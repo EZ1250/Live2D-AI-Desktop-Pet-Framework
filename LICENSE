@@ -19,11 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-注意：本许可证只覆盖本仓库原创的代码与文档。
-
-仓库内还包含第三方运行库（Live2D Cubism Core、PixiJS、Live2D 引擎等，
-见 src/renderer/lib/ 下的 *.min.js），它们各自遵循自己的许可条款，
-**不由上面的 MIT 授权覆盖**。再分发前请逐项核验其来源与许可条件。
