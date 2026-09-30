@@ -1,0 +1,33 @@
+{
+  "name": "pet-desktop-app",
+  "productName": "Pet",
+  "version": "1.0.0",
+  "description": "Pet — Live2D 桌面宠物",
+  "author": "Pet",
+  "main": "dist/main/main.js",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "import": "node scripts/import-model.js",
+    "assemble": "node scripts/assemble-renderer.js",
+    "check:privacy": "node scripts/check-privacy.js --all",
+    "build:tsc": "tsc -p tsconfig.json",
+    "test": "npm run build:tsc && node --test tests/devTools.test.js",
+    "check": "npm test",
+    "build:all": "npm run build:tsc && npm run assemble",
+    "start": "chcp 65001 > nul && electron .",
+    "prestart": "npm run build:all",
+    "build": "npm run import && npm run build:tsc && npm run assemble && node scripts/build-portable.js",
+    "dist": "npm run build"
+  },
+  "dependencies": {
+    "active-win": "^8"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "cross-env": "^7",
+    "electron": "^31.7.7",
+    "electron-builder": "^24",
+    "typescript": "^5"
+  }
+}

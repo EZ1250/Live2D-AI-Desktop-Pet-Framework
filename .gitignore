@@ -1,0 +1,21 @@
+# 依赖与构建产物（都不该进版本库）
+node_modules/
+dist/
+release/
+
+# 生成物：public/assets 由 npm run import 重建，public/renderer 由 npm run assemble 重建
+# （npm start 的 prestart 会自动跑 build:all，所以忽略它们不影响任何用法）
+public/assets/
+public/renderer/
+
+# 杂项
+*.log
+*.tsbuildinfo
+tmp/
+.pytest_cache/
+
+# 凭据：本工程不使用 .env（密钥存在用户数据目录的 settings.json 里），
+# 这里只是防以后有人误建一个含 Key 的 .env 被提交上去。
+.env
+.env.*
+!.env.example

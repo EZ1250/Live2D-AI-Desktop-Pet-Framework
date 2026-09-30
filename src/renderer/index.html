@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<!--
+  Pet — 渲染进程页面
+  透明无边框窗口：body 背景透明；模型渲染在 #stage，气泡 #bubble，状态小字 #overlay。
+
+  Live2D 运行时库加载顺序固定（pixi 全局 → Cubism Core → Live2D 引擎）：
+    ./lib/pixi.min.js               PixiJS 8.14.0 独立全局构建（window.PIXI，MIT）
+    ./lib/live2dcubismcore.min.js   Live2D Cubism Core 5.0（window.Live2DCubismCore，最高 moc3 v5）
+    ./lib/live2d-engine.min.js      untitled-pixi-live2d-engine 1.4.0（Cubism 3/4/5，写入 window.PIXI.live2d）
+  版本/来源/许可/兼容处理见 ./lib/VERSIONS.md；重取：node scripts/fetch-live2d-runtime.js
+  三者在浏览器分支下互相配合，moc3 路径可用（Cubism 3/4/5 导出的 moc3 都能读）；任一缺失时渲染层自动降级为
+  portrait <img> / 占位图形，页面照常可用（见 live2d.ts / renderer.ts）。
+
+  以下 JS 均为 tsc 编译产物（与 .ts 同目录）：live2d.js、renderer.js。
+  若主进程改为打包器/ESM 构建，只需保证 renderer.js 先于 DOM 逻辑、live2d.js 先于 renderer.js。
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- 模型静态资源由主进程本地 HTTP 服务提供(http://127.0.0.1:<port>/assets/...)，
+       端口运行时才知，故 connect-src/img-src 放行 127.0.0.1 与 localhost 任意端口。
+       unsafe-eval：Pixi 内部需要 new Function（WebGL 着色器/程序编译路径）。
+       worker-src/child-src blob:：Pixi 8 的贴图解码会用 blob worker（不给就 SecurityError → 模型挂不上）。
+       应用只加载本地自带脚本、无任何远程脚本，故放行以保证 moc3 渲染可用。 -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self' 'unsafe-eval' blob:; style-src 'self'; img-src 'self' data: blob: http://127.0.0.1:* http://localhost:*; media-src http://127.0.0.1:* http://localhost:* blob:; connect-src 'self' http://127.0.0.1:* http://localhost:*; worker-src 'self' blob:; child-src 'self' blob:; font-src 'self'" />
+  <title>Pet</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <!-- 模型渲染容器：moc3 时挂 PIXI canvas / portrait 时放 <img> / 失败时放占位 -->
+  <main id="stage" aria-label="pet stage"></main>
+
+  <!-- 点击特效层：粉色星星小范围扩散（pointer-events:none，绝不拦截鼠标） -->
+  <div id="fx-layer" class="fx-layer" aria-hidden="true"></div>
+
+  <!-- 窗口边缘拖拽条带（drag 区；模型主体区为 no-drag 可交互） -->
+  <div id="drag-top" class="window-drag-strip"></div>
+  <div id="drag-bottom" class="window-drag-strip"></div>
+  <div id="drag-left" class="window-drag-strip"></div>
+  <div id="drag-right" class="window-drag-strip"></div>
+
+  <!-- 台词气泡：初始隐藏，逐字打印（CSS 见 styles.css） -->
+  <div id="bubble" aria-live="polite"><span id="bubble-text"></span></div>
+
+  <!-- 底部状态小字（活动窗口监控 / 加载状态） -->
+  <div id="overlay"><span id="overlay-text"></span></div>
+
+  <!-- 对话气泡窗 -->
+  <div id="chatbar" class="chatbar" aria-label="和 Pet 聊天" aria-hidden="true">
+    <div id="chat-toolbar" class="chat-toolbar">
+      <button id="chat-plus" class="chat-plus" type="button" title="更多" aria-haspopup="true" aria-expanded="false">＋</button>
+      <span id="chat-toolbar-status" class="chat-toolbar-status"></span>
+      <button id="chat-close" class="chat-close" type="button" title="收起对话（Esc）">×</button>
+    </div>
+    <div id="chat-menu" class="chat-menu" hidden>
+      <button type="button" data-chat-menu="new" title="新对话">＋ 新对话</button>
+      <button type="button" data-chat-menu="history" title="查看历史对话">🕘 历史对话</button>
+      <button type="button" data-chat-menu="think" title="显示过程">🧠 过程</button>
+      <button type="button" data-chat-menu="collapse" title="收起这个气泡窗（Esc）">⌄ 收起对话</button>
+    </div>
+    <div id="chat-history-list" class="chat-history-list" hidden></div>
+    <div id="chat-log" class="chat-log" aria-live="polite"></div>
+    <div class="chat-input-row">
+      <input id="chat-input" class="chat-input" type="text" placeholder="输入消息" maxlength="500" autocomplete="off" spellcheck="false" />
+      <button id="chat-mic" class="chat-mic" type="button" aria-pressed="false" title="按住说话（松开后转写，不会自动发送）" aria-label="按住说话">
+        <!-- 声纹图标（参考用户给的图：7 条圆头竖条，中间最高、左右对称，描边不填充）；
+             stroke=currentColor 跟随按钮颜色，录音时由 CSS 让竖条跳动 -->
+        <span class="chat-mic-ico" aria-hidden="true">
+          <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+            <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.7">
+              <line x1="3" y1="9.5" x2="3" y2="14.5" />
+              <line x1="6" y1="7" x2="6" y2="17" />
+              <line x1="9" y1="5" x2="9" y2="19" />
+              <line x1="12" y1="3.5" x2="12" y2="20.5" />
+              <line x1="15" y1="5" x2="15" y2="19" />
+              <line x1="18" y1="7" x2="18" y2="17" />
+              <line x1="21" y1="9.5" x2="21" y2="14.5" />
+            </g>
+          </svg>
+        </span>
+        <span class="chat-mic-ring" aria-hidden="true"></span>
+      </button>
+      <button id="chat-send" class="chat-send" type="button">发送</button>
+    </div>
+    <div class="chat-tail" aria-hidden="true"></div>
+  </div>
+
+  <!-- AI 提问框（ask_user 工具 / 写操作确认）：选项按钮 + 自由文本 -->
+  <div id="ask-box" class="ask-box" aria-label="Pet 提问" aria-hidden="true" hidden>
+    <div id="ask-question" class="ask-question"></div>
+    <div id="ask-options" class="ask-options"></div>
+    <input id="ask-input" class="ask-input" type="text" placeholder="或直接输入你的回答…" maxlength="500" autocomplete="off" spellcheck="false" />
+  </div>
+
+  <!-- 思考过程浮窗：对话时贴在模型旁边，实时显示推理内容与工具调用步骤 -->
+  <aside id="think-panel" class="think-panel" aria-label="思考过程" aria-hidden="true" hidden>
+    <header class="think-header">
+      <span id="think-title">思考中…</span>
+      <button id="think-close" class="think-close" type="button" aria-label="关闭思考浮窗">×</button>
+    </header>
+    <div id="think-plan" class="think-plan" hidden></div>
+    <div id="think-list" class="think-list"></div>
+  </aside>
+  <button id="think-capsule" class="think-capsule" type="button" aria-label="展开思考过程" hidden>🧠 详情</button>
+
+  <nav id="context-menu" class="context-menu" aria-label="Pet menu" hidden>
+    <div class="cm-group">
+      <div class="cm-title">动作</div>
+      <button type="button" data-menu-action="idle">Idle 待机</button>
+    </div>
+    <div id="cm-expressions" class="cm-group" hidden>
+      <div class="cm-title">表情</div>
+      <div id="cm-expression-list"></div>
+    </div>
+    <!-- 服饰 / 道具：模型能力归类里有这一类时才显示（没有就不出现） -->
+    <div id="cm-costume" class="cm-group" hidden>
+      <div class="cm-title">服饰 / 道具</div>
+      <div id="cm-costume-list"></div>
+    </div>
+    <div class="cm-sep"></div>
+    <div class="cm-group">
+      <button type="button" data-menu-action="framing">🔍 全身 / 半身 切换</button>
+      <button type="button" data-menu-action="chat">💬 和 Pet 聊天</button>
+      <button type="button" data-menu-action="settings">设置</button>
+      <button type="button" data-menu-action="reload">重新加载模型</button>
+      <button type="button" data-menu-action="quit">退出 Pet</button>
+    </div>
+  </nav>
+
+  <!-- 待办笔记本面板：与聊天/提醒同源（ToolBox，%APPDATA% 持久化） -->
+  <section id="todo-panel" class="todo-panel" aria-label="待办笔记本" hidden>
+    <header class="todo-header">
+      <h1>📒 待办笔记本</h1>
+      <button id="todo-close" class="icon-button" type="button" aria-label="关闭待办">×</button>
+    </header>
+    <div id="todo-list" class="todo-list" role="list"></div>
+    <div id="todo-empty" class="todo-empty" hidden>暂无待办，写下第一条吧 ✍️</div>
+    <footer class="todo-footer">
+      <input id="todo-input" class="todo-input" type="text" placeholder="添加新待办…" maxlength="200" autocomplete="off" spellcheck="false" />
+      <button id="todo-add" class="todo-add" type="button">添加</button>
+      <button id="todo-close2" class="todo-cancel" type="button">关闭</button>
+    </footer>
+  </section>
+
+  <section id="settings-panel" class="settings-panel" aria-label="设置" hidden>
+    <header class="settings-header">
+      <h1>Pet 设置</h1>
+      <button id="settings-close" class="icon-button" type="button" aria-label="关闭设置">×</button>
+    </header>
+    <form id="settings-form" class="settings-form">
+      <label>模型<select id="setting-model" name="model"></select></label>
+      <label>角色取景
+        <select id="setting-display-mode" name="displayMode">
+          <option value="full">全身</option>
+          <option value="half">半身（放大头与上半身）</option>
+        </select>
+      </label>
+      <label class="settings-checkbox"><input id="setting-hide-fullscreen" name="hideOnFullscreen" type="checkbox" checked /> 全屏时自动收起</label>
+      <label class="settings-checkbox"><input id="setting-click-through" name="clickThrough" type="checkbox" /> 点击穿透（透明区不挡鼠标）</label>
+      <!-- 语音识别（转写）：与聊天模型分开配；自检按钮用内置合成音频打两条路由 -->
+      <fieldset class="settings-fieldset">
+        <legend>语音识别（语音输入转文字）</legend>
+        <!-- 转写模型：可从 API 地址的 /models 自动索引候选；留空则按地址自动挑一个。 -->
+        <label class="settings-row">转写模型
+          <input id="setting-voice-model" name="voiceModel" placeholder="留空=按地址自动识别（默认 qwen3-asr-flash）" autocomplete="off" />
+          <button id="setting-voice-model-pick" type="button" title="从 API 地址的 /models 挑转写模型">▾ 按地址索引</button>
+        </label>
+        <div id="setting-voice-model-panel" class="model-panel" hidden>
+          <input id="setting-voice-model-filter" class="model-filter" type="text" placeholder="过滤：asr / whisper / audio / speech…" autocomplete="off" spellcheck="false" />
+          <div id="setting-voice-model-list" class="model-list"></div>
+        </div>
+        <p id="setting-voice-model-hint" class="settings-status voice-model-hint" role="status"></p>
+        <label>转写路由
+          <select id="setting-voice-route" name="voiceRoute">
+            <option value="auto">自动（推荐：先试可用的那条）</option>
+            <option value="chat-audio">chat/completions + 音频（百炼网关用这条）</option>
+            <option value="transcriptions">/audio/transcriptions（OpenAI 经典）</option>
+          </select>
+        </label>
+        <label>语音专用地址<input id="setting-voice-base-url" name="voiceBaseUrl" placeholder="留空=复用上面的 API 地址" /></label>
+        <label>语音专用 Key<input id="setting-voice-api-key" name="voiceApiKey" type="password" placeholder="留空=复用上面的 API Key" /></label>
+        <div class="settings-row">
+          <button id="setting-voice-check" type="button" title="用一段内置合成音频分别测试两条转写路由">🎙 自检语音识别</button>
+          <span id="setting-voice-status" class="settings-status" role="status"></span>
+        </div>
+      </fieldset>
+      <label>Provider<input id="setting-provider" name="provider" placeholder="deepseek / openai / azure" /></label>
+      <label>API 地址<input id="setting-base-url" name="baseUrl" placeholder="https://api.deepseek.com" /></label>
+      <label>API Key<input id="setting-api-key" name="apiKey" type="password" placeholder="仅保存到本机" /></label>
+      <label class="settings-row">AI 模型
+        <input id="setting-ai-model" name="aiModel" placeholder="点右边「选择模型」从服务端列表里挑" autocomplete="off" />
+        <button id="setting-ai-model-refresh" type="button" title="从 API 地址拉取可用模型（GET /models）">▾ 选择模型</button>
+      </label>
+      <!-- 内嵌展开的模型列表：不用原生 datalist（它的弹窗只有一个候选、点外面收不回、滚动还挡在原处） -->
+      <div id="setting-ai-model-panel" class="model-panel" hidden>
+        <input id="setting-ai-model-filter" class="model-filter" type="text" placeholder="过滤：coder / max / flash / vl …" autocomplete="off" spellcheck="false" />
+        <div id="setting-ai-model-list" class="model-list"></div>
+      </div>
+      <p id="setting-ai-model-status" class="settings-status" role="status"></p>
+      <label>Azure API 版本<input id="setting-azure-version" name="azureApiVersion" placeholder="2024-10-21" /></label>
+      <div class="settings-grid">
+        <label>温度<input id="setting-temperature" name="temperature" type="number" min="0" max="2" step="0.1" /></label>
+        <label>上下文轮数<input id="setting-rounds" name="contextRounds" type="number" min="0" max="100" step="1" /></label>
+      </div>
+      <label>上下文 Token 上限<input id="setting-tokens" name="maxContextTokens" type="number" min="256" max="200000" step="256" placeholder="多步任务建议 ≥16000" /></label>
+      <label class="settings-checkbox"><input id="setting-confirm-tools" name="confirmTools" type="checkbox" /> 工具调用需确认（写操作前先问我）</label>
+      <label class="settings-checkbox"><input id="setting-show-thinking" name="showThinking" type="checkbox" checked /> 显示思考过程（请求模型返回推理内容）</label>
+      <label class="settings-checkbox"><input id="setting-sfx" name="sfxEnabled" type="checkbox" checked /> 点击音效（点桌宠时播放轻响）</label>
+      <label class="settings-range">音效音量
+        <input id="setting-sfx-volume" name="sfxVolume" type="range" min="0" max="1" step="0.05" value="0.6" />
+        <span id="sfx-volume-display" class="settings-range-value">60%</span>
+      </label>
+      <div class="settings-divider">开发辅助（建文件夹 / 写文件 / 执行命令）</div>
+      <label class="settings-row">开发工作区
+        <input id="setting-dev-root" name="devWorkspaceRoot" type="text" readonly placeholder="未选择（选择后 Pet 才能建文件夹 / 写文件）" />
+        <button id="setting-dev-root-pick" type="button">选择文件夹…</button>
+        <button id="setting-dev-root-open" type="button">打开</button>
+      </label>
+      <label class="settings-checkbox"><input id="setting-allow-shell" name="allowShell" type="checkbox" checked /> 允许执行命令（危险命令会被拦截，每次执行都需确认）</label>
+      <label>权限模式
+        <select id="setting-permission-mode" name="permissionMode">
+          <option value="ask">每次询问（最安全）</option>
+          <option value="auto-edit">自动接受编辑（写入不问，命令仍问）</option>
+          <option value="plan-only">只读 / 计划（不许改动）</option>
+        </select>
+      </label>
+      <div class="settings-divider">可插拔资产（模型 / 插件：放进文件夹即可用）</div>
+
+      <div class="asset-block">
+        <div class="asset-head">
+          <span class="asset-title">Live2D 模型</span>
+          <button id="asset-model-open" type="button" title="用资源管理器打开模型文件夹">📂 打开模型文件夹</button>
+          <button id="asset-model-add" type="button" title="选择一个已有的模型文件夹加入">＋ 添加模型…</button>
+        </div>
+        <div id="asset-model-dir" class="asset-path"></div>
+        <div class="asset-preset-row">
+          <span id="asset-preset-info" class="asset-path" hidden></span>
+          <button id="asset-preset-edit" type="button" title="生成 / 打开该模型的 pet-model.json">📝 预设…</button>
+          <button id="asset-detect" type="button" title="重新识别模型能力（点击触发 / 服饰道具 / 情绪表情）">🧠 重新识别</button>
+        </div>
+        <div id="asset-preset-hint" class="asset-path asset-preset-hint" hidden></div>
+        <div id="asset-model-list" class="asset-list"></div>
+      </div>
+
+      <div class="asset-block">
+        <div class="asset-head">
+          <span class="asset-title">插件</span>
+          <button id="asset-plugin-open" type="button" title="用资源管理器打开插件文件夹">📂 打开插件文件夹</button>
+          <button id="asset-plugin-add" type="button" title="选择一个含 pet-plugin.json 的插件文件夹">＋ 添加插件…</button>
+          <button id="asset-refresh" type="button" title="重新扫描两个文件夹">↻ 重新扫描</button>
+        </div>
+        <div id="asset-plugin-dir" class="asset-path"></div>
+        <div id="asset-plugin-list" class="asset-list"></div>
+      </div>
+
+      <!-- 状态行放在保存行**前面**：保存行是 sticky 钉底的最后一个子节点，
+           它下面是空的，钉住时才不会盖住任何东西（保存结果就显示在按钮正上方）。 -->
+      <p id="settings-status" class="settings-status" role="status"></p>
+      <div class="settings-actions">
+        <button id="settings-save" class="primary-button" type="submit">保存设置</button>
+      </div>
+    </form>
+  </section>
+
+  <!-- ① Live2D 运行时库（顺序不可变：Pixi 8 → 官方 Cubism Core → Live2D 引擎）
+       版本/来源/许可/兼容处理见 ./lib/VERSIONS.md；重取：node scripts/fetch-live2d-runtime.js -->
+  <script src="./lib/pixi.min.js"></script>
+  <script src="./lib/live2dcubismcore.min.js"></script>
+  <script src="./lib/live2d-engine.min.js"></script>
+  <!-- ② 渲染辅助层：情感判定（全局脚本，暴露 window.PetEmotion；纯函数，无依赖） -->
+  <script src="./emotion.js"></script>
+  <!-- 声纹（实时输入电平波形）：全局脚本，挂 window.PetVoiceLab；必须在 renderer.js 之前 -->
+  <script src="./voicelab.js"></script>
+  <!-- ③ 渲染辅助层：moc3/portrait/placeholder 挂载（全局脚本，暴露 window.PetLive2d） -->
+  <script src="./live2d.js"></script>
+  <!-- ④ 渲染入口 -->
+  <script src="./renderer.js"></script>
+</body>
+</html>

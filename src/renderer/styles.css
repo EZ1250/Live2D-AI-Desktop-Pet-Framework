@@ -1,0 +1,1945 @@
+/* ============================================================
+  Pet — 渲染进程样式
+   透明窗口：html/body 全透明；整窗可拖拽(app-region: drag)；
+   模型居中于底部；气泡/状态条不拦截指针。
+   ============================================================ */
+
+:root {
+  --bubble-bg: rgba(15, 22, 38, 0.68);
+  --bubble-bg-error: rgba(96, 26, 38, 0.82);
+  --bubble-fg: #ffffff;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent; /* 桌面宠物窗口必须透明 */
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+  font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", system-ui, sans-serif;
+}
+
+body {
+  /* 无边框透明窗口。窗口拖动仅保留边缘条带（见下方 #window-drag-strip），
+     模型主体区为可交互区（右键菜单/视线跟踪/点击），避免整窗 drag 吞掉右键。 */
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+/* 窗口边缘拖拽条带：模型区域之外留 10px 边缘用于拖动窗口。
+   覆盖四边（+ 底部一条较高区域方便拖），但让 #stage 模型主体可交互。 */
+.window-drag-strip {
+  position: fixed;
+  z-index: 2;
+  -webkit-app-region: drag;
+  app-region: drag;
+  background: transparent;
+}
+#drag-top    { top: 0; left: 0; right: 0; height: 12px; }
+#drag-bottom { bottom: 0; left: 0; right: 0; height: 16px; }
+#drag-left   { left: 0; top: 0; bottom: 0; width: 10px; }
+#drag-right  { right: 0; top: 0; bottom: 0; width: 10px; }
+
+/* ---------- 模型舞台 ---------- */
+#stage {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: flex-end;      /* 角色“站”在窗口底部 */
+  justify-content: center;
+  overflow: hidden;
+  /* 模型主体可交互：右键弹菜单、视线跟踪、点击均作用于模型区；
+     窗口拖动交由边缘 #window-drag-strip（no-drag 主体 + drag 边缘） */
+  pointer-events: auto;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+#stage canvas {
+  display: block;
+  pointer-events: auto;
+}
+
+/* ---------- 半身取景：窗口边缘渐透明（羽化） ----------
+   半身会把模型放大 2.5 倍（高约 1157px 塞进 521px 窗口）：下三分之一是躯干、被窗口左右与下沿
+   **硬裁**，看起来就是个矩形窗口。这里用两层嵌套 mask（水平在 #stage、垂直在 canvas）让边缘 alpha
+   渐变到 0 —— 嵌套天然取交集，不依赖实验性的 mask-composite。
+   渐变的 stop 用多段近似 ease-out（不是线性直落），过渡更像"羽化/虚化"而非一刀淡出。
+   只在半身下生效：全身时模型本来就有边距，淡了反而不自然。
+   常亮清晰区：水平 46px 以内、垂直 12px 到 (100% - 78px) —— 覆盖整张脸和肩（范围按反馈收窄过一轮）。
+   注：**不做**真正的 backdrop-filter 模糊：这台机器上实测在透明窗口里 backdrop-filter 完全不生效
+   （用静态条纹探针 A/B 量到 0% 高频变化），留着只是白耗一个合成层。 */
+body.framing-half #stage {
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    rgba(0, 0, 0, 0.18) 9px,
+    rgba(0, 0, 0, 0.5) 21px,
+    rgba(0, 0, 0, 0.82) 33px,
+    #000 46px,
+    #000 calc(100% - 46px),
+    rgba(0, 0, 0, 0.82) calc(100% - 33px),
+    rgba(0, 0, 0, 0.5) calc(100% - 21px),
+    rgba(0, 0, 0, 0.18) calc(100% - 9px),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    rgba(0, 0, 0, 0.18) 9px,
+    rgba(0, 0, 0, 0.5) 21px,
+    rgba(0, 0, 0, 0.82) 33px,
+    #000 46px,
+    #000 calc(100% - 46px),
+    rgba(0, 0, 0, 0.82) calc(100% - 33px),
+    rgba(0, 0, 0, 0.5) calc(100% - 21px),
+    rgba(0, 0, 0, 0.18) calc(100% - 9px),
+    transparent 100%
+  );
+}
+body.framing-half #stage canvas,
+body.framing-half #stage .pet-media {
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    rgba(0, 0, 0, 0.4) 5px,
+    #000 12px,
+    #000 calc(100% - 78px),
+    rgba(0, 0, 0, 0.72) calc(100% - 53px),
+    rgba(0, 0, 0, 0.42) calc(100% - 35px),
+    rgba(0, 0, 0, 0.18) calc(100% - 17px),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    rgba(0, 0, 0, 0.4) 5px,
+    #000 12px,
+    #000 calc(100% - 78px),
+    rgba(0, 0, 0, 0.72) calc(100% - 53px),
+    rgba(0, 0, 0, 0.42) calc(100% - 35px),
+    rgba(0, 0, 0, 0.18) calc(100% - 17px),
+    transparent 100%
+  );
+}
+
+/* 老引擎没有 mask-image：退回"不淡出"的硬裁（宁可少个效果，不能少个角色） */
+@supports not ((mask-image: linear-gradient(#000, #000)) or (-webkit-mask-image: linear-gradient(#000, #000))) {
+  body.framing-half #stage,
+  body.framing-half #stage canvas,
+  body.framing-half #stage .pet-media {
+    -webkit-mask-image: none;
+    mask-image: none;
+  }
+}
+
+/* 老引擎没有 mask-image：退回"不淡出、不虚化"的硬裁（宁可少个效果，不能少个角色） */
+@supports not ((mask-image: linear-gradient(#000, #000)) or (-webkit-mask-image: linear-gradient(#000, #000))) {
+  body.framing-half #stage,
+  body.framing-half #stage canvas,
+  body.framing-half #stage .pet-media {
+    -webkit-mask-image: none;
+    mask-image: none;
+  }
+}
+
+/* portrait 容器与图片 */
+.pet-media {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+}
+
+.pet-portrait {
+  display: block;
+  max-width: 94%;
+  max-height: 100%;
+  object-fit: contain;
+  transform-origin: 50% 100%; /* 以“脚底”为中心做呼吸缩放/浮动 */
+  will-change: transform;
+  opacity: 0;
+  transition: opacity 0.35s ease;
+  filter: drop-shadow(0 8px 14px rgba(0, 0, 0, 0.18));
+  -webkit-user-drag: none;
+}
+
+.pet-portrait.is-visible {
+  opacity: 1;
+}
+
+/* 半身取景下的立绘：缩放锚点从"脚底"换成"头顶"。
+   立绘是**整幅画**（这版大肥鱼的脑袋只占画高的 13%，而 Cubism 模型通常占 25%+），
+   从脚底放大 2.5 倍会把窗口里挤满裙子；锚到头顶后，配合 live2d.ts 里既有的半身下移量，
+   窗口里正好是"头 + 肩 + 上胸"——和 Live2D 模型的半身取景观感一致。 */
+body.framing-half .pet-portrait {
+  transform-origin: 50% 0;
+}
+
+/* moc3 画布（live2d.ts 挂载，铺满窗口） */
+.pet-canvas {
+  width: 100%;
+  height: 100%;
+}
+
+/* ---------- 拖放加入资产：拖到窗口上时的提示态 ----------
+   只做一圈内描边 + 轻微提亮，不遮挡模型（拖放目标是整个 #stage）。 */
+body.is-dragover #stage::after {
+  content: '松开即可加入模型 / 插件';
+  position: fixed;
+  inset: 6px;
+  border: 2px dashed rgba(160, 210, 255, 0.85);
+  border-radius: 14px;
+  background: rgba(120, 180, 255, 0.08);
+  color: #eaf4ff;
+  font-size: 13px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: 10px;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+}
+
+/* ---------- 占位（moc3 环境不可用 / 加载失败时的降级图形） ---------- */
+.pet-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: min(190px, 56vw);
+  aspect-ratio: 3 / 4;
+  border-radius: 22px;
+  margin-bottom: 8vh;
+  padding: 12px;
+  text-align: center;
+  background: rgba(20, 26, 38, 0.58);
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.18);
+  color: rgba(255, 255, 255, 0.92);
+  will-change: transform;
+}
+
+.pet-placeholder .ph-emoji {
+  font-size: 46px;
+  line-height: 1;
+  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.35));
+}
+
+.pet-placeholder .ph-name {
+  font-size: 13px;
+  letter-spacing: 0.5px;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+  word-break: break-all;
+}
+
+.pet-placeholder .ph-hint {
+  font-size: 10px;
+  line-height: 1.5;
+  opacity: 0.72;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+}
+
+/* ---------- 台词气泡（初始隐藏；窄胶囊，深色半透明底 + 白字） ---------- */
+#bubble {
+  position: fixed;
+  left: 50%;
+  bottom: 14px;              /* 底部居中，避开模型主体 */
+  transform: translateX(-50%);
+  max-width: 76%;
+  min-width: 40px;
+  min-height: 24px;
+  padding: 5px 14px;
+  border-radius: 999px;
+  background: var(--bubble-bg);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  color: var(--bubble-fg);
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
+  white-space: normal;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22);
+  pointer-events: none;      /* 不拦截点击/拖拽 */
+  opacity: 0;
+  transition: opacity 0.25s ease;
+  z-index: 60;
+}
+
+#bubble.is-visible {
+  opacity: 1;
+}
+
+/* 长回复不要把气泡撑破：文字区自己滚动（气泡本身不拦截点击） */
+#bubble-text {
+  display: inline-block;
+  max-height: 30vh;
+  max-width: 100%;
+  overflow-y: auto;
+  text-align: left;
+  scrollbar-width: thin;
+}
+
+/* 错误/警告语气 */
+#bubble.is-error {
+  background: var(--bubble-bg-error);
+  border-color: rgba(255, 150, 150, 0.5);
+}
+
+/* 打字中的闪烁光标（JS 在打字结束会移除 is-typing） */
+#bubble.is-typing #bubble-text::after {
+  content: "▌";
+  margin-left: 1px;
+  opacity: 0.85;
+  animation: pet-caret 0.7s steps(1) infinite;
+}
+
+@keyframes pet-caret {
+  0%, 55% { opacity: 0.85; }
+  56%, 100% { opacity: 0; }
+}
+
+/* ---------- 状态小字（活动窗口监控，右下角） ---------- */
+#overlay {
+  position: fixed;
+  right: 8px;
+  bottom: 6px;
+  max-width: 55%;
+  font-size: 10px;
+  line-height: 1.4;
+  text-align: right;
+  color: rgba(255, 255, 255, 0.6);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  z-index: 50;
+}
+
+#overlay.is-visible {
+  opacity: 1;
+}
+
+/* ---------- 右键菜单与设置面板 ---------- */
+.context-menu,
+.settings-panel {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+  pointer-events: auto;
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 100;
+  min-width: 132px;
+  padding: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 9px;
+  background: rgba(25, 30, 45, 0.96);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  /* 菜单比角色窗还高时不再被窗沿裁掉：自身限高 + 内部滚动（最后一项一定够得到） */
+  max-height: calc(100vh - 12px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+.context-menu::-webkit-scrollbar { width: 7px; }
+.context-menu::-webkit-scrollbar-track { background: transparent; }
+.context-menu::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(158, 203, 255, 0.28);
+}
+.context-menu::-webkit-scrollbar-thumb:hover { background: rgba(158, 203, 255, 0.45); }
+
+/* 表情一多（当前模型 8 个）就把菜单顶穿窗口：改成两列网格 + 自身限高滚动 */
+.context-menu #cm-expression-list,
+.context-menu #cm-costume-list {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px;
+  max-height: 132px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.context-menu #cm-expression-list button,
+.context-menu #cm-costume-list button { padding: 6px 8px; }
+.context-menu #cm-expression-list button::before,
+.context-menu #cm-costume-list button::before { content: '· '; opacity: 0.45; }
+
+.context-menu button,
+.settings-actions button {
+  border: 0;
+  border-radius: 6px;
+  color: #fff;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+}
+
+.context-menu button {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  text-align: left;
+  font-size: 12px;
+}
+
+.context-menu .cm-title {
+  padding: 4px 10px 2px;
+  color: rgba(255, 255, 255, 0.48);
+  font-size: 10px;
+  letter-spacing: 0.4px;
+}
+
+.context-menu .cm-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.context-menu button[data-menu-action="quit"] {
+  color: #ffb3ae;
+}
+
+.context-menu button:hover,
+.settings-actions button:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.settings-panel {
+  position: fixed;
+  inset: 10px;
+  z-index: 90;
+  /* 面板本身不滚，改成「标题常驻 + 表单自己滚 + 保存行钉底」：
+     521px 高的桌宠窗口里内容有 2000px+ 高，原来整面板一条 overflow:auto，
+     用户的原话是"设置框的展开无法完全在显示窗里显示"——展开的模型列表和底部
+     「保存设置」都落在可视区外，只有一条很细的滚动条提示还能滚。
+     现在：标题不滚（随时能关）、表单是唯一滚动容器（min-height:0 才能压住 grid）、
+     保存行 sticky 钉在表单底部（见 .settings-actions）。 */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 14px;
+  background: rgba(24, 29, 43, 0.96);
+  color: #f6f7fb;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.42);
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.settings-header,
+.settings-actions,
+.settings-grid {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-header {
+  justify-content: space-between;
+  flex: none; /* 标题常驻面板顶部，不随表单滚动 */
+  margin-bottom: 10px;
+}
+
+.settings-header h1 {
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.icon-button {
+  border: 0;
+  color: rgba(255, 255, 255, 0.75);
+  background: transparent;
+  cursor: pointer;
+  font-size: 23px;
+  line-height: 1;
+}
+
+.settings-form {
+  display: grid;
+  /* 单列必须写成 minmax(0,1fr)：默认的 auto 列会被"某一行里最长的不可断内容"
+     （下拉框最宽选项 / 带 nowrap 的按钮 / 长网关地址）撑到比面板还宽，
+     于是面板出现横向滚动条、左边文字被推出可视区（用户报的"看不全"就是这个）。
+     min 写 0 之后列宽被钉死在容器内，需要换行的内容自己换行。 */
+  grid-template-columns: minmax(0, 1fr);
+  gap: 9px;
+  min-width: 0;
+  min-height: 0; /* grid 子项默认 min-height:auto，不加这个 flex 容器压不住、滚动条会跑出去 */
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden; /* 横向一律靠收缩/折行解决，永不出现横向滚动条 */
+  /* 外层面板已经是 overflow:hidden，这里再挡住"滚动链"：内嵌模型列表滚到底继续滚时，
+     不会把滚动传给外层窗口/看板（外部审查提醒的点，实测手滑多滚一格会带动整页）。 */
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  padding-right: 2px;
+}
+
+.settings-form label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 11px;
+}
+
+.settings-form input,
+.settings-form select {
+  width: 100%;
+  min-height: 29px;
+  padding: 5px 7px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 5px;
+  outline: 0;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.22);
+  font: inherit;
+  font-size: 12px;
+}
+
+.settings-form input:focus,
+.settings-form select:focus {
+  border-color: rgba(160, 210, 255, 0.8);
+}
+
+.settings-grid > label {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.settings-divider {
+  margin-top: 4px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.16);
+  color: rgba(255, 255, 255, 0.62);
+  font-size: 11px;
+}
+
+.settings-actions {
+  /* 钉在表单滚动区底部：不管上面展开了多少内容，「保存设置」永远看得见点得到。
+     放在表单最后一个子节点（#settings-status 已挪到它前面），所以钉住时不会盖住任何东西。 */
+  position: sticky;
+  bottom: 0;
+  z-index: 4;
+  justify-content: flex-end;
+  margin-top: 4px;
+  padding: 8px 0 2px;
+  border-top: 1px solid rgba(255, 255, 255, 0.14);
+  background: linear-gradient(rgba(24, 29, 43, 0.86), rgba(24, 29, 43, 0.99) 55%);
+}
+
+.settings-actions button {
+  padding: 7px 11px;
+  background: rgba(255, 255, 255, 0.1);
+  font-size: 12px;
+}
+
+.settings-actions .primary-button {
+  background: #287fc4;
+}
+
+.settings-actions .primary-button:hover {
+  background: #3599e8;
+}
+
+.settings-status {
+  min-height: 15px;
+  min-width: 0;
+  color: rgba(255, 255, 255, 0.68);
+  font-size: 11px;
+  /* 状态行里会出现很长的网关地址 / 模型名（没有空格可断）——必须允许任意位置折行，
+     否则会把所在行（甚至整个表单）撑宽，面板出现横向滚动条并把左边的字推出可视区。 */
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* ---------- AI 模型选择（内嵌展开，不用原生 datalist） ----------
+   datalist 的原生弹窗在 Electron 里：只按输入框内容过滤（看着像"只有一个模型"）、
+   点外面收不回去、设置页滚动时还钉在原处。这里改成普通 DOM，**参与文档流**，
+   跟着设置面板一起滚动，按钮/选中/Esc 都能收起来。 */
+.model-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 2px 0 6px;
+  padding: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 10px;
+  background: rgba(12, 16, 26, 0.6);
+}
+.model-filter {
+  padding: 4px 8px;
+  font-size: 12px;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  outline: none;
+}
+.model-filter:focus { border-color: rgba(160, 210, 255, 0.8); }
+.model-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  /* 服务端可能有 200+ 个模型：这个列表是"筛选器的结果区"，给自己一个上限 + 内部滚动。
+     521px 高的窗口里 190px 已经占了 1/3 屏，改成跟着窗口高度走（高屏更大、小窗更小）。 */
+  max-height: min(190px, 34vh);
+  overflow-y: auto;
+  overscroll-behavior: contain; /* 261 个模型的列表滚到底不要把滚动传给设置表单 */
+  scrollbar-width: thin;
+}
+.model-item {
+  text-align: left;
+  padding: 4px 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.9);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.model-item:hover { background: rgba(158, 203, 255, 0.22); color: #fff; }
+.model-item.is-current { border-color: rgba(158, 203, 255, 0.75); background: rgba(158, 203, 255, 0.14); }
+.model-empty { padding: 2px 4px; font-size: 11.5px; color: rgba(255, 255, 255, 0.6); }
+
+/* ---------- 可插拔资产（模型 / 插件）：文件夹式导入 + 逐项状态 ---------- */
+.asset-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 6px 0 10px;
+  padding: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  background: rgba(12, 16, 26, 0.45);
+}
+.asset-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.asset-title { margin-right: auto; font-size: 12.5px; font-weight: 600; color: rgba(255, 255, 255, 0.9); }
+.asset-head button {
+  padding: 3px 10px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: rgba(255, 255, 255, 0.07);
+  color: rgba(255, 255, 255, 0.88);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.asset-head button:hover { background: rgba(158, 203, 255, 0.22); border-color: rgba(158, 203, 255, 0.7); }
+.asset-path { font-size: 10.5px; color: rgba(255, 255, 255, 0.5); word-break: break-all; }
+.asset-list { display: flex; flex-direction: column; gap: 4px; }
+.asset-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  /* 徽章与按钮都是 flex:none（不许压缩），一行放不下时改换行——不换行就会从右边顶出去，
+     在 299px 宽的表单里表现为横向滚动条 + 右侧按钮被裁掉。 */
+  flex-wrap: wrap;
+  padding: 5px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 12px;
+}
+.asset-item.is-bad { border-color: rgba(255, 150, 150, 0.45); }
+.asset-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.asset-badge { flex: none; padding: 1px 7px; border-radius: 999px; font-size: 10.5px; }
+.asset-badge.is-ok { background: rgba(120, 220, 160, 0.18); color: #9fe6bb; border: 1px solid rgba(120, 220, 160, 0.4); }
+.asset-badge.is-warn { background: rgba(255, 209, 102, 0.16); color: #ffd166; border: 1px solid rgba(255, 209, 102, 0.4); }
+.asset-badge.is-bad { background: rgba(255, 140, 140, 0.16); color: #ffb4b4; border: 1px solid rgba(255, 140, 140, 0.45); }
+.asset-item button {
+  flex: none;
+  padding: 2px 9px;
+  font-size: 11px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: transparent;
+  color: rgba(255, 255, 255, 0.85);
+  cursor: pointer;
+}
+.asset-item button:hover { background: rgba(158, 203, 255, 0.2); }
+.asset-issues { padding: 0 4px 2px 10px; font-size: 11px; line-height: 1.5; color: #ffd166; white-space: pre-wrap; word-break: break-word; }
+
+/* 当前模型预设一行：左边是摘要（长文本省略），右边是"生成/打开模板"按钮 */
+.asset-preset-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 2px 4px;
+}
+.asset-preset-row .asset-path {
+  flex: 1;
+  min-width: 0;
+  /* 摘要保持**一行**（短摘要 + title 里有完整信息）：换行会把这行挤成两行、看起来像排版坏了。
+     解释性长文案放在下面独立的 hint 行。 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.asset-preset-row .asset-path.is-bad { color: #ff9c9c; }
+.asset-preset-hint {
+  padding: 0 2px 4px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.5);
+  white-space: normal;
+  word-break: break-word;
+}
+.asset-preset-hint.is-bad { color: #ff9c9c; }
+.asset-preset-row button {
+  flex: none;
+  padding: 3px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.88);
+  font-size: 11px;
+  cursor: pointer;
+}
+.asset-preset-row button:hover { background: rgba(158, 203, 255, 0.2); border-color: rgba(158, 203, 255, 0.6); }
+
+/* 设置页里的分组框（语音识别等）：与深色玻璃主题一致 */
+.settings-fieldset {
+  margin: 6px 0 2px;
+  padding: 6px 8px 8px;
+  border: 1px solid rgba(120, 150, 190, 0.26);
+  border-radius: 10px;
+  background: rgba(12, 16, 26, 0.22);
+  /* fieldset 的 UA 默认值是 min-inline-size:min-content：里面的长网关地址会把整个
+     grid 列撑到比面板还宽，面板就出现横向滚动条、左边的字被推出可视区（用户报的"看不全"）。 */
+  min-inline-size: 0;
+  min-width: 0;
+}
+.settings-fieldset > legend {
+  padding: 0 4px;
+  color: #9ecbff;
+  font-size: 11px;
+}
+.settings-fieldset .settings-row { margin-top: 4px; }
+/* 状态文案（含长 URL）占满一整行：与按钮挤在同一行时既折不开也读不清 */
+.settings-fieldset .settings-status { flex: 1 1 100%; min-width: 0; }
+
+/* 转写模型「按地址索引」的提示行：三档颜色复用资产徽章那套语义色 */
+.voice-model-hint.is-ok { color: #9fe6bb; }
+.voice-model-hint.is-warn { color: #ffd166; }
+.voice-model-hint.is-bad { color: #ffb4b4; }
+
+/* ---------- AI 对话输入条（右键菜单“💬 和 Pet 聊天”打开） ----------
+   顶部窄条居中（bottom:auto），不遮挡站底部的角色；视觉语言对齐 .context-menu
+   （深色半透明胶囊 + 白字）；默认 opacity/visibility 收起，JS 加 .is-open 淡入。
+   z-index 90：高于气泡(60)/模型，低于右键菜单(100)。
+   整条 no-drag：输入框可点击聚焦、按钮可点（顶部 12px 拖拽条带仍可拖窗）。 */
+.chatbar {
+  /* 气泡框的视觉层（底色/描边/模糊/投影）统一由 ::before 承担，这里只留布局。
+     为什么拆开：要"两侧逐渐透明"只能用 mask 淡出，而 mask 作用在整个元素上——
+     直接把 mask 加在 #chatbar 上会把里面的**文字和输入框一起淡化**，可读性受损。
+     拆到 ::before 后，淡出只作用于框本身，内容保持清晰。 */
+  --frame-bg: rgba(20, 26, 38, 0.72);
+  --frame-border: rgba(255, 255, 255, 0.25);
+  --frame-shadow: 0 6px 20px rgba(0, 0, 0, 0.28);
+  --frame-blur: 8px;
+  --frame-fade: 24px; /* 两侧各自淡出的宽度 */
+  position: fixed;
+  top: 12px;                 /* 置于 #drag-top(0–12px) 之下，不与拖拽条带重叠 */
+  left: 50%;
+  bottom: auto;
+  transform: translateX(-50%) translateY(-8px);
+  display: flex;
+  flex-direction: column;    /* 上：对话记录；下：输入行 */
+  align-items: stretch;
+  gap: 6px;
+  width: min(560px, 84%);
+  max-height: 62vh;
+  padding: 8px 8px 6px;
+  border: 0;
+  border-radius: 14px;
+  background: transparent;
+  box-shadow: none;
+  color: #fff;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  z-index: 90;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+/* ---- 气泡框的视觉层 + 两侧逐渐透明（mask 只作用在 ::before 上，内容不受影响）---- */
+.chatbar::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;          /* 在父级内容之下，但仍在 #chatbar 自己的层叠上下文里 */
+  pointer-events: none;
+  border-radius: 14px;
+  background: var(--frame-bg);
+  border: 1px solid var(--frame-border);
+  box-shadow: var(--frame-shadow);
+  -webkit-backdrop-filter: blur(var(--frame-blur));
+  backdrop-filter: blur(var(--frame-blur));
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 var(--frame-fade),
+    #000 calc(100% - var(--frame-fade)),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 var(--frame-fade),
+    #000 calc(100% - var(--frame-fade)),
+    transparent 100%
+  );
+}
+
+/* 老引擎没有 mask-image：退回"不淡出"的完整气泡框（宁可少个效果，不能少个框） */
+@supports not ((mask-image: linear-gradient(#000, #000)) or (-webkit-mask-image: linear-gradient(#000, #000))) {
+  .chatbar::before {
+    -webkit-mask-image: none;
+    mask-image: none;
+  }
+}
+
+.chatbar.is-open {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(-50%) translateY(0);
+  pointer-events: auto;
+}
+
+/* 聚焦态高亮：描边在 ::before 上（元素本身已经没有 border 了） */
+.chatbar:focus-within::before {
+  border-color: rgba(160, 210, 255, 0.75);
+}
+
+/* ---------- 对话工具条（新对话 / 历史） ---------- */
+.chat-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 2px 2px;
+}
+.chat-tool {
+  padding: 2px 9px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.85);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.chat-tool:hover { background: rgba(255, 255, 255, 0.16); border-color: rgba(160, 210, 255, 0.6); }
+.chat-toolbar-status {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.6);
+}
+.chat-toolbar-status.is-error { color: #ffb4b4; }
+
+/* ---------- 历史对话列表 ---------- */
+.chat-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 32vh;
+  overflow-y: auto;
+  padding: 6px;
+  margin-bottom: 6px;
+  border-radius: 10px;
+  background: rgba(12, 16, 26, 0.55);
+  scrollbar-width: thin;
+}
+.chat-history-empty { font-size: 11.5px; color: rgba(255, 255, 255, 0.5); padding: 2px 4px; }
+.chat-history-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 8px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.05);
+  color: rgba(255, 255, 255, 0.88);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.chat-history-item:hover { background: rgba(255, 255, 255, 0.13); }
+.chat-history-item.is-current { border-color: rgba(158, 203, 255, 0.75); }
+.chat-history-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-history-meta { flex: none; font-size: 10.5px; color: rgba(255, 255, 255, 0.5); }
+.chat-history-clear {
+  margin-top: 2px;
+  padding: 3px 8px;
+  font-size: 11px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 150, 150, 0.4);
+  background: transparent;
+  color: #ffb4b4;
+  cursor: pointer;
+}
+.chat-history-clear:hover { background: rgba(255, 150, 150, 0.14); }
+
+/* ---------- 对话记录（可滚动回看） ---------- */
+.chat-log {
+  flex: 1 1 auto;
+  min-height: 40px;
+  max-height: 46vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 8px 9px;
+  border-radius: 10px;
+  background: rgba(12, 16, 26, 0.22); /* 面板比气泡更暗：气泡才"浮"得出来 */
+  font-size: 12.5px;
+  line-height: 1.62;
+  scrollbar-width: thin;
+  overscroll-behavior: contain; /* 滚到底不要把滚动传给外层窗口 */
+  -webkit-user-select: text;
+  user-select: text;
+  /* 让每条气泡按**内容宽度**收缩（而不是撑满整行）：
+     这是"看得出是一条条气泡"的关键——短消息就是一个短气泡 */
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+/* 细圆角滚动条（Windows 上默认滚动条太抢眼，与玻璃卡不搭） */
+.chat-log::-webkit-scrollbar { width: 7px; }
+.chat-log::-webkit-scrollbar-track { background: transparent; }
+.chat-log::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.16);
+}
+.chat-log::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.3); }
+.chat-log:empty { display: none; }
+/* ---- 对话行 = 气泡：尾巴角 5px、圆角 15px、内边距 11px 14px、
+   用户行右对齐并把尾巴角镜像；这里是深色玻璃版本的等价取值） ---- */
+.chat-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  max-width: 86%;
+  margin: 0 0 8px 0;
+  padding: 7px 10px;
+  border: 1px solid rgba(96, 118, 150, 0.32);
+  border-radius: 14px 14px 14px 5px;
+  background: rgba(44, 56, 80, 0.92);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.22); /* 每条气泡自己落一点影，才看得出是"一条一条" */
+}
+.chat-row:last-child { margin-bottom: 0; }
+.chat-row.is-user {
+  align-self: flex-end;
+  border-radius: 14px 14px 5px 14px;
+  border-color: rgba(126, 168, 226, 0.55);
+  background: rgba(58, 92, 140, 0.92); /* 比桌宠气泡明显偏蓝，左右一眼分得开 */
+}
+.chat-row.is-tool {
+  border-color: rgba(80, 96, 120, 0.26);
+  background: rgba(30, 38, 54, 0.8);
+}
+.chat-row.is-pet { margin-right: 0; }
+.chat-label {
+  flex: none;
+  min-width: 0;
+  margin-bottom: 3px;          /* 标签在气泡内顶部 */
+  font-size: 10.5px;
+  line-height: 1.5;
+  letter-spacing: 0.04em;
+  text-align: left;
+  color: #9fb0c6;
+}
+.chat-row.is-user .chat-label { text-align: right; }
+.chat-text { flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; }
+.chat-row.is-user .chat-text { color: #9ecbff; }
+.chat-row.is-pet .chat-text { color: rgba(255, 255, 255, 0.94); }
+.chat-row.is-tool .chat-text { color: rgba(255, 255, 255, 0.58); font-size: 11.5px; font-style: italic; }
+.chat-row.is-error .chat-text { color: #ffb4b4; }
+.chat-row.is-typing .chat-text { color: rgba(255, 255, 255, 0.5); font-style: italic; }
+
+/* ---- 行状态：发送中（半透明）/ 已送达（正常）/ 失败（红条 + 可点重填） ----
+  每行带 sending/sent/failed 三态；同时保留可交互状态：
+   失败的行走的是"点一行 → 文字回到输入框"，不自动重发（避免误发与浪费额度）。 */
+.chat-row.is-sending .chat-text { opacity: 0.62; }
+.chat-row.is-sending .chat-text::after {
+  content: ' · 发送中';
+  font-size: 10.5px;
+  opacity: 0.75;
+}
+.chat-row.is-failed {
+  margin-left: 0;
+  border-radius: 14px 14px 14px 5px;
+  border-color: rgba(255, 120, 120, 0.5);
+  background: rgba(90, 40, 46, 0.6);
+  cursor: pointer;
+}
+.chat-row.is-failed:hover {
+  border-color: rgba(255, 140, 140, 0.7);
+  background: rgba(110, 48, 56, 0.68);
+}
+/* 失败行若本来是"我发的"，尾巴角仍要指向右下（别被 .is-failed 的圆角盖掉） */
+.chat-row.is-user.is-failed { border-radius: 14px 14px 5px 14px; }
+.chat-row.is-failed .chat-text::after {
+  content: ' · 点这一行重填';
+  font-size: 10.5px;
+  color: rgba(255, 180, 180, 0.9);
+}
+.chat-row.is-error {
+  border-color: rgba(255, 150, 150, 0.4);
+  background: rgba(80, 38, 44, 0.6);
+}
+
+/* ---- 等待回复：三点跳动（比"…"更像在干活，且不占额外行高） ---- */
+.chat-row.is-typing .chat-text::after {
+  content: '';
+  display: inline-block;
+  width: 1.2em;
+  text-align: left;
+  animation: chat-dots 1.2s steps(4, end) infinite;
+}
+@keyframes chat-dots {
+  0% { content: ''; }
+  25% { content: '.'; }
+  50% { content: '..'; }
+  75% { content: '...'; }
+  100% { content: ''; }
+}
+
+/* 输入区：深色玻璃卡，
+   focus-within 给 3px 柔光，把"整条输入区"作为一个聚焦边界（输入框本身不再描边） */
+.chat-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 7px 6px 11px;
+  border: 1px solid rgba(120, 150, 190, 0.28);
+  border-radius: 15px;
+  background: rgba(30, 40, 60, 0.55);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.chat-input-row:focus-within {
+  border-color: rgba(130, 163, 206, 0.75);
+  box-shadow: 0 0 0 3px rgba(136, 168, 210, 0.11);
+}
+
+/* ---- 声纹（实时输入电平波形）：voicelab.ts 注入，插在输入行之前 ----
+  28px 高的圆角浮条 + 160×24 的镜像对称波形。
+   这里不做绝对定位（气泡窗只有 270px 高，绝对定位会压住输入行），走文档流占一行。 */
+.pet-voice-lab {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 100%;
+  max-width: 200px;
+  height: 26px;
+  margin: 0 auto;
+  border: 1px solid rgba(120, 150, 190, 0.3);
+  border-radius: 13px;
+  background: rgba(30, 40, 60, 0.68);
+  color: #c2d5ed;
+  font-size: 11px;
+  line-height: 1;
+  pointer-events: none;
+  overflow: hidden;
+}
+.pet-voice-lab[hidden] { display: none !important; }
+.pet-voice-status { white-space: nowrap; }
+.pet-voice-wave { display: block; width: 160px; max-width: calc(100% - 12px); height: 22px; }
+.pet-voice-wave[hidden] { display: none !important; }
+.pet-voice-wave svg { display: block; width: 100%; height: 100%; }
+#pet-voice-wave-path {
+  stroke: #8fb6de;
+  stroke-width: 1.4;
+  fill: rgba(143, 182, 222, 0.3);
+  stroke-linejoin: round;
+}
+/* 录音中：亮蓝（与麦克风按钮的蓝色脉冲同色系，用明度区分状态；不用红色以免破坏主题） */
+.pet-voice-lab[data-phase='recording'] { border-color: rgba(74, 163, 224, 0.5); }
+.pet-voice-lab[data-phase='recording'] #pet-voice-wave-path {
+  stroke: #6fc3f2;
+  fill: rgba(111, 195, 242, 0.3);
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-input-row { transition: none; }
+}
+
+.chat-input {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  border: 0;
+  outline: 0;
+  color: #fff;
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+.chat-input::placeholder {
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.chat-send {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 28px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 999px;
+  color: #fff;
+  background: #287fc4;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+/* 聚焦输入时的柔和描边（只描输入框本身，不抢整窗的 focus-within 描边） */
+.chat-input:focus-visible {
+  box-shadow: 0 0 0 2px rgba(158, 203, 255, 0.28);
+  border-radius: 6px;
+}
+
+/* 从失败行"填回"输入框时闪一下，让用户知道文字去哪了 */
+.chat-input.is-prefilled {
+  animation: chat-prefill 0.9s ease-out;
+  border-radius: 6px;
+}
+@keyframes chat-prefill {
+  0%   { box-shadow: 0 0 0 3px rgba(255, 170, 170, 0.55); }
+  100% { box-shadow: 0 0 0 3px rgba(255, 170, 170, 0); }
+}
+
+.chat-send:hover {
+  background: #3599e8;
+}
+
+.chat-send:disabled {
+  background: rgba(255, 255, 255, 0.16);
+  color: rgba(255, 255, 255, 0.5);
+  cursor: default;
+}
+
+/* ================= 语音输入（按住说话） ================= */
+/* 位置：输入框与发送按钮之间；按住才录音，松开立刻转写，转写完只填进输入框不自动发送。 */
+.chat-mic {
+  position: relative;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  cursor: pointer;
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: none; /* 按住拖出按钮时不触发滚动/手势 */
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+.chat-mic:hover { background: rgba(255, 255, 255, 0.16); }
+
+.chat-mic.is-arming {
+  border-color: #ffb347;
+  background: rgba(255, 179, 71, 0.2);
+}
+
+/* 录音中：与整体主题同色系的**蓝色**脉冲（原来是红色，和深蓝玻璃主题冲突）+ 呼吸光环。
+   蓝色 + 动效 + 竖条跳动 = 三重提示，不依赖单一颜色（色盲也能看出来）。 */
+.chat-mic.is-listening {
+  border-color: #4aa3e0;
+  background: rgba(40, 127, 196, 0.28);
+  box-shadow: 0 0 0 0 rgba(40, 127, 196, 0.55);
+  animation: chat-mic-pulse 1.1s ease-out infinite;
+}
+
+@keyframes chat-mic-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(40, 127, 196, 0.55); }
+  70%  { box-shadow: 0 0 0 7px rgba(40, 127, 196, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(40, 127, 196, 0); }
+}
+
+.chat-mic.is-busy { opacity: 0.6; cursor: progress; animation: none; box-shadow: none; }
+.chat-mic:disabled { cursor: progress; }
+
+.chat-mic-ring {
+  position: absolute;
+  inset: -3px;
+  border-radius: 999px;
+  border: 1px solid rgba(74, 163, 224, 0.6);
+  opacity: 0;
+}
+
+.chat-mic.is-listening .chat-mic-ring { opacity: 1; animation: chat-mic-ring 1.1s ease-out infinite; }
+
+@keyframes chat-mic-ring {
+  0%   { transform: scale(0.9); opacity: 0.85; }
+  100% { transform: scale(1.25); opacity: 0; }
+}
+
+/* 语音状态行：与主题同色系（浅蓝 = 进行中；错误才用柔和红） */
+.chat-row.is-voice .chat-text { color: #9ecbff; font-style: normal; }
+.chat-row.is-voice.is-error .chat-text { color: #ffb4b4; }
+
+/* ---- 声纹图标（麦克风按钮里的 7 条圆头竖条，描边不填充）----
+   参考用户给的图：中间最高、左右两条依次变矮；录音时竖条自己跳动（音量感）。 */
+.chat-mic-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+}
+.chat-mic-ico svg { display: block; width: 100%; height: 100%; }
+/* 关键：不写 transform-box 的话 transform-origin:center 指的是整个 SVG 视口中心，
+   竖条会整体位移而不是"从自己中心伸缩"。 */
+.chat-mic-ico line { transform-box: fill-box; transform-origin: center; }
+
+.chat-mic.is-listening .chat-mic-ico line {
+  animation: chat-mic-bars 0.6s ease-in-out infinite alternate;
+}
+.chat-mic.is-listening .chat-mic-ico line:nth-child(1) { animation-delay: 0.05s; }
+.chat-mic.is-listening .chat-mic-ico line:nth-child(2) { animation-delay: 0.1s; }
+.chat-mic.is-listening .chat-mic-ico line:nth-child(3) { animation-delay: 0.15s; }
+.chat-mic.is-listening .chat-mic-ico line:nth-child(4) { animation-delay: 0.2s; }
+.chat-mic.is-listening .chat-mic-ico line:nth-child(5) { animation-delay: 0.15s; }
+.chat-mic.is-listening .chat-mic-ico line:nth-child(6) { animation-delay: 0.1s; }
+.chat-mic.is-listening .chat-mic-ico line:nth-child(7) { animation-delay: 0.05s; }
+
+@keyframes chat-mic-bars {
+  from { transform: scaleY(0.55); }
+  to   { transform: scaleY(1); }
+}
+
+/* 降低动效偏好：竖条不再跳动（只保留静音图标） */
+@media (prefers-reduced-motion: reduce) {
+  .chat-mic.is-listening .chat-mic-ico line { animation: none; }
+  .chat-mic.is-listening { animation: none; }
+  .chat-mic.is-listening .chat-mic-ring { animation: none; opacity: 0.6; }
+}
+
+/* ================= 待办笔记本（Notebook 面板） ================= */
+.todo-panel {
+  position: absolute;
+  inset: 0;
+  z-index: 900;
+  display: flex;
+  flex-direction: column;
+  background: #fdf7e7; /* 米色纸感 */
+  background-image: repeating-linear-gradient(transparent 0, transparent 23px, rgba(140,110,80,.12) 24px);
+  border-radius: 0 0 14px 14px;
+  box-shadow: inset 0 0 0 1px rgba(160,130,90,.35);
+  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+}
+.todo-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px 8px;
+  border-bottom: 1px dashed #c9b288;
+}
+.todo-header h1 {
+  margin: 0;
+  font-size: 16px;
+  color: #6b4f2a;
+  letter-spacing: 1px;
+}
+.todo-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 4px;
+  min-height: 0;
+}
+.todo-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 12px;
+  color: #4a3823;
+}
+.todo-item + .todo-item { border-top: 1px dotted rgba(170,140,90,.4); }
+.todo-item-checkbox { margin-top: 3px; accent-color: #8a6d3b; cursor: pointer; flex: none; }
+.todo-item-text {
+  flex: 1;
+  font-size: 13.5px;
+  line-height: 1.45;
+  word-break: break-word;
+  cursor: pointer;
+  user-select: text;
+}
+.todo-item-text.done { text-decoration: line-through; color: #a09177; }
+.todo-item-delete {
+  flex: none;
+  background: none;
+  border: none;
+  color: #b3a183;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+.todo-item-delete:hover { color: #d05555; background: rgba(220,120,90,.15); }
+.todo-empty { padding: 26px 10px; text-align: center; color: #a09177; font-size: 13px; }
+.todo-footer {
+  display: flex;
+  gap: 6px;
+  padding: 10px 12px;
+  border-top: 1px dashed #c9b288;
+  background: rgba(255,252,240,.6);
+}
+.todo-input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  font-size: 13.5px;
+  color: #4a3823;
+  background: #fffdf4;
+  border: 1px solid #cdbb96;
+  border-radius: 8px;
+  outline: none;
+}
+.todo-input:focus { border-color: #a98a52; }
+.todo-add {
+  padding: 6px 14px;
+  font-size: 13.5px;
+  color: #fff;
+  background: #8a6d3b;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.todo-add:hover { background: #6f5629; }
+
+.todo-cancel {
+  padding: 6px 12px;
+  font-size: 13px;
+  color: #6b4f2a;
+  background: #f0e6cf;
+  border: 1px solid #cdbb96;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.todo-cancel:hover { background: #e2d4b4; }
+
+
+/* 兜底：任何带 hidden 的元素必须隐藏（防止类 display 覆盖 hidden 导致开机即显示面板） */
+[hidden] { display: none !important; }
+
+
+/* ================= AI 提问框（ask_user）与设置项 ================= */
+.ask-box {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: 58px;
+  z-index: 950;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  background: rgba(28, 24, 20, 0.94);
+  border: 1px solid rgba(214, 178, 116, 0.45);
+  border-radius: 12px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  color: #f5ead3;
+}
+.ask-question { font-size: 13.5px; line-height: 1.5; font-weight: 600; white-space: pre-wrap; word-break: break-word; max-height: 46vh; overflow-y: auto; }
+.ask-options { display: flex; flex-direction: column; gap: 6px; }
+.ask-option-btn {
+  text-align: left;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(214, 178, 116, 0.4);
+  background: rgba(255, 255, 255, 0.06);
+  color: #f7efdd;
+  cursor: pointer;
+  font-size: 13px;
+}
+.ask-option-btn:hover { background: rgba(214, 178, 116, 0.22); }
+.ask-option-label { display: block; font-weight: 600; }
+.ask-option-desc { display: block; margin-top: 2px; font-size: 12px; opacity: .75; }
+.ask-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 9px;
+  font-size: 13px;
+  color: #f5ead3;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(214, 178, 116, 0.35);
+  border-radius: 8px;
+  outline: none;
+}
+.ask-input:focus { border-color: #d6b274; }
+.settings-form .settings-checkbox { display: flex; align-items: center; gap: 6px; font-size: 13px; min-width: 0; flex-wrap: wrap; }
+.settings-checkbox input { width: auto; flex: none; }
+
+/* 音效音量：滑杆用主题色，右侧显示百分比 */
+.settings-form .settings-range { display: flex; align-items: center; gap: 8px; font-size: 13px; min-width: 0; }
+.settings-range input[type='range'] {
+  flex: 1;
+  width: auto;
+  height: 18px;
+  padding: 0;
+  background: transparent;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.settings-range input[type='range']::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.22);
+}
+.settings-range input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 13px;
+  height: 13px;
+  margin-top: -4.5px;
+  border-radius: 50%;
+  background: #9ecbff;
+  border: 1px solid rgba(24, 29, 43, 0.9);
+  cursor: pointer;
+}
+.settings-range-value { min-width: 34px; color: rgba(255, 255, 255, 0.72); font-size: 12px; text-align: right; }
+
+/* 开发工作区一行：路径输入占满，两个按钮不换行 */
+/* 注意选择器前缀：.settings-form label{display:grid}（0,1,1）比单个类（0,1,0）更具体，
+   所以"标签和控件排在同一行"的这几个 label 必须用 .settings-form 提权，
+   否则它们会退化成竖排 grid——每行都多占一行高度，面板凭空长一倍（滚动更多）。 */
+.settings-form .settings-row { display: flex; align-items: center; gap: 8px; font-size: 13px; flex-wrap: wrap; min-width: 0; }
+/* 同理必须写 input，不能只写 input[type='text']：「AI 模型」那个输入框没写 type 属性，
+   匹配不到就保留 .settings-form input{width:100%}，在 flex 行里必然撑破整行 →
+   面板出现横向滚动条、左侧文字被推出可视区。 */
+.settings-form .settings-row input,
+.settings-form .settings-row select { flex: 1 1 92px; width: auto; min-width: 0; }
+.settings-form .settings-row button { flex: 0 0 auto; white-space: nowrap; padding: 0 8px; }
+.settings-form .settings-row .settings-status { flex: 1 1 100%; }
+
+/* ================= 思考过程浮窗（贴在模型旁边） ================= */
+.think-panel {
+  position: absolute;
+  right: 6px;
+  top: 70px;
+  width: 152px;
+  max-height: 262px;
+  display: flex;
+  flex-direction: column;
+  background: rgba(22, 20, 18, 0.9);
+  border: 1px solid rgba(214, 178, 116, 0.35);
+  border-radius: 10px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  color: #e9e2d2;
+  z-index: 940;
+  overflow: hidden;
+}
+.think-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 8px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #d6b274;
+  border-bottom: 1px solid rgba(214, 178, 116, 0.25);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* AI 任务进度清单（plan_update）：贴在浮窗顶部，可滚动 */
+.think-plan {
+  max-height: 96px;
+  overflow-y: auto;
+  padding: 4px 8px;
+  border-bottom: 1px solid rgba(214, 178, 116, 0.25);
+  font-size: 11px;
+  line-height: 1.35;
+  color: rgba(255, 255, 255, 0.85);
+}
+.think-plan-item {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.think-plan-item.is-done {
+  color: rgba(255, 255, 255, 0.52);
+  text-decoration: line-through;
+}
+.think-plan-item.is-doing {
+  color: #9ecbff;
+  font-weight: 600;
+}
+.think-plan-item.is-pending {
+  color: rgba(255, 255, 255, 0.8);
+}
+
+/* 等待用户确认（弹窗）期间：整块浮窗进入"暂停"态，提示它在等你而不是还在思考 */
+.think-panel.is-waiting {
+  border-color: rgba(255, 209, 102, 0.85);
+  box-shadow: 0 0 0 1px rgba(255, 209, 102, 0.4), 0 6px 18px rgba(0, 0, 0, 0.45);
+}
+.think-panel.is-waiting .think-header {
+  color: #ffd166;
+  border-bottom-color: rgba(255, 209, 102, 0.4);
+}
+.think-panel.is-waiting .think-line {
+  opacity: 0.55; /* 已产出的思考内容压暗，突出"现在在等你" */
+}
+.think-panel.is-waiting .think-line:last-child {
+  opacity: 1;
+  color: #ffd166;
+}
+.think-close {
+  background: none;
+  border: none;
+  color: #cdb896;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.think-close:hover { color: #fff; }
+.think-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px 8px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.think-line { margin-bottom: 4px; word-break: break-word; white-space: pre-wrap; }
+.think-line.is-reasoning { color: #b9b2a4; }
+.think-line.is-tool { color: #e3c07a; }
+.think-line.is-result { color: #9fd7a5; }
+.think-line.is-error { color: #ff9b90; }
+.think-line.is-done { color: #d6b274; }
+
+/* 思考浮窗：可拖拽 header + 折叠胶囊 */
+.think-header { cursor: move; user-select: none; }
+.think-capsule {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  z-index: 945;
+  padding: 4px 10px;
+  font-size: 11.5px;
+  color: #1d1a16;
+  background: rgba(214, 178, 116, 0.92);
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);
+}
+.think-capsule:hover { background: #e6c98d; }
+
+/* ================= 主题统一覆盖：思考浮窗 / 提问框 与全站深色玻璃卡一致 ================= */
+.think-panel {
+  background: rgba(24, 29, 43, 0.94);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 12px;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.42);
+  color: rgba(255, 255, 255, 0.88);
+}
+.think-header {
+  color: rgba(255, 255, 255, 0.62);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.16);
+  background: transparent;
+}
+.think-close { color: rgba(255, 255, 255, 0.6); }
+.think-close:hover { color: #fff; }
+.think-line.is-reasoning { color: rgba(255, 255, 255, 0.62); }
+.think-line.is-tool { color: #9ecbff; }
+.think-line.is-result { color: #8fe0a8; }
+.think-line.is-error { color: #ffb3ae; }
+.think-line.is-done { color: #cfe4ff; }
+.think-capsule {
+  background: rgba(24, 29, 43, 0.94);
+  color: #fff;
+  border: 1px solid rgba(160, 210, 255, 0.75);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+.think-capsule:hover { background: rgba(40, 127, 196, 0.9); }
+
+.ask-box {
+  background: rgba(24, 29, 43, 0.96);
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  border-radius: 12px;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.42);
+  color: #f6f7fb;
+}
+.ask-question { color: #fff; }
+.ask-option-btn {
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  color: rgba(255, 255, 255, 0.92);
+}
+.ask-option-btn:hover {
+  background: rgba(255, 255, 255, 0.18);
+  border-color: rgba(160, 210, 255, 0.75);
+}
+.ask-option-desc { color: rgba(255, 255, 255, 0.62); }
+.ask-input {
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  color: #fff;
+}
+.ask-input:focus { border-color: rgba(160, 210, 255, 0.8); }
+.settings-checkbox { color: rgba(255, 255, 255, 0.82); }
+
+/* ================= 点击星星特效（粉色小范围扩散，风格与深色玻璃主体一致） ================= */
+.fx-layer {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;   /* 绝不拦截鼠标：不触发拖拽/右键/滚轮 */
+  overflow: hidden;
+  z-index: 600;           /* 高于模型 canvas，低于待办/提问/思考/设置面板 */
+}
+.sparkle {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  font-size: var(--size, 10px);
+  line-height: 1;
+  color: var(--color, #ff9fd0);
+  opacity: 0.4;           /* 初始半透明，不遮挡视野 */
+  text-shadow: 0 0 6px rgba(255, 159, 208, 0.55), 0 0 2px rgba(255, 255, 255, 0.35);
+  will-change: transform, opacity;
+  animation:
+    sparkle-burst var(--dur, 650ms) cubic-bezier(0.22, 0.61, 0.36, 1) var(--delay, 0ms) forwards,
+    sparkle-fade var(--dur, 650ms) ease-out var(--delay, 0ms) forwards;
+}
+.sparkle-halo {
+  position: absolute;
+  width: 96px;
+  height: 96px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(255, 159, 208, 0.22) 0%, rgba(255, 159, 208, 0.10) 45%, rgba(255, 159, 208, 0) 72%);
+  pointer-events: none;
+  animation: sparkle-halo-fade 340ms ease-out forwards;
+}
+@keyframes sparkle-burst {
+  0%   { transform: translate(-50%, -50%) scale(1) rotate(0deg); }
+  100% { transform: translate(calc(-50% + var(--dx, 0px)), calc(-50% + var(--dy, 0px))) scale(0.55) rotate(var(--rot, 0deg)); }
+}
+@keyframes sparkle-fade {
+  0%   { opacity: 0.38; }
+  28%  { opacity: 0.62; }
+  100% { opacity: 0; }
+}
+@keyframes sparkle-halo-fade {
+  0%   { opacity: 0.55; transform: translate(-50%, -50%) scale(0.7); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(1.15); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sparkle { animation: sparkle-fade 320ms ease-out forwards; }
+  .sparkle-halo { animation: sparkle-halo-fade 200ms ease-out forwards; }
+}
+
+/* =================================================================================
+   ① 对话气泡窗（?panel=chat）：无边框透明小窗（340x240），浮在桌宠上方，
+      底部有个指向桌宠的小尾巴。窗口本体透明，气泡外观全由 #chatbar 画。
+   ================================================================================= */
+body.is-chat-window {
+  background: transparent;
+  color: #fff;
+  cursor: default;
+  overflow: hidden;
+}
+
+body.is-chat-window #stage,
+body.is-chat-window #fx-layer,
+body.is-chat-window .window-drag-strip,
+body.is-chat-window #bubble,
+body.is-chat-window #overlay,
+body.is-chat-window #context-menu,
+body.is-chat-window #todo-panel,
+body.is-chat-window #settings-panel,
+body.is-chat-window #think-panel,
+body.is-chat-window #think-capsule {
+  display: none !important; /* 思考过程有独立浮窗，气泡窗里不重复显示 */
+}
+
+/* 气泡本体：铺满窗口，深色玻璃卡 + 圆角 */
+body.is-chat-window #chatbar {
+  /* 气泡窗里的框更实一点、更宽一点；视觉层同样交给 ::before（见 .chatbar::before） */
+  --frame-bg: rgba(20, 26, 38, 0.93);
+  --frame-border: rgba(255, 255, 255, 0.22);
+  --frame-shadow: 0 10px 30px rgba(0, 0, 0, 0.46), 0 2px 8px rgba(0, 0, 0, 0.3);
+  --frame-blur: 10px;
+  --frame-fade: 36px; /* 360px 宽的窗口里，两侧各 36px 淡出视觉最自然 */
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  width: auto;
+  max-height: none;
+  height: auto;
+  padding: 6px 8px 7px;
+  border: 0;
+  border-radius: 14px;
+  background: transparent;
+  box-shadow: none;
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: none;
+  /* 气泡窗打开时轻轻弹出（只播一次；窗本身是固定尺寸的透明窗，动画只作用于卡片） */
+  animation: chat-pop 0.19s cubic-bezier(0.2, 0.9, 0.3, 1.15);
+}
+@keyframes chat-pop {
+  from { transform: scale(0.96) translateY(4px); opacity: 0.4; }
+  to   { transform: scale(1) translateY(0); opacity: 1; }
+}
+body.is-chat-window #chatbar.is-open { transform: none; }
+body.is-chat-window #chatbar:focus-within::before { border-color: rgba(160, 210, 255, 0.75); }
+
+/* 指向桌宠的小尾巴：data-tail=down（气泡在桌宠上方）默认朝下；up 时翻到顶部朝上；none 不画 */
+body.is-chat-window .chat-tail {
+  position: absolute;
+  left: 50%;
+  bottom: -9px;
+  width: 18px;
+  height: 10px;
+  margin-left: -9px;
+  pointer-events: none;
+  filter: drop-shadow(0 3px 4px rgba(0, 0, 0, 0.32)); /* 尾巴跟着卡片一起落影，避免"贴纸感" */
+}
+body.is-chat-window .chat-tail::before {
+  content: '';
+  display: block;
+  width: 0;
+  height: 0;
+  border-left: 9px solid transparent;
+  border-right: 9px solid transparent;
+  border-top: 10px solid rgba(20, 26, 38, 0.93);
+}
+body.is-chat-window[data-tail='up'] .chat-tail { bottom: auto; top: -9px; }
+body.is-chat-window[data-tail='up'] .chat-tail::before {
+  border-top: 0;
+  border-bottom: 10px solid rgba(20, 26, 38, 0.93);
+}
+body.is-chat-window[data-tail='none'] .chat-tail { display: none; }
+
+/* 顶栏就是整窗的拖动条（按钮与状态文字之外的区域可拖） */
+body.is-chat-window #chat-toolbar {
+  -webkit-app-region: drag;
+  app-region: drag;
+  padding: 0 2px 2px;
+  gap: 6px;
+}
+body.is-chat-window #chat-toolbar button,
+body.is-chat-window .chat-menu button {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+/* 左侧 ＋ 按钮 / 右侧 × 按钮 */
+.chat-plus,
+.chat-close {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.26);
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.9);
+  cursor: pointer;
+}
+.chat-plus:hover,
+.chat-close:hover {
+  background: rgba(158, 203, 255, 0.28);
+  border-color: rgba(158, 203, 255, 0.7);
+  color: #fff;
+}
+.chat-plus[aria-expanded='true'] {
+  background: rgba(158, 203, 255, 0.35);
+  border-color: rgba(158, 203, 255, 0.85);
+}
+
+/* ＋ 菜单：浮在气泡内部左上角 */
+.chat-menu {
+  position: absolute;
+  left: 8px;
+  top: 28px;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 148px;
+  padding: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 10px;
+  background: rgba(14, 19, 29, 0.98);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.5);
+}
+.chat-menu button {
+  text-align: left;
+  padding: 5px 9px;
+  font-size: 12px;
+  line-height: 1.6;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.9);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.chat-menu button:hover { background: rgba(158, 203, 255, 0.22); color: #fff; }
+
+/* 气泡窗内的对话记录：占满剩余高度，字号略小 */
+body.is-chat-window .chat-log {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+  padding: 5px 7px;
+  background: rgba(12, 16, 26, 0.6);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+body.is-chat-window .chat-row { margin-bottom: 7px; }
+body.is-chat-window #chat-log { padding: 6px 7px; }
+body.is-chat-window .chat-label { min-width: 22px; font-size: 10.5px; }
+
+/* 历史列表：覆盖在对话记录之上，不挤压输入区 */
+body.is-chat-window .chat-history-list {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  top: 28px;
+  bottom: 40px;
+  z-index: 20;
+  max-height: none;
+  background: rgba(12, 16, 26, 0.98);
+}
+body.is-chat-window .chat-input-row { padding-top: 2px; }
+body.is-chat-window .chat-input { font-size: 13px; }
+body.is-chat-window .chat-send { padding: 4px 14px; font-size: 12px; }
+body.is-chat-window .chat-toolbar-status { font-size: 11px; }
+
+/* 回复中：发送按钮禁用 + 变暗（文字仍是「发送」，不做成"更多"按钮的样子） */
+.chat-send.is-busy { opacity: 0.55; cursor: default; }
+.chat-send:disabled { cursor: default; }
+
+/* 提问/写操作确认框：贴在气泡底部输入区上方 */
+body.is-chat-window #ask-box {
+  left: 8px;
+  right: 8px;
+  bottom: 40px;
+  max-height: 66vh;
+  overflow-y: auto;
+}
+
+/* =================================================================================
+   ② 思考浮窗（?panel=think）：无边框透明面板铺满窗口，摆在桌宠旁边。
+      提问时主进程自动打开、AI 答完自动收起；这里只负责渲染。
+   ================================================================================= */
+body.is-think-window {
+  background: transparent;
+  color: #fff;
+  cursor: default;
+  overflow: hidden;
+}
+
+body.is-think-window #stage,
+body.is-think-window #fx-layer,
+body.is-think-window .window-drag-strip,
+body.is-think-window #bubble,
+body.is-think-window #overlay,
+body.is-think-window #context-menu,
+body.is-think-window #todo-panel,
+body.is-think-window #settings-panel,
+body.is-think-window #chatbar,
+body.is-think-window #ask-box,
+body.is-think-window #think-capsule {
+  display: none !important; /* 胶囊只在桌宠窗口里用；这里整窗就是面板 */
+}
+
+body.is-think-window #think-panel {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: auto;
+  max-height: none;
+  height: auto;
+  border-radius: 14px;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.5);
+  z-index: 10;
+}
+body.is-think-window .think-header {
+  -webkit-app-region: drag;
+  app-region: drag;
+  padding: 8px 12px;
+  font-size: 12.5px;
+}
+body.is-think-window .think-close {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+  font-size: 15px;
+}
+body.is-think-window .think-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  padding: 8px 12px;
+}
+body.is-think-window .think-plan {
+  max-height: 170px;
+  font-size: 12px;
+  padding: 6px 12px;
+}
+body.is-think-window .think-line { margin-bottom: 6px; }

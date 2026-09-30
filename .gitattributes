@@ -1,0 +1,33 @@
+# 换行统一策略
+#
+# 为什么需要这个文件：本工程既有 CRLF 文件（personas/*.offline.txt、生成的 .bat），
+# 也有 LF 文件（大部分 .ts/.js）。不声明的话，git 会按 core.autocrlf 自行决定，
+# 于是"只改了一行"却显示整个文件都变了 —— 换台机器克隆后尤其明显。
+#
+# 策略：仓库内一律 LF；只有 Windows 脚本类必须 CRLF（cmd.exe 解析 .bat 对换行敏感）。
+
+* text=auto eol=lf
+
+# Windows 脚本：必须 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制：不做换行转换，也不参与文本 diff/合并
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.exe binary
+*.dll binary
+*.zip binary
+*.7z binary
+*.moc3 binary
+*.moc binary
+*.psd binary
+
+# 第三方压缩库：由 scripts/vendor-assets.js 之类的流程引入，标记为 vendored
+# 这样 GitHub 不会把它们算进本仓库的代码统计
+src/renderer/lib/*.min.js linguist-vendored

@@ -1,0 +1,17 @@
+{
+  "_说明": "这是模型预设模板：把它复制到某个模型目录下改名为 pet-model.json 即可生效（例如 %APPDATA%\\pet-desktop-app\\live2d-models\\<模型名>\\pet-model.json）。三个字段全部可选，缺省时行为与没有该文件完全一致。工程内不放具体模型文件，模型一律由用户放在本机用户数据目录。",
+  "_framing": "启动取景建议：\"full\" 全身 / \"half\" 半身。只在用户自己没在设置里选过时作为默认值。",
+  "framing": "half",
+  "_emotionMap": "情绪标签 → 该模型的表情名（必须与 model3.json 里 Expressions[].Name 完全一致，中文名也可以）。名字不存在会被忽略并退回内置模糊匹配（smile/happy/笑…）。",
+  "emotionMap": {
+    "happy": "拍照",
+    "surprised": "呆猫",
+    "neutral": "眼镜"
+  },
+  "_parameterMap": "逻辑参数名 → 模型实际参数 ID。给参数命名不标准的模型做兼容用（当前仅记录与展示，未参与驱动）。",
+  "parameterMap": {
+    "AngleX": "ParamAngleX",
+    "AngleY": "ParamAngleY",
+    "MouthOpenY": "ParamMouthOpenY"
+  }
+}

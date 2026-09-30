@@ -1,0 +1,96 @@
+# Pet electron-builder 配置
+#
+# 设计要点：
+#   模型资源（约 40MB）通过 extraResources 放在 ASAR **之外**，
+#   避免打进 app.asar 导致：①安装包体积膨胀；②打包时间变长；
+#   ③运行时每次都要从 asar 解压读取大文件造成卡顿。
+#   打包后模型位于 <resourcesPath>/assets/（便携 exe 解包临时目录的 resources/assets）。
+#   开发态则由 PathResolver 指向 public/assets/（见 CONTRACT.md）。
+
+appId: com.pet.desktop
+productName: Pet
+
+# 不要在打包时重建原生依赖。
+# 唯一的原生依赖是 active-win，它用的是 **N-API**（napi_versions: [3, 6]）——N-API 是 ABI 稳定的，
+# node_modules 里那份 napi-6-win32-unknown-x64/node-active-win.node 在 Node 与 Electron 下都能直接加载
+# （已验证 require 成功、导出 getActiveWindow/getOpenWindows）。
+# 而 electron-builder 默认会跑 npm rebuild：它会去 GitHub 下载 node-pre-gyp 预编译包，
+# 网络不通时报 ECONNRESET 并让整个打包失败（实测）；回退到 node-gyp 源码编译同样失败。
+# 关闭后沿用已有二进制，打包可靠性显著提高，运行时行为不变。
+npmRebuild: false
+
+# 便携版（portable 单 exe）是 NSIS 自解压包：**每次启动**都要把整个应用解包到 %TEMP%，退出再删，
+# 无法缓存复用，所以启动慢（项目文档记录实测"出现窗口"约 9.7s）。
+#
+# compression 实测对 portable 单 exe 体积影响很大（本机复现，各跑两次结果一致）：
+#   store  → 233 MB（不压缩，解包≈拷贝）
+#   normal → 65 MB  （约 1/3.5 体积）
+# 取 normal，理由：解包耗时的大头是"把 232MB 落盘"，压缩设置只影响其中的解压那一段
+# （量级 1~3s），却让文件大 168MB。体积优先。
+# 若要优先便携版的解包速度，把它改成 store（体积涨到约 233MB）。
+compression: normal
+
+directories:
+  output: release
+
+files:
+  - dist/**/*
+  - package.json
+
+# 把 public/assets（import-model.js 的产物，含 models.json）原样带出 ASAR。
+# from 的相对基准是项目根目录；to=assets 表示最终落在 resources/assets/。
+extraResources:
+  - from: public/assets
+    to: assets
+  # 渲染器由 assemble 脚本生成到 public/renderer；打包后由 StaticServer
+  # 从 resources/renderer 提供 index.html、脚本和 Live2D 运行时库。
+  - from: public/renderer
+    to: renderer
+
+win:
+  # 两个目标：
+  #   nsis     —— 安装包（安装后启动 = win-unpacked 级速度，实测 ~0.5s）
+  #   portable —— 单 exe 免安装（每次启动解包到 %TEMP%，实测 ~9.7s；慢是这个目标的固有代价）
+  target:
+    - nsis
+    - portable
+  # 只保留中英两种语言包：少 10 个 locale（约 5MB）+ 更少的文件要解包/复制
+  electronLanguages:
+    - zh-CN
+    - en-US
+  # 无代码签名证书；跳过 exe 资源编辑/签名以规避 winCodeSign 符号链接权限问题
+  # （Windows 下 rcedit 由 app-builder 内建执行，本开关仅跳过签名相关步骤）
+  signAndEditExecutable: false
+
+nsis:
+  # 一键安装会给用户装到 AppData 且不问路径；这里让用户能选目录、建桌面快捷方式
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Pet 桌宠
+  artifactName: Pet-${version}-setup.${ext}
+  installerLanguages:
+    - zh_CN
+  deleteAppDataOnUninstall: false
+
+portable:
+  artifactName: Pet-${version}-portable.exe
+
+# 启动速度说明：
+#   - portable（NSIS 单 exe）每次启动都会把整个应用解包到 %TEMP%，退出时再删除
+#     （脚本固定行为，unpackDirName 也无法缓存复用）→ 实测"出现窗口"约 9.7 秒。
+#   - 最快启动：装一次 nsis 安装包（之后启动≈0.5s），或直接用免解压的 win-unpacked/Pet.exe。
+#
+# ⚠️ 关键环境约束（本机实测，2026-09-30）：
+#   **在 `Desktop\PET\...\release\` 下生成的 exe 双击无反应、进程都不出现**（退出码 0x80000003），
+#   同一份文件拷到 %TEMP% 或 %LOCALAPPDATA%\Programs\ 下却能正常启动。
+#   逐字节校验过：两种位置的运行时文件完全相同 → 是**系统安全策略拦截了 Desktop 下的新可执行文件**，
+#   不是构建问题。所以：**打包产物不要在 Desktop 目录下运行**；要么装到
+#   %LOCALAPPDATA%\Programs\Pet（安装版默认位置），要么从别的分区运行。
+#
+#   - 可选：把 compression 改为 store（exe 更大、解包退化为拷贝、启动更快），默认保持 normal。
+# compression: store
+
+# 便携版说明：见构建后自动生成的 README_PORTABLE.md
