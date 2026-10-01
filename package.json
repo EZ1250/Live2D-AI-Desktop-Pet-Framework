@@ -12,7 +12,7 @@
     "assemble": "node scripts/assemble-renderer.js",
     "check:privacy": "node scripts/check-privacy.js --all",
     "build:tsc": "tsc -p tsconfig.json",
-    "test": "npm run build:tsc && node --test tests/devTools.test.js",
+    "test": "npm run build:tsc && node --test tests/*.test.js",
     "check": "npm test",
     "build:all": "npm run build:tsc && npm run assemble",
     "start": "chcp 65001 > nul && electron .",
