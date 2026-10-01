@@ -53,7 +53,7 @@ exe 没有代码签名，Windows SmartScreen 会弹「无法验证发布者 / �
   （应用启动时按"用户模型优先、内置模型兜底"排序，清单里没有骨骼模型时也会扫这个目录）。
   想内置/留种子：把模型放进 `local-assets/live2d_models/<模型名>/` 再 `npm run import`
   （只有放在 `local-assets/` 才能活过构建；`public/assets` 每次 import 都会被清空重建）。
-  详见 `local-assets/README.md` 与 `docs/MODEL_COMPAT.md`。
+  详见 `local-assets/live2d_models/README.md` 与 `docs/MODEL_COMPAT.md`。
 - 应用启动时会优先从打包资源路径读取模型（`process.resourcesPath/assets`，
   兜底为 exe 同目录的 `assets/`），因此随包资源无需联网、无需额外放置。
 - 判断某个模型能不能被当前运行库渲染：`node scripts/check-model.js "<模型文件夹>"`。

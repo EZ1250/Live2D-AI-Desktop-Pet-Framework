@@ -3,7 +3,7 @@
   "productName": "Pet",
   "version": "1.0.0",
   "description": "Pet — Live2D 桌面宠物",
-  "author": "Pet",
+  "author": "EZ1250",
   "main": "dist/main/main.js",
   "private": true,
   "license": "MIT",
@@ -25,7 +25,6 @@
   },
   "devDependencies": {
     "@types/node": "^20",
-    "cross-env": "^7",
     "electron": "^31.7.7",
     "electron-builder": "^24",
     "typescript": "^5"

@@ -3,7 +3,7 @@
 本文件只记录**运行时边界**与**改代码时必须同步的位置**。IPC 通道名与数据类型的完整清单以
 `src/shared/contracts.ts` 为唯一来源，此处不重复维护（重复的清单必然过期）。
 
-## 唯一真源
+## 唯一源
 
 - `src/shared/contracts.ts` 定义全部 IPC 通道常量、`ElectronAPI` 接口与共享类型。
 - `src/preload/preload.ts` 只通过 `contextBridge` 暴露 `window.electron`（`ElectronAPI`）；
@@ -59,4 +59,4 @@
 ## 第三方资源授权
 
 模型、角色资料、Live2D 运行库等第三方资源的授权**不由 MIT 覆盖**；发布前须逐项核验来源、
-许可与再分发条件。仓库未声明具体开发者或第三方资源授权人。
+许可与再分发条件。项目代码版权主体见根目录 `LICENSE`。

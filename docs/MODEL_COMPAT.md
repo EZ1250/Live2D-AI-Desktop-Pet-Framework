@@ -9,7 +9,7 @@
 |---|---|---|
 | Live2D **moc3 v3 / v4 / v5**（Cubism 4.0 / 4.2 / 5 导出） | ✅ 正常渲染 | 随包运行库 = Pixi 8.14 + untitled-pixi-live2d-engine 1.4.0 + 官方 Cubism Core 5.0（上限就是 moc3 v5） |
 | Live2D **moc3 v6**（Cubism 5.3 导出） | ❌ 暂不支持 | Core 5.0 读不了；升 Core 6 会与引擎内含的框架不匹配（实测渲染崩溃）。体检会明确标 `unsupported` 并给出出路 |
-| **Cubism 2.1**（`.moc` / `.model.json`） | ⚠️ 引擎带了 legacy 分支 | `lib/live2d-engine-cubism2.min.js` 已随包；当前渲染层只加载现代分支，需要时再接入（见 §3.3） |
+| **Cubism 2.1**（`.moc` / `.model.json`） | ❌ 暂不支持 | 仓库保留 legacy 运行库文件，但当前渲染入口未加载它；请重新导出为 moc3 |
 | 只有图片（png/jpg/webp/gif） | ✅ 按**静态立绘**显示 | 有呼吸 / 浮动待机，没有动作与表情 |
 | `*.model3.json` 里没有 `FileReferences.Moc`（立绘壳） | ✅ 按**静态立绘**显示 | 目录里有图片就自动降级 |
 | 引用文件缺失（缺 moc / 缺贴图） | ❌/⚠️ | 缺 moc → 不能渲染；缺贴图 → 能渲染但会提示缺几张 |
@@ -79,7 +79,7 @@ v5 模型实测正常渲染。**moc3 v6（Cubism 5.3）暂不支持**（原因�
 
 ## 5. 已知边界
 
-- **Cubism 2 模型**（含 `.moc`）只能用 Cubism Editor 重新导出为 `.moc3`，运行库层面不支持（pixi-live2d-display 的 cubism2 分支没有随包）。
+- **Cubism 2 模型**（含 `.moc`）只能用 Cubism Editor 重新导出为 `.moc3`；当前渲染入口不加载 legacy 分支。
 - **只有 `.moc3` 但没有 `.model3.json`**：`pixi-live2d-display` 需要描述文件（贴图列表在里面），应用会提示补描述文件；不自动改写用户的模型目录。
 - moc3 **v5 + 老 Core**：即使强行加载也会失败，所以应用选择"不尝试 + 明确告知"，避免出现半渲染的坏画面。
 - 体检只读文件、不写用户的模型目录（除了 `pet-model.json` 这类由应用管理的预设文件）。

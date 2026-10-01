@@ -4,8 +4,7 @@
  * 职责：
  *   1. 等待 preload 注入的 window.electron 窄接口。
  *   2. loadModel() 装载默认模型：先试空名 ''（主进程侧应回退到 models.json 第一项），
- *      再按 IPC_MODEL_LIST 返回的模型名逐个回退。**工程内不写死任何模型名**——
- *      本项目是"不含模型、填入模型即可运行"的框架。
+ *      再按 IPC_MODEL_LIST 返回的模型名逐个回退。工程不写死用户模型名。
  *   3. 按 ModelManifest.type 渲染：
  *        moc3     → PIXI + pixi-live2d（见 live2d.ts；不可用/失败 → 预览图或占位图形）
  *        portrait → <img src=manifest.url> + CSS transform 待机动画

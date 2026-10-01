@@ -17,11 +17,11 @@ that MIT grant and keep their own terms — verify each one before redistributin
 | `src/renderer/lib/pixi.min.js` | PixiJS | 2D 渲染引擎 |
 | `src/renderer/lib/live2dcubismcore.min.js` | **Live2D Cubism Core** | Live2D 官方运行库，**有独立授权条款**，商用/再分发条件需自行确认 |
 | `src/renderer/lib/live2d-engine.min.js` | Live2D 引擎适配层 | 与 Pixi 的桥接 |
-| `src/renderer/lib/live2d-engine-cubism2.min.js` | Cubism 2 兼容层 | 仅旧模型需要 |
+| `src/renderer/lib/live2d-engine-cubism2.min.js` | Cubism 2 兼容层 | 当前渲染入口未启用 |
 
 > ⚠️ **Live2D Cubism Core 是最需要注意的一个。** 它是 Live2D Inc. 的产品，
 > 有独立的使用与再分发条款（尤其商用场景）。公开或商用前请到 Live2D 官网确认你符合其许可。
-> 本项目仓库**不包含任何 Live2D 模型素材**，模型由使用者自行放入本机用户数据目录。
+> 本项目仓库只包含一张静态示例立绘和托盘图标；用户的 Live2D 骨骼模型应放入本机用户数据目录。
 
 ## 素材 / Assets
 

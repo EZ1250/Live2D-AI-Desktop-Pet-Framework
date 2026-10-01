@@ -134,10 +134,10 @@ src/
 四份 `.md` 曾都写着"无法访问文件、执行命令或联网"，而项目**其实支持**——
 前提是用户先在设置里指定工作区（`devTools.ts`：「未配置则全部拒绝」），危险命令会被拦、
 按权限模式逐次确认；联网只能 `web_fetch` 单个 URL。
-这些边界由 `verify_personas.js` 自动校验（含"每个分组都必须能被代码触发"）。
+这些边界应在修改语料或触发逻辑后，通过 `npm test` 和实际场景检查确认。
 
 **⑤ 工程内不写任何具体模型名。**
-本仓库是"不含模型、填入模型即可运行"的框架：默认语料只有 `character.md` / `character.offline.txt`，
+本仓库是可选模型的框架：默认语料只有 `character.md` / `character.offline.txt`，仓库当前另含一份静态立绘。
 模型专属的人设与台词池放该模型自己的目录
 （`%APPDATA%/pet-desktop-app/live2d-models/<模型名>/knowledge/`），
 程序优先读那份、读不到才回退默认（见 §5.3）。
@@ -216,9 +216,9 @@ API Key 丢了 / 设置改了不生效"——两套配置各改各的，排查�
 > 种子模型的顺序用 `local-assets/model-order.json`（**需要时自建**；只在 import 阶段生效，不会进 `public/assets/`；
 > 需要时自己建，见 §5.0）。
 
-## 5.3 本仓库是「不含模型」的框架（别把本机的东西写回去）
+## 5.3 仓库资产与本机数据边界
 
-**原则：仓库里不出现任何具体模型的名字，也不出现任何本机路径/配置。填进模型就能跑。**
+**原则：仓库只保留可再分发的示例资产，不提交本机路径、配置或密钥。用户模型放在用户数据目录。**
 
 这条被违反过，代价是"项目看起来只在那台机器上成立"。已经清掉的东西：
 
@@ -472,9 +472,7 @@ npm test                                     # 单测（devTools）
 npm run check:privacy --all                  # 打包前后密钥/隐私闸门
 ```
 
-一次性跑完全部静态校验（类型 / 装配 / 单测 / 隐私 / IPC 契约 / 文档一致性 / 各功能专项）：
-`run_all_checks.js`，位于审计输出目录 `outputs/audit_2026-09-13/`（不在本仓库内），
-它同时会打印"静态校验覆盖不到、必须实机确认"的清单。
+项目内置校验范围见上面的命令；窗口交互、渲染和权限提示仍需在 Windows 目标环境中手动确认。
 
 ## 9. 已知未做 / 待实机确认
 
@@ -486,36 +484,8 @@ npm run check:privacy --all                  # 打包前后密钥/隐私闸门
 - **双击**：需求未定义双击该做什么，未实现（随意绑定有干扰单击的风险）。
 - **序列帧动画**：当前模型集是 Live2D + 立绘，无序列帧素材来源。
 
-## 10. 本次审计新增能力的自检脚本
+## 10. 验证边界
 
-审计输出目录内与本仓库功能一一对应的校验脚本（都由 `run_all_checks.js` 汇总调用）：
-
-| 脚本 | 覆盖 |
-|---|---|
-| `verify_position_memory.js` | 位置记忆（读/写/写回/可见性判定） |
-| `verify_idle_throttle.js` | 空闲降帧（常量/接线/边界） |
-| `verify_tray.js` | 托盘（图标资产/接线/降级/菜单） |
-| `verify_fullscreen_policy.js` | 全屏自动收起（状态隔离/优先级） |
-| `verify_global_shortcuts.js` | 全局快捷键（失败容忍/注销/复用） |
-| `verify_gl_context_lifecycle.js` | WebGL 上下文成对释放 |
-| `verify_drag_drop.js` | 拖放加入资产（四层链路/webUtils） |
-| `verify_permission_gate.js` | 权限最小授权 |
-| `verify_click_through.js` | 点击穿透（极性方向/安全兜底/覆盖层面板/逃生口/命中边界） |
-| `verify_hit_mask_capture.js` | 命中遮罩取样时序（必须帧内取样 + 空帧防线） |
-| `verify_texture_downscale.js` | 贴图降采样（上限/时序/容错） |
-| `verify_userdata_unified.js` | 打包版与开发版共用同一 userData 目录 |
-| `verify_no_reference_source.js` | 参考源已废弃：模型单来源 + 空种子不致命 |
-| `verify_lod_option_passthrough.js` | LOD 选项传递（已实测无效，仅记录） |
-| `verify_accelerator_format.js` | 快捷键组合键语法 |
-| `verify_docs.js` · `verify_docs_paths.js` | 文档断言与路径引用 |
-| `verify_offline_pool.js` | 离线台词池回退链路 |
-| `measure_edge_quality.js` | 边缘质量 A/B（aliasEnergy / hardEdgeRate） |
-
-渲染质量的客观 A/B：改前后各用 `PET_SHOT_DIR` 截一张图，再用审计脚本
-`measure_edge_quality.js`（位于审计输出目录 `outputs/audit_2026-09-13/`，不在本仓库内）
-比对 `aliasEnergy` / `hardEdgeRate`；同一角色、同一取景下才有可比性。
-
-> ⚠️ 写断言前先看清**变量命名空间**：`verify_no_reference_source.js` 只对"剥掉注释后的代码正文"
-> 断言——因为 `import-model.js` 的文件头**故意**保留了"曾用参考源、已废弃"的说明，
-> 直接全文搜关键词会命中说明文字而非代码，属误报（踩过）。
+自动化检查覆盖类型、开发工具和隐私边界；Live2D 渲染质量、窗口交互、托盘、快捷键与系统权限
+仍需在 Windows 目标环境中手动确认。
 

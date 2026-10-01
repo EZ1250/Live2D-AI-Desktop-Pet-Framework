@@ -35,7 +35,7 @@ moc3 v6（Cubism 5.3）模型由体检层明确标成超出上限（`unsupported
 
 ## 实测结果（升级后）
 
-按 **moc3 版本**归纳（不列具体模型——工程是"不含模型、填入模型即可运行"的框架）：
+按 **moc3 版本**归纳（不列用户模型名称）：
 
 | moc3 版本 | 结果 |
 |---|---|
@@ -47,6 +47,6 @@ moc3 v6（Cubism 5.3）模型由体检层明确标成超出上限（`unsupported
 
 ## 回退办法（万一新栈出问题）
 
-老栈三件套已备份：`AI调用方案/outputs/audit_2026-09-13/lib-backup-r17/`（Core 4.2）+ 从 CDN 取
+老栈三件套可从上游版本重新获取（Core 4.2）；本目录只保留当前运行库。
 `pixi.js@6.5.10/dist/browser/pixi.min.js` 与 `pixi-live2d-display@0.4.0/dist/cubism4.min.js`；
 `live2d.ts` 里两代运行库都兼容，换回文件即可（不需要改代码）。
