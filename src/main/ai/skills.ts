@@ -1,4 +1,4 @@
-// src/main/ai/skills.ts —— 技能库（参考 ClaudeCode SkillTool 的 prompt 型技能）
+// src/main/ai/skills.ts —— Markdown 技能库
 // 技能 = 一份 Markdown（可选 front-matter：name / description），正文是给模型的步骤提示词。
 // 搜索顺序：userData/skills（用户自定义，优先）→ <assetsRoot>/skills（随包分发）。
 import * as fs from 'fs';

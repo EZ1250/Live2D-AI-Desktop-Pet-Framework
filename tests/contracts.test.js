@@ -6,7 +6,6 @@
  * 表现是"某个功能静默失效、控制台不报错"——很难查。这里把它钉死。
  *
  * 需要先 `npm run build:tsc`（npm test 已包含），因为读的是 dist 产物。
- * 来源：GitHub Copilot 在 PR #1 里提出的测试，经核对后保留。
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');

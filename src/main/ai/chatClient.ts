@@ -1702,7 +1702,8 @@ export class ChatClient {
     const devHint =
       '\n\n开发任务按“先读、再改、后验证”执行，遵循当前权限设置，失败或被拒绝时如实说明。' +
       '\n文件与命令只能作用于开发工作区；写入、建目录、执行命令和联网访问需要确认。' +
-      '\n多步任务可用计划工具；工具结果是事实，不要在没有结果时声称已完成。' +
+      '\nWindows 命令使用 powershell.exe；修改已有文件前先读取，完成后检查结果。' +
+      '\n多步任务可用 plan_propose 和 plan_update；工具结果是事实，不要在没有结果时声称已完成。' +
       `\n当前开发工作区：${this.workspaceRoot || '未配置'}。` +
       (this.planSnapshot.length
         ? '\n- 当前任务清单（上次 plan_update 的内容，接着往下做，别从头再来）：\n' +
