@@ -714,6 +714,7 @@
         }
         model = m;
         model.autoUpdate = false; // 由本层 update 手动驱动（与统一 RAF 同步）
+        try { model.autoFocus = false; } catch { /* ignore */ }
         // 交互：Pixi 8 用 eventMode（旧的 interactive 已移除）；两者都设，兼容新旧运行库。
         model.eventMode = 'static';
         model.interactive = true;
@@ -913,12 +914,12 @@
         let headTrackZ = 0;
         const idleMotionAvailable = hasMotionGroup('Idle');
         let headTrackOK = false;
-        /** 身体摆动参数是否可用（不可用就走"整体倾斜"兜底） */
         let bodyTrackOK = false;
         let bodyTrackX = 0;
         let bodyTrackZ = 0;
-        /** 呼吸参数是否可用（可用就交给它，不可用只靠整体缩放呼吸） */
         let breathParamOK = false;
+        const focusCtl = (model && model.internalModel && model.internalModel.focusController) || null;
+        const focusOK = !!(focusCtl && typeof focusCtl.focus === 'function');
         // 追踪层要用到的参数是否存在（缺哪个就只驱动存在的那些，不报错）
         let eyeLOK = false;
         let eyeROK = false;
@@ -1343,8 +1344,8 @@
             try {
               // 取景：fit × 取景 × 呼吸 × 滚轮档位，锚在真实可见内容上（见 frameModel）
               frameModel(breathe * Math.pow(1.08, zoomSteps), bob);
-              // 身体摆动·第二层预案：模型没有身体参数时，靠整体倾斜补偿，保证"一定在动"
-              if (!bodyTrackOK) model.rotation = (swayDeg * Math.PI) / 180;
+              model.rotation = ((waveDeg + (focusOK || bodyTrackOK ? 0 : eSway)) * Math.PI) / 180;
+              if (focusOK) focusCtl.focus(gazeTX, gazeTY);
               if (typeof model.update === 'function') model.update(deltaSec * 1000);
 
               // —— 视线跟踪（moc3，明显跟随）：写在 model.update 之后（避免被 Idle 动作帧覆盖）；
@@ -1360,28 +1361,27 @@
               headCX += (gazeCX - headCX) * hk;
               headCY += (gazeCY - headCY) * hk;
               const bodyCX = headCX * 0.55; // 身体比头更滞后、幅度更小
-              if (gazeCX !== 0 || gazeCY !== 0) {
-                // AngleX=左右，AngleY=上下；使用较慢的 headC* 保持自然滞后。
-                if (headTrackX > 0) setBaseParam(paramIds.angleX, headCX * headTrackX);
-                if (headTrackY > 0) setBaseParam(paramIds.angleY, headCY * headTrackY);
-                if (headTrackZ > 0) setBaseParam(paramIds.angleZ, headCX * headTrackZ);
-                // 眼球也跟着鼠标动（有该参数才驱动）：只转头不动眼会显得呆
-                if (eyeBallXOK) setBaseParam(paramIds.eyeBallX, gazeCX);
-                if (eyeBallYOK) setBaseParam(paramIds.eyeBallY, gazeCY);
-              } else if (headTrackOK && !idleMotionAvailable) {
-                // 没有原生 Idle 时才补充幅度很小的头部游移。
-                if (headTrackX > 0) setBaseParam(paramIds.angleX, Math.sin(nowSec * 0.45 + phase * 0.7) * Math.min(headTrackX, 2.2));
-                if (headTrackY > 0) setBaseParam(paramIds.angleY, Math.sin(nowSec * 0.33 + phase * 1.1) * Math.min(headTrackY, 2.0));
-                if (headTrackZ > 0) setBaseParam(paramIds.angleZ, Math.sin(nowSec * 0.27 + phase * 0.9) * Math.min(headTrackZ, 2.4));
-              }
-              // 身体摆动·第一层预案：模型有 ParamBodyAngle* → 参数级跟随（跟着物理走，最自然）
-              if (bodyTrackOK) {
-                if (bodyTrackX > 0) setBaseParam(paramIds.bodyX, bodyCX * bodyTrackX);
-                if (bodyTrackZ > 0) setBaseParam(paramIds.bodyZ, swayDeg);
-              }
-              // 呼吸·有 ParamBreath 就交给它，没有则只靠整体缩放呼吸（frameModel 的 breathe）
-              if (breathParamOK) {
-                setBaseParam(paramIds.breath, (Math.sin(nowSec * 1.22 + phase * 2.1) * 0.5 + 0.5) * 0.8 + 0.1);
+              if (!focusOK) {
+                if (gazeCX !== 0 || gazeCY !== 0) {
+                  // AngleX=左右，AngleY=上下；使用较慢的 headC* 保持自然滞后。
+                  if (headTrackX > 0) setBaseParam(paramIds.angleX, headCX * headTrackX);
+                  if (headTrackY > 0) setBaseParam(paramIds.angleY, headCY * headTrackY);
+                  if (headTrackZ > 0) setBaseParam(paramIds.angleZ, headCX * headTrackZ);
+                  if (eyeBallXOK) setBaseParam(paramIds.eyeBallX, gazeCX);
+                  if (eyeBallYOK) setBaseParam(paramIds.eyeBallY, gazeCY);
+                } else if (headTrackOK && !idleMotionAvailable) {
+                  // 没有原生 Idle 时才补充幅度很小的头部游移。
+                  if (headTrackX > 0) setBaseParam(paramIds.angleX, Math.sin(nowSec * 0.45 + phase * 0.7) * Math.min(headTrackX, 2.2));
+                  if (headTrackY > 0) setBaseParam(paramIds.angleY, Math.sin(nowSec * 0.33 + phase * 1.1) * Math.min(headTrackY, 2.0));
+                  if (headTrackZ > 0) setBaseParam(paramIds.angleZ, Math.sin(nowSec * 0.27 + phase * 0.9) * Math.min(headTrackZ, 2.4));
+                }
+                if (bodyTrackOK) {
+                  if (bodyTrackX > 0) setBaseParam(paramIds.bodyX, bodyCX * bodyTrackX);
+                  if (bodyTrackZ > 0) setBaseParam(paramIds.bodyZ, swayDeg);
+                }
+                if (breathParamOK) {
+                  setBaseParam(paramIds.breath, (Math.sin(nowSec * 1.22 + phase * 2.1) * 0.5 + 0.5) * 0.8 + 0.1);
+                }
               }
               // 内容锚点标定（每个模型只做一次）：
               // ① 半身会把角色裁出窗口、量不准 → 先临时切全身摆一帧（肉眼看不到这一帧）
@@ -1538,6 +1538,8 @@
         // 自动进入 Idle 组（若模型有）：让 moc3 自带动画（呼吸/身体微摆）真正动起来，
         // 而不是静止贴图观感；视线参数在 update() 末尾写入，不会被动作帧覆盖。
         if (idleMotionAvailable) startMocMotion('Idle', 0);
+        const breathOK = !!(model && model.internalModel && model.internalModel.breath);
+        log(`追踪来源: 引擎focus=${focusOK ? '有' : '无(退回手动)'} 引擎呼吸=${breathOK ? '有' : '无'} 头部参数=${headTrackOK ? '有' : '无'}`);
         if (headTrackOK) log('头部跟踪参数:', { headTrackX, headTrackY, headTrackZ, ids: paramIds });
         else log('头部跟踪: 当前模型没有头部角度参数', paramIds.angleX, paramIds.angleY, paramIds.angleZ);
         log('moc3 就绪:', modelUrl);
