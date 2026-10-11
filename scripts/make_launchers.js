@@ -1,22 +1,10 @@
 'use strict';
-/**
- * make_launchers.js —— 生成编码正确的 Windows 启动器（.bat）。
- *
- * 两条硬约束（都是踩过坑的）：
- *  1. 中文 Windows 的 cmd.exe 按 **GBK/CP936** 解析 .bat。用 UTF-8 存中文注释会被解成乱码、
- *     把命令行切碎，报 "'xxx' 不是内部或外部命令"。所以正文**只用 ASCII**。
- *  2. Chromium 解析命令行时，`--switch` 要放在**位置参数（app 路径）之前**才可靠。
- *     写成 `electron.exe "app路径" --no-sandbox` 时 --no-sandbox 可能不被识别；
- *     正确写法是 `electron.exe --no-sandbox "app路径"`。
- *
- * 产出（release/ 下）：
- *   启动桌宠.bat    —— 双击即用，不显示控制台
- *   _调试启动.bat   —— 保留控制台；同时把输出写进 release\启动日志.txt，便于排错
- */
+/** 生成 Windows 启动器。 */
 const fs = require('fs');
 const path = require('path');
 
-const APP = 'C:/Users/enze/Desktop/PET/DesktopPet-App';
+// 从脚本位置推导工程根目录，避免机器相关的绝对路径。
+const APP = path.resolve(__dirname, '..');
 const REL = path.join(APP, 'release');
 
 const MAIN_BAT = [

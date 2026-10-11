@@ -1,16 +1,4 @@
-/**
- * voicelab.test.js — 声纹（实时输入电平波形）显示层。
- *
- * 两条线：
- *   ① 无 DOM 时的纯数据行为（token 代际、镜像带 path、stop 归零）—— 老设计就支持，
- *      这里把它钉住，避免以后改成"必须有 DOM 才能跑"；
- *   ② **接管状态条而不是往输入行里插行**。这是"按住说话起不来"的根因所在的回归点：
- *      声纹条以前插在 `.chat-input-row` 之前，一显示就把输入行（连同按住的麦克风按钮）
- *      顶走 → 指针"离开"按钮 → pointerleave 把录音取消。这里断言 DOM 里**没有**任何插入，
- *      并且 stop() 不隐藏状态条本体（紧接着要显示"转写中…/转写失败…"，隐藏了就吞掉文案）。
- *
- * 需要先 `npm run build:tsc`（npm test 已包含），因为加载的是 dist 产物。
- */
+/** 声纹数据与状态条 DOM 行为回归测试。 */
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
@@ -61,11 +49,7 @@ function makeDom() {
   return { document, FakeNode, registry };
 }
 
-/**
- * 用给定 document 重新加载 voicelab（全局脚本：执行后挂到 globalThis.PetVoiceLab）。
- * 注意：doc 要一直留在 global 上直到断言结束 —— 模块里的 `document` 是**运行时**查的
- * （`typeof document !== 'undefined'`），提前还原就等于"无 DOM"。
- */
+/** 在指定 document 下重新加载全局声纹脚本。 */
 function loadVoicelab(doc) {
   global.document = doc;
   delete require.cache[require.resolve(DIST_VOICELAB)];
@@ -94,7 +78,7 @@ test('无 DOM：token 代际、镜像带 path、stop 归零', () => {
   assert.ok(d.startsWith('M0'), `path 应从 x=0 起画：${d.slice(0, 20)}`);
   assert.ok(d.trim().endsWith('Z'), '镜像带应闭合');
 
-  // 旧代际的电平一律丢弃（防止上一段录音的尾巴污染新会话）
+  // 丢弃旧会话的电平。
   const stale = token;
   const fresh = lab.begin({ label: '重新开始' });
   assert.notEqual(fresh, stale);
@@ -109,7 +93,7 @@ test('无 DOM：token 代际、镜像带 path、stop 归零', () => {
 
 test('接管 index.html 里画好的状态条：不往输入行插元素，stop 不隐藏状态条', () => {
   const { document, FakeNode } = makeDom();
-  // 复刻 index.html 的结构：#chatbar > (.chat-input-row, #pet-voice-lab > 文本 + 波形)
+  // 构造 index.html 中的状态条结构。
   const bar = new FakeNode('div'); bar.id = 'chatbar';
   const inputRow = new FakeNode('div'); inputRow.className = 'chat-input-row';
   const strip = new FakeNode('div'); strip.id = 'pet-voice-lab'; strip.hidden = true;
@@ -125,17 +109,17 @@ test('接管 index.html 里画好的状态条：不往输入行插元素，stop 
   const token = lab.begin({ label: '正在连接语音' });
 
   assert.equal(lab.__mounted(), true);
-  // ① 用的是页面里已有的那三个元素，没有另建一套
+  // 使用页面已有元素。
   assert.equal(document.getElementById('pet-voice-lab'), strip);
   assert.equal(document.getElementById('pet-voice-status'), status);
   assert.equal(strip.children.length, 2, '不应再往状态条里塞重复元素');
-  // ② 输入行里 / 输入行前面都没有被插入任何东西（老 bug 就是在这里顶走麦克风按钮）
+  // 不向输入行插入元素。
   assert.equal(bar.children.length, 2, '#chatbar 的子节点数不该因为声纹而变化');
   assert.equal(bar.children[0], inputRow, '输入行必须仍是 #chatbar 的第一个子节点');
   assert.equal(inputRow.children.length, 0, '不应往输入行里插元素');
-  // ③ 波形 SVG 建好了
+  // 波形 SVG 已创建。
   assert.ok(wave.querySelector('#pet-voice-wave-path'), '波形 path 应已创建');
-  // ④ begin 让状态条本体可见（renderer 负责窗口长高，这里只保证内容可见）
+  // begin 显示状态条。
   assert.equal(strip.hidden, false);
   assert.equal(status.textContent, '正在连接语音');
 
@@ -149,7 +133,7 @@ test('接管 index.html 里画好的状态条：不往输入行插元素，stop 
   assert.equal(wave.hidden, false, '有了 PCM 应显示波形');
   assert.equal(status.hidden, true, '波形出现后应让位给波形');
 
-  // ⑤ stop：只收波形，**不隐藏状态条本体** —— renderer 紧接着要写"转写中…/转写失败…"
+  // stop 隐藏波形但保留状态条。
   lab.stop();
   assert.equal(wave.hidden, true);
   assert.equal(status.hidden, false);

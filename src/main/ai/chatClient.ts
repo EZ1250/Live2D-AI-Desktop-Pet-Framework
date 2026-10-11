@@ -346,7 +346,7 @@ export const TOOL_DEFS: Array<{ type: string; function: Record<string, unknown> 
         '把某个绝对路径目录设为「开发工作区」（会弹一次确认框并保存到设置）。当用户明确说出要在哪个目录里建项目/文件夹时，先调用它；不要要求用户自己去设置面板填写。',
       parameters: {
         type: 'object',
-        properties: { path: { type: 'string', description: '完整的绝对路径，例如 C:\\Users\\enze\\Desktop\\我的项目' } },
+        properties: { path: { type: 'string', description: '完整的绝对路径，例如 C:\\Users\\you\\Desktop\\我的项目' } },
         required: ['path'],
       },
     },

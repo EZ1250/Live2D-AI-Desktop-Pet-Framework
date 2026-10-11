@@ -1,22 +1,4 @@
-/**
- * voiceInput.test.js — 按住说话的**状态机**集成回归（Node + 极简假 DOM）。
- *
- * 为什么要在 Node 里跑渲染层：真实故障是"在正常对话框里按住麦克风什么都没发生"，
- * 它只发生在 Electron 窗口 + 指针 + 布局的组合里，单测某个纯函数抓不到。这里用一个
- * 够用的假 DOM 加载 `public/renderer/renderer.js`（?panel=chat 分支），直接驱动真实的
- * 状态机与事件监听，把三条不变式钉住：
- *
- *   ① 按下必须**同步**进入 arming —— 否则"按下后马上松手"的 pointerup 落在 await 期间，
- *      松手事件丢失，麦克风会一直开着到 60s 上限；
- *   ② 状态条显隐**不得挪动麦克风按钮**：老实现把声纹条插进输入行前的文档流，一显示就把
- *      按钮顶走，指针 "离开" 按钮 → pointerleave 把录音取消（这就是"起不来"的病根）；
- *      因此 pointerleave 要按**按钮当前矩形**复核坐标，布局位移造成的假离开不取消；
- *   ③ 转写结果只填进输入框、不自动发送，并且状态文案会自己收起（窗口跟着缩回原高）。
- *
- * 前置：`npm test` 只跑 `build:tsc`（不跑 assemble），所以这里加载 **dist/renderer/** 的编译产物。
- * 千万别改成 `public/renderer/renderer.js`：那是 assemble 的拷贝，源码改了但没 assemble 时
- * 它会静默停在旧代码上，测试就会"通过"一个已经不存在的版本。
- */
+/** 按住说话状态机的集成回归测试。 */
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');

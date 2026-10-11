@@ -172,7 +172,7 @@
     scale: number;
     x: number;
     y: number;
-    /** 实际采用的基准 */
+    /** 'content'=按真实内容居中；'bbox'=退回画布包围盒（角色一定在窗口里） */
     used: 'content' | 'bbox';
     /** 内容锚点被否掉（量歪 / 会把角色摆出窗口）——调用方应停止再用它 */
     contentRejected: boolean;
@@ -203,7 +203,6 @@
     if (!Number.isFinite(s) || s <= 0) return null;
 
     const bbox = { x: 0, y: 0, w: natW, h: natH };
-    /** 按给定锚点算容器位置 */
     const placeWith = (a: { x: number; y: number; w: number; h: number }): { x: number; y: number } => {
       const cx = (a.x + a.w / 2) * s; // 锚点中心相对容器原点的偏移
       if (input.framing === 'half') {

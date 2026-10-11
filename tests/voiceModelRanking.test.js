@@ -1,25 +1,11 @@
-/**
- * voiceModelRanking.test.js — 转写模型选型与"失败到底为什么"的文案。
- *
- * 背景（真机实测 2026-10-11，用户自己的百炼工作区域名）：
- *   - 网关没有 /audio/transcriptions（404），只有 chat/completions + input_audio 能走；
- *   - **唯一能用的模型是 `qwen3-asr-flash`**（0.5s 出文本，真实 ogg/opus 也过）；
- *   - 它**不在** /models 列表里；而列表里排第一的 `fun-asr-flash-2026-06-15` 两条路由都报错；
- *   - `*-realtime` / `fun-asr-*` / `paraformer-*` 是实时/原生接口专用；`*-omni-*`、
- *     `qwen-audio-*` 能收音频但会"回答"而不是听写。
- *
- * 于是"按地址索引"曾经把用户引到一个走不通的模型上，并且列表里没有 qwen3-asr-flash 时
- * 还反过来判它"名字写错"。这里把这些结论钉死：排序规则、结论文案、失败提示。
- *
- * `indexVoiceModels` / `checkVoiceRoutes` 用**假 fetch** 驱动，不联网、不碰真密钥。
- */
+/** 转写模型排序、路由兼容性与失败提示回归测试。 */
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
 
 const voice = require(path.join(__dirname, '..', 'dist', 'main', 'ai', 'voice.js'));
 
-/** 造一个只回固定响应的 fetch（按 URL 区分 /models 与两条转写路由） */
+/** 创建按 URL 返回固定响应的 fetch 替身。 */
 function stubFetch(handler) {
   const calls = [];
   const original = globalThis.fetch;
@@ -48,7 +34,7 @@ test('路由兼容性分级：实测可用的 / 实时原生专用 / 会聊天�
 });
 
 test('候选排序：qwen3-asr-flash 必须排第一，实时/原生专用的被压到最后', () => {
-  // 这就是用户网关 /models 的真实形态（qwen3-asr-flash 不在列表里时由调用方补进来）
+  // 覆盖默认模型不在 /models 列表中的情况。
   const models = [
     'fun-asr-flash-2026-06-15',
     'qwen3-asr-flash-realtime',
@@ -62,14 +48,14 @@ test('候选排序：qwen3-asr-flash 必须排第一，实时/原生专用的被
   const ranked = voice.rankAsrCandidates(models);
   assert.equal(ranked[0], 'qwen3-asr-flash', `榜首必须是实测可用的模型，实际=${ranked[0]}`);
   assert.equal(ranked.includes('text-embedding-v4'), false, '与转写无关的模型不该进候选');
-  // 实时/原生专用的一律排在"会聊天"的多模态之后
+  // 实时/原生专用模型应排在多模态模型之后。
   const iIncompatible = ranked.indexOf('fun-asr-flash-2026-06-15');
   const iChatty = ranked.indexOf('qwen3.8-omni-flash');
   assert.ok(iIncompatible > iChatty, `fun-asr 应在多模态之后（fun=${iIncompatible}, omni=${iChatty}）`);
   for (const n of ['fun-asr-flash-2026-06-15', 'qwen3-asr-flash-realtime', 'qwen3.8-omni-flash-realtime']) {
     assert.ok(ranked.indexOf(n) > ranked.indexOf('qwen-audio-3.0-asr-flash'), `${n} 应排在多模态之后`);
   }
-  // 自动挑模型也要落在可用那条线上
+  // 自动选择也应命中可用模型。
   assert.equal(voice.pickAutoVoiceModel(models, ranked), 'qwen3-asr-flash');
 });
 

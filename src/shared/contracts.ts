@@ -1,19 +1,6 @@
-/**
- * src/shared/contracts.ts
- *
- * 全工程跨模块契约的唯一实现方（Single Source of Truth）。
- * Sole implementor of the cross-module contract defined in CONTRACT.md.
- * 其他模块（main / preload / plugin-system / renderer）只可 import 本文件，
- * 不得各自重复定义这些类型与 IPC 通道名。严禁循环依赖：本文件不 import 任何模块。
- *
- * 安全约定：preload 只通过 contextBridge 暴露 window.electron（ElectronAPI），
- * 绝不暴露 ipcRenderer / node 原对象。
- */
+/** 跨模块类型与 IPC 通道契约；保持无依赖。 */
 
-// ---------------------------------------------------------------------------
-// IPC 通道常量（IPC channel names）——renderer ⇄ main 之间的唯一通道名。
-// 名称与 CONTRACT.md 完全一致，改动前必须同步主进程 ipc.ts。
-// ---------------------------------------------------------------------------
+// IPC 通道常量；名称须与 CONTRACT.md 和主进程保持一致。
 
 /** invoke renderer→main：按名字加载模型（返回 ModelManifest）。 */
 export const IPC_LOAD_MODEL = 'model:load';
@@ -96,15 +83,7 @@ export const IPC_PET_BOUNDS = 'pet:bounds';
  * 点击穿透用：主进程已知窗口位置与全局光标，换算后交给渲染层做命中判定。
  */
 export const IPC_HIT_PROBE = 'pet:hitProbe';
-/**
- * renderer→main（send）：命中判定的结果 {ignore, overlay}。
- * ignore  = true → 该点不在角色身上 → 主进程执行 setIgnoreMouseEvents(true, {forward:true}) 让点击穿到底下。
- * overlay = true → 窗口内正开着覆盖层面板（设置/待办/右键菜单/思考浮窗）。
- *
- * 为什么需要 overlay：这些面板就在**同一个窗口内部**，而 setIgnoreMouseEvents 是**整窗**生效的。
- * 只看"光标是否在角色身上"的话，面板一打开、光标落在面板外缘的透明处就会被判成可穿透，
- * 于是面板自己也点不动了。有这个标志，主进程就能在面板打开期间强制保持可交互。
- */
+/** renderer→main：命中判定结果；overlay 打开时保持面板可交互。 */
 export const IPC_HIT_RESULT = 'pet:hitResult';
 /** 主进程 push→renderer：思考浮窗开/关状态 {open}（气泡窗里据此显示「思考浮窗」是开还是关）。 */
 export const IPC_THINK_WINDOW_STATE = 'think:windowState';

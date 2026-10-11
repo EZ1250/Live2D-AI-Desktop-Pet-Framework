@@ -1,19 +1,4 @@
-/**
- * live2dPlacement.test.js — moc3 取景落位的纯函数（"角色被摆出窗口"的回归）。
- *
- * 背景（实测故障）：模型启动时**有时**角色向左偏出窗口。取景居中的基准不是画布包围盒，
- * 而是从"命中遮罩"里量出来的真实内容框；遮罩不是每帧都抓，只要换算时把遮罩那一帧的
- * 变换和此刻的 model.position/scale 混着用，量出来的局部内容框就会跑到画布外面去，
- * 按它摆位角色就出窗了。
- *
- * 这里锁住三条：
- *   ① 内容框合理时按内容居中（画布留白大的模型不被带偏）；缩放仍只按画布包围盒算；
- *   ② 内容框不可信（超出画布包围盒 / 太小 / 非有限值）时**必须**退回画布包围盒，
- *      并回报 contentRejected，让渲染层丢掉这个锚点；
- *   ③ 半身取景：缩放 ×2.5、横向仍居中、纵向把头顶顶到窗口上沿附近。
- *
- * 需要先 `npm run build:tsc`（npm test 已包含），加载的是 dist 产物（与运行时同一份代码）。
- */
+/** moc3 取景落位纯函数回归测试。 */
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
@@ -21,8 +6,7 @@ const path = require('node:path');
 const DIST_LIVE2D = path.join(__dirname, '..', 'dist', 'renderer', 'live2d.js');
 
 function loadLive2d() {
-  // live2d.js 是浏览器全局脚本：模块级只做 `const w = window` + 挂 window.PetLive2d，
-  // 其余（PIXI/document）都在函数里惰性取用，所以 Node 里给个空 window 就能加载纯函数。
+  // live2d.js 依赖浏览器全局对象，测试中提供最小 window。
   if (!globalThis.window) globalThis.window = {};
   delete require.cache[require.resolve(DIST_LIVE2D)];
   require(DIST_LIVE2D);
@@ -43,11 +27,11 @@ test('内容框可信：按真实内容居中，缩放仍按画布包围盒算',
   assert.equal(r.used, 'content');
   assert.equal(r.contentRejected, false);
 
-  // 缩放 = 画布包围盒 fit（与内容框无关）
+  // 缩放按画布包围盒计算。
   const expectScale = Math.min((VIEW.vw * 0.89) / CANVAS.natW, (VIEW.vh * 0.89) / CANVAS.natH);
   assert.ok(Math.abs(r.scale - expectScale) < 1e-9, `缩放应只按画布包围盒：${r.scale} vs ${expectScale}`);
 
-  // 内容中心必须落在窗口正中
+  // 内容中心应位于窗口中央。
   const centerX = r.x + (CONTENT_INSIDE.x + CONTENT_INSIDE.w / 2) * r.scale;
   const centerY = r.y + (CONTENT_INSIDE.y + CONTENT_INSIDE.h / 2) * r.scale;
   assert.ok(Math.abs(centerX - VIEW.vw / 2) < 0.5, `内容应在窗口水平中间：${centerX}`);
@@ -56,7 +40,7 @@ test('内容框可信：按真实内容居中，缩放仍按画布包围盒算',
 
 test('内容框不可信：退回画布包围盒（角色绝不被摆出窗口）', () => {
   const { __computeMoc3Placement: place } = loadLive2d();
-  // 三个"换算用错帧"的典型症状：跑到画布外面、比画布大得离谱、小得离谱
+  // 覆盖越界、过大、过小和非有限值。
   const bogus = [
     { name: '整体跑到画布右侧外', rect: { x: 800, y: 50, w: 200, h: 400 } },
     { name: '超出画布下沿', rect: { x: 100, y: 480, w: 200, h: 400 } },
@@ -70,7 +54,7 @@ test('内容框不可信：退回画布包围盒（角色绝不被摆出窗口�
     assert.equal(r.contentRejected, true, `${name}：应回报内容锚点被否掉`);
     assert.equal(r.used, 'bbox', `${name}：应退回画布包围盒`);
 
-    // 退回包围盒后：画布居中 → 角色一定在窗口里（每边余量 ≥ 窗口的 5%）
+    // 回退后画布应基本位于窗口内。
     const expectX = VIEW.vw / 2 - (CANVAS.natW / 2) * r.scale;
     assert.ok(Math.abs(r.x - expectX) < 0.5, `${name}：应把画布居中（x=${r.x}，期望 ${expectX}）`);
     const left = r.x;

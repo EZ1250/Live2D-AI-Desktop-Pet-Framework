@@ -179,7 +179,7 @@ src/
 ```js
 // 已删除，别再写回来
 const SOURCE_ROOT = process.env.MODEL_SOURCE_ROOT ||
-  'C:\\Users\\enze\\Desktop\\DesktopPet-main\\assets\\live2d_models';
+  path.join(os.homedir(), 'Desktop', 'DesktopPet-main', 'assets', 'live2d_models');
 const KNOWLEDGE_SOURCE = process.env.KNOWLEDGE_SOURCE || path.join(path.dirname(SOURCE_ROOT), 'knowledge');
 ```
 

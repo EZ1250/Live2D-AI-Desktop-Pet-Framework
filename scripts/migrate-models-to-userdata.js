@@ -1,18 +1,5 @@
 'use strict';
-/**
- * migrate-models-to-userdata.js —— 把"随包模型"搬成"用户模型"（一次性 + 可重复执行）
- *
- * 背景（用户确认的方案）：
- *   - 项目**不再内置任何模型**：初始模型表为空，模型/插件一律从本机用户数据读取；
- *   - 每个模型一个自给自足的文件夹：模型文件 + pet-model.json（取景/情绪映射/能力归类）+ knowledge/<模型>.offline.txt；
- *   - 本机已有的模型目录整体搬到 %APPDATA%/pet-desktop-app/live2d-models/；
- *   - 随包 assets/knowledge/character.offline.txt 保留为"通用语料"，模型专属语料跟随模型目录。
- *
- * 用法：
- *   node scripts/migrate-models-to-userdata.js            # 真正执行
- *   node scripts/migrate-models-to-userdata.js --dry-run  # 只打印计划
- *   node scripts/migrate-models-to-userdata.js --userdata <dir>   # 指定用户数据目录（测试用）
- */
+/** 将随包模型迁移到用户数据目录。 */
 const fs = require('fs');
 const path = require('path');
 
@@ -130,9 +117,7 @@ for (const kd of knowledgeDirs) {
     const dst = path.join(modelDir, 'knowledge', f);
     if (!DRY) {
       fs.mkdirSync(path.dirname(dst), { recursive: true });
-      // 语料是**工程资产**，唯一源在 personas/（见 docs/PROJECT_LAYOUT.md §4.1）。
-      // 必须**每次覆盖**：早先写成"目标已存在就跳过"，导致改完 personas 跑 import 后
-      // 用户模型目录里的旧副本纹丝不动 —— 改动对已装好的应用完全不生效（踩过）。
+      // 每次覆盖，确保用户目录同步最新语料。
       const existed = fs.existsSync(dst);
       fs.copyFileSync(path.join(kd, f), dst);
       fs.rmSync(path.join(kd, f), { force: true }); // 原处删掉，避免两处不一致
@@ -167,8 +152,7 @@ let detected = 0;
 if (!DRY) {
   let detect;
   try {
-    // userAssets 依赖 electron.app.getPath('userData')：纯 Node 里用 Module._load 打桩，
-    // 保证识别写进的就是我们这次用的 USER_DATA（测试/迁移脚本的常规做法）
+    // 在纯 Node 测试中将 userData 指向迁移目录。
     const Module = require('module');
     const origLoad = Module._load;
     Module._load = function (request) {
