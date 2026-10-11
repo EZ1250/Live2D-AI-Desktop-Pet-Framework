@@ -33,6 +33,7 @@ import {
   IPC_CHAT_WINDOW_CLOSE,
   IPC_CHAT_WINDOW_COLLAPSED,
   IPC_CHAT_WINDOW_OPEN,
+  IPC_CHAT_WINDOW_VOICE_STRIP,
   IPC_LOAD_MODEL,
   IPC_MODEL_LIST,
   IPC_OPEN_PATH,
@@ -109,6 +110,8 @@ export interface IpcDeps {
   closeChatWindow?: () => void;
   /** 设置对话气泡窗折叠态（折叠=只显示输入条）；menu=true 时折叠态撑高给 ＋ 菜单腾地方。 */
   setChatWindowCollapsed?: (collapsed: boolean, menu?: boolean) => { ok: boolean; height?: number };
+  /** 语音状态条显示/收起（显示时气泡窗向上长高一条、底边钉住）。 */
+  setChatWindowVoiceStrip?: (visible: boolean) => { ok: boolean; height?: number };
   /** 显示/收起思考浮窗（提问时自动开、答完自动关，也供 ＋ 菜单手动调用） */
   showThinkWindow?: () => void;
   hideThinkWindow?: () => void;
@@ -787,6 +790,16 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
     const input = (raw ?? {}) as { collapsed?: unknown; menu?: unknown };
     try {
       return deps.setChatWindowCollapsed?.(Boolean(input.collapsed), Boolean(input.menu)) ?? { ok: true };
+    } catch (err) {
+      return { ok: false };
+    }
+  });
+
+  // ---- 语音状态条（声纹 / 转写报错）：贴在气泡正上方，显示时窗口向上长高一条 ----
+  ipcMain.handle(IPC_CHAT_WINDOW_VOICE_STRIP, (_event, raw: unknown): { ok: boolean; height?: number } => {
+    const input = (raw ?? {}) as { visible?: unknown };
+    try {
+      return deps.setChatWindowVoiceStrip?.(Boolean(input.visible)) ?? { ok: true };
     } catch (err) {
       return { ok: false };
     }

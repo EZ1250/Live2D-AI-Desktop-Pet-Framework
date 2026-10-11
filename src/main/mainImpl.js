@@ -106,15 +106,21 @@ const CHAT_WINDOW_HEIGHT = 270;
 const CHAT_WINDOW_COLLAPSED_HEIGHT = 72;
 /** 折叠态「开 ＋ 菜单」时的高度：菜单从加号往上弹，需要竖向空间 */
 const CHAT_WINDOW_MENU_HEIGHT = 220;
+/**
+ * 语音状态条（声纹 / 转写报错）的高度：贴在气泡正上方的一条。
+ * 气泡窗本体没有"气泡外面"的地方可画，所以显示时把窗口向上长高这么一条（底边钉住）。
+ */
+const CHAT_WINDOW_VOICE_STRIP_HEIGHT = 34;
 /** 气泡窗是否折叠（渲染层经 IPC 改） */
 let chatCollapsed = true;
 /** 折叠态是否正开着 ＋ 菜单（开菜单要临时把窗口撑高） */
 let chatMenuOpen = false;
-/** 气泡窗当前应有的高度：展开 270 / 折叠开菜单 220 / 折叠 72 */
+/** 语音状态条是否正显示（渲染层经 IPC 改：录音/转写/报错期间为 true） */
+let chatVoiceStripOpen = false;
+/** 气泡窗当前应有的高度：展开 270 / 折叠开菜单 220 / 折叠 72，再加语音状态条那一条 */
 function chatWindowHeight() {
-    if (!chatCollapsed)
-        return CHAT_WINDOW_HEIGHT;
-    return chatMenuOpen ? CHAT_WINDOW_MENU_HEIGHT : CHAT_WINDOW_COLLAPSED_HEIGHT;
+    const base = chatCollapsed ? (chatMenuOpen ? CHAT_WINDOW_MENU_HEIGHT : CHAT_WINDOW_COLLAPSED_HEIGHT) : CHAT_WINDOW_HEIGHT;
+    return base + (chatVoiceStripOpen ? CHAT_WINDOW_VOICE_STRIP_HEIGHT : 0);
 }
 /** 思考浮窗：摆在桌宠旁边（原来那个大窗口的位置），提问时自动开、答完自动关 */
 const THINK_WINDOW_WIDTH = 460;
@@ -1209,6 +1215,7 @@ function lockNavigation(win, srv, label) {
 function createChatWindow(resolver, srv) {
     chatCollapsed = true; // 新建窗口从折叠态开始
     chatMenuOpen = false;
+    chatVoiceStripOpen = false; // 新窗口从"没有语音状态条"开始（否则会凭空高一条）
     const win = new electron_1.BrowserWindow(panelWindowOptions(CHAT_WINDOW_WIDTH, chatWindowHeight(), '对话气泡'));
     chatWindow = win;
     // 记住这次的尾巴朝向，等页面加载完再作为查询参数传给渲染层（决定 CSS 画朝上还是朝下的尾巴）
@@ -1244,11 +1251,19 @@ function createChatWindow(resolver, srv) {
             return; // 退出流程：放行，否则 app.quit() 永远收不了尾
         event.preventDefault();
         win.hide();
+        // 收起时把语音状态条一并收回：下次打开不该凭空高一条（渲染层也会在隐藏时通知）
+        if (chatVoiceStripOpen) {
+            const before = chatWindowHeight();
+            chatVoiceStripOpen = false;
+            resizeBubbleKeepingEdge(win, chatWindowHeight());
+            syncManualBubbleAnchor(before, chatWindowHeight());
+        }
         notifyChatWindowState(false);
     });
     win.on('closed', () => {
         if (chatWindow === win)
             chatWindow = null;
+        chatVoiceStripOpen = false;
         notifyChatWindowState(false);
     });
     if (process.env.DEVTOOLS === '1') {
@@ -1310,13 +1325,42 @@ function repositionBubble(win) {
  * 只改高矮、**不动贴桌宠的那条边**：重新挑位会让窗口整个翻到桌宠另一边，看起来像"跳了一下"。
  */
 function setChatWindowCollapsed(collapsed, menu) {
+    const before = chatWindowHeight();
     chatCollapsed = Boolean(collapsed);
     chatMenuOpen = chatCollapsed && Boolean(menu);
     const win = chatWindow;
     if (!win || win.isDestroyed())
         return { ok: true };
     resizeBubbleKeepingEdge(win, chatWindowHeight());
+    syncManualBubbleAnchor(before, chatWindowHeight());
     return { ok: true, height: chatWindowHeight() };
+}
+/**
+ * 语音状态条（声纹 / 转写报错）显示或收起：只改高矮，仍然**不动贴桌宠的那条边**。
+ * 显示 = 窗口向上长高一条，气泡本体在屏幕上原地不动，所以输入行与麦克风按钮不会移位
+ * （麦克风按钮一移位，按住的指针就会"离开"按钮，录音会被误当作用户移开而取消）。
+ */
+function setChatWindowVoiceStrip(visible) {
+    const before = chatWindowHeight();
+    chatVoiceStripOpen = Boolean(visible);
+    const win = chatWindow;
+    if (!win || win.isDestroyed())
+        return { ok: true };
+    resizeBubbleKeepingEdge(win, chatWindowHeight());
+    syncManualBubbleAnchor(before, chatWindowHeight());
+    return { ok: true, height: chatWindowHeight() };
+}
+/**
+ * 改高矮时**同步手动锚点**。
+ *
+ * 窗口是"钉住贴桌宠那条边"改高的，所以另一条边会移动：用户手动拖动过气泡时，锚点偏移
+ * （相对桌宠的 dx/dy）记的是**窗口顶边**，不同步补偿的话，下一次跟随桌宠气泡会跳一条。
+ */
+function syncManualBubbleAnchor(beforeH, afterH) {
+    const delta = Number(afterH) - Number(beforeH);
+    if (!delta || !bubbleOffset || !bubbleAnchorManual)
+        return;
+    bubbleOffset = { dx: bubbleOffset.dx, dy: bubbleOffset.dy - delta };
 }
 /** 只改气泡窗高矮：尾巴朝下时钉住底边、朝上时钉住顶边，再夹进工作区 */
 function resizeBubbleKeepingEdge(win, h) {
@@ -1395,6 +1439,7 @@ function followPetForBubble() {
 function closeChatWindowWindow() {
     const win = chatWindow;
     chatWindow = null;
+    chatVoiceStripOpen = false; // 真正销毁后状态归零：下次新建不会带着旧的高度
     if (win && !win.isDestroyed()) {
         try {
             win.destroy(); // destroy：不经过 beforeunload，避免渲染层卡住导致窗口关不掉
@@ -1989,6 +2034,7 @@ async function bootstrap() {
         openChatWindow: () => openChatWindow(resolver, srv),
         closeChatWindow: () => closeChatWindowWindow(),
         setChatWindowCollapsed: (collapsed, menu) => setChatWindowCollapsed(collapsed, menu),
+        setChatWindowVoiceStrip: (visible) => setChatWindowVoiceStrip(visible),
         showThinkWindow: () => showThinkWindowWindow(resolver, srv),
         hideThinkWindow: () => hideThinkWindowWindow(),
         onChatStarted: () => onChatRoundStarted(resolver, srv),

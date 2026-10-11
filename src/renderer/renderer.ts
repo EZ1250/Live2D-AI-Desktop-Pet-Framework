@@ -3171,6 +3171,8 @@ function hideChatBar(keepThinkPanel = false): void {
   }
   // 收起对话时若正在录音，立刻取消并释放麦克风（不做后台常驻录音）
   if (voiceState === 'listening' || voiceState === 'arming') finishVoiceCapture(true);
+  // 状态条是贴着这个输入条的浮层：输入条收了就不该留在窗口里
+  clearVoiceRow();
   if (!keepThinkPanel) closeThinkWithChat(); // 关闭对话 → 浮窗彻底关闭（含胶囊）
 }
 
@@ -3197,14 +3199,102 @@ let voiceRecorder: MediaRecorder | null = null;
 let voiceStream: MediaStream | null = null;
 let voiceChunks: Blob[] = [];
 let voiceArmAt = 0;
-let voiceRowEl: HTMLElement | null = null;
 let voiceMaxTimer: number | null = null;
 let voiceMouthTimer: number | null = null;
 let voiceAudioCtx: AudioContext | null = null;
 let voiceAnalyser: AnalyserNode | null = null;
 let voiceMouthBuf: Uint8Array | null = null;
+/** 语音状态文案的自动收起定时器（见 setVoiceState） */
+let voiceRowTimer: number | null = null;
+/**
+ * "按下说话"的代际号。
+ *
+ * 一次按下会走两条 await（查配置 → 开麦克风）。如果用户按一下、松开、马上再按一下，
+ * 两次 await 会交叠：前一条链路醒来时状态已经是新一轮的 arming，只看状态判断会被它
+ * 蒙混过关，于是把**上一次**的麦克风接回来（第二路 getUserMedia 也会覆盖 voiceStream，
+ * 旧流泄漏、录音器被建两遍）。所以每条链路认领一个代际号，醒来先对号。
+ */
+let voicePressSeq = 0;
+/** "按住说话"的指针容差（px）：指针在这个范围内一律不算"移开按钮"，见 cancelByPointerAway */
+const VOICE_LEAVE_PAD_PX = 16;
 /** 外部可挂的唤醒词回调（当前不做常驻唤醒；留给将来接本地/系统级唤醒词） */
 let wakeWordHook: ((word: string) => void) | null = null;
+
+/* ---- 语音状态条（声纹 + 转写报错）：贴在对话气泡正上方 ————
+   为什么单独做一条：以前声纹条插在输入行前面的文档流里，一显示就把输入行（连同按住的
+   麦克风按钮）顶走 —— 指针随即"离开"按钮，pointerleave 直接把录音取消掉，看起来就是
+   "语音输入起不来"；报错则写进消息区，而消息区在折叠态是整片隐藏的 → 报错也看不见。
+   现在：绝对定位的状态条 + 气泡窗模式下由主进程把窗口向上长高一条（底边钉住），
+   气泡本体在屏幕上原地不动，输入行绝不移位。 */
+let voiceStripShown = false;
+
+function voiceStripEl(): HTMLElement | null {
+  return document.getElementById('pet-voice-lab');
+}
+
+function voiceStripTextEl(): HTMLElement | null {
+  return document.getElementById('pet-voice-status');
+}
+
+/**
+ * 显示状态条。气泡窗模式下**先让窗口向上长高一条再加 class**：这样气泡在屏幕上一步都不动
+ * （窗口变高时输入行本来就贴着底边，加 class 后气泡缩回原高、底边仍在原处）。
+ */
+function showVoiceStrip(): void {
+  const el = voiceStripEl();
+  if (el) el.hidden = false;
+  if (voiceStripShown) return;
+  voiceStripShown = true;
+  // 按**当前**意愿落 class：IPC 是异步的，快速"显示→收起"时后到的回调不能把状态带回去
+  const apply = (): void => { document.body.classList.toggle('is-voice-strip', voiceStripShown); };
+  const bridge = CHAT_PANEL_MODE ? chatBridge ?? getBridge() : null;
+  const pending = bridge?.chatWindowVoiceStrip?.(true);
+  if (pending && typeof pending.then === 'function') {
+    void pending.then(apply).catch(apply);
+    return;
+  }
+  apply();
+}
+
+/** 收起状态条（幂等）。窗口先缩回原高、再摘 class，避免气泡在屏幕上跳一下。 */
+function hideVoiceStrip(): void {
+  const el = voiceStripEl();
+  if (el) el.hidden = true;
+  if (!voiceStripShown) return;
+  voiceStripShown = false;
+  const apply = (): void => { document.body.classList.toggle('is-voice-strip', voiceStripShown); };
+  const bridge = CHAT_PANEL_MODE ? chatBridge ?? getBridge() : null;
+  const pending = bridge?.chatWindowVoiceStrip?.(false);
+  if (pending && typeof pending.then === 'function') {
+    void pending.then(apply).catch(apply);
+    return;
+  }
+  apply();
+}
+
+/**
+ * 状态条 / 输入行 / 麦克风按钮的几何快照（调试与自动化验证用）。
+ * 关键断言就一条：**状态条显隐前后 `mic` 的坐标不许变**（变了就说明又挤动布局了，
+ * 那正是"按住说话起不来"的老病根）。
+ */
+function voiceStripDebug(): Any {
+  const rect = (el: Element | null): Any => {
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) };
+  };
+  return {
+    shown: voiceStripShown,
+    mode: CHAT_PANEL_MODE ? 'chat-window' : 'in-window',
+    win: { w: window.innerWidth, h: window.innerHeight },
+    strip: rect(voiceStripEl()),
+    text: voiceStripTextEl()?.textContent ?? null,
+    bar: rect(document.getElementById('chatbar')),
+    inputRow: rect(document.querySelector('.chat-input-row')),
+    mic: rect(document.getElementById('chat-mic')),
+    lab: voiceLab()?.state() ?? null,
+  };
+}
 
 /* ---- 声纹（实时输入电平波形）：由 voicelab.ts 提供 ---- */
 interface VoiceLabLike {
@@ -3260,24 +3350,47 @@ function currentVoiceState(): VoiceState {
   return voiceState;
 }
 
-/** 语音专用行：不持久化（转写结果进输入框，历史上不该留"录音中…"这种瞬时状态） */
+/**
+ * 语音状态文案：写到**气泡上方的状态条**里（不再往聊天记录插行）。
+ *
+ * 两条硬理由：
+ *   1) 聊天记录（#chat-log）在气泡窗的折叠态是 `display:none`，而折叠态正是气泡窗打开时的
+ *      默认形态 —— 写进去的报错用户根本看不见（"按住说话没反应"最容易被忽视的原因）；
+ *   2) 状态条是绝对定位的，写文案不会挤动输入行，麦克风按钮原地不动。
+ * 文案不持久化：转写结果进输入框，历史上不该留"录音中…"这种瞬时状态。
+ */
 function setVoiceRow(text: string, tone: 'info' | 'error' = 'info'): void {
-  if (!chatLogEl) return;
-  if (!voiceRowEl) voiceRowEl = appendChatLog('tool', text, { persist: false });
-  if (!voiceRowEl) return;
-  voiceRowEl.classList.toggle('is-error', tone === 'error');
-  voiceRowEl.classList.add('is-voice');
-  const body = voiceRowEl.querySelector('.chat-text');
-  if (body) body.textContent = tone === 'error' ? `⚠️ ${text}` : `🎤 ${text}`;
-  chatScrollToEnd();
+  const el = voiceStripTextEl();
+  if (!el) return;
+  showVoiceStrip();
+  el.textContent = tone === 'error' ? `⚠️ ${text}` : `🎤 ${text}`;
+  el.classList.toggle('is-error', tone === 'error');
+  el.hidden = false;
 }
 
+/** 清掉状态文案并收起状态条（幂等） */
 function clearVoiceRow(): void {
-  if (voiceRowEl && voiceRowEl.parentElement) voiceRowEl.parentElement.removeChild(voiceRowEl);
-  voiceRowEl = null;
+  const el = voiceStripTextEl();
+  if (el) {
+    el.textContent = '';
+    el.classList.remove('is-error');
+  }
+  hideVoiceStrip();
 }
 
-/** 状态切换：按钮外观 + 状态行文案 + 收尾（停录音/停口型）都集中在这里 */
+/** 各状态的文案停留时长（0/未列出 = 一直留到状态自己变） */
+const VOICE_ROW_HIDE_MS: Partial<Record<VoiceState, number>> = {
+  error: 6000,
+  ready: 6500,
+  cancelled: 2400,
+};
+
+/**
+ * 状态切换：按钮外观 + 状态条文案 + 收尾（停录音/停口型）都集中在这里。
+ *
+ * 顺序很重要：**先收声纹（stopVoiceWave），再写文案**。反过来的话，收声纹那一步会把
+ * 状态条吞掉，"转写中… / 转写失败…"这些字就永远看不见（这是修复前报错消失的原因之一）。
+ */
 function setVoiceState(next: VoiceState, text?: string, tone: 'info' | 'error' = 'info'): void {
   voiceState = next;
   const btn = voiceButton();
@@ -3291,10 +3404,32 @@ function setVoiceState(next: VoiceState, text?: string, tone: 'info' | 'error' =
       ? '按住说话（松开后转写，不会自动发送）'
       : next === 'listening' ? '正在录音…松开结束' : next === 'transcribing' ? '转写中…' : '按住说话';
   }
-  if (text) setVoiceRow(text, tone);
-  // 声纹只在"连接中/录音中"存在；其它状态一律收掉（转写/完成/报错由状态行表达）
+  // 声纹只在"连接中/录音中"存在；其它状态一律收掉（转写/完成/报错由状态条文案表达）
   if (next !== 'listening' && next !== 'arming') stopVoiceWave();
   if (next === 'idle' || next === 'ready' || next === 'error' || next === 'cancelled') stopVoiceMouth();
+  if (text) setVoiceRow(text, tone);
+  // idle 一定伴随状态条收起：不带文案的 idle 也要把旧文案清掉，否则它会一直挂在气泡上方
+  else if (next === 'idle') clearVoiceRow();
+  scheduleVoiceRowHide(next);
+}
+
+/**
+ * 状态文案的自动收起：集中在这里，避免每个分支各写一个 setTimeout ——
+ * 漏写的那条分支（例如"当前版本没有接入语音转写"）会让状态条永远留在气泡上方。
+ */
+function scheduleVoiceRowHide(next: VoiceState): void {
+  if (voiceRowTimer) {
+    window.clearTimeout(voiceRowTimer);
+    voiceRowTimer = null;
+  }
+  const ms = VOICE_ROW_HIDE_MS[next];
+  if (!ms) return;
+  voiceRowTimer = window.setTimeout(() => {
+    voiceRowTimer = null;
+    if (voiceState !== next) return; // 期间又变了 → 交给新的状态处理
+    clearVoiceRow();
+    setVoiceState('idle');
+  }, ms);
 }
 
 /* —— 麦克风能量 → 口型（说话时嘴跟着动）—— */
@@ -3352,6 +3487,7 @@ function startVoiceMouth(stream: MediaStream): void {
 }
 
 function releaseVoiceStream(): void {
+  voicePressSeq += 1; // 让还在 await 里的那条链路作废（否则它会把刚放掉的麦克风又接回来）
   stopVoiceWave(); // 麦克风一释放，声纹立刻收掉（不留残波）
   try { voiceRecorder?.state !== 'inactive' && voiceRecorder?.stop(); } catch { /* ignore */ }
   voiceRecorder = null;
@@ -3375,11 +3511,11 @@ function finishVoiceCapture(cancel: boolean): void {
   if (cancel || heldMs < VOICE_MIN_HOLD_MS) {
     releaseVoiceStream();
     setVoiceState('cancelled', '语音未发送（按得太短或已取消）');
-    window.setTimeout(() => { if (voiceState === 'cancelled') { clearVoiceRow(); setVoiceState('idle'); } }, 2000);
     return;
   }
   if (!voiceStream) {
-    setVoiceState('cancelled', '语音未发送（没有拿到麦克风）');
+    // 按住够久但麦克风还没就绪（授权/设备慢）就松手了：这段没录到，说清楚原因
+    setVoiceState('cancelled', '语音未发送（麦克风还没就绪就松手了）');
     return;
   }
   const bridge = chatBridge ?? getBridge();
@@ -3435,40 +3571,56 @@ function fillVoiceTranscript(text: string): void {
   }
   setVoiceState('ready', `转写完成：${clean.slice(0, 60)}${clean.length > 60 ? '…' : ''}（确认后点发送）`);
   setChatToolbarStatus('语音已转写，确认后发送');
-  window.setTimeout(() => { if (voiceState === 'ready') { clearVoiceRow(); setVoiceState('idle'); } }, 6000);
 }
 
-async function startVoiceCapture(): Promise<void> {
+/**
+ * 按下麦克风（**同步**进入 arming）。
+ *
+ * 为什么必须同步：以前这里是 `await bridge.voiceStatus()` 之后才 setVoiceState('arming')，
+ * 于是"按下后马上松手"（或松手正好落在 IPC 往返期间）时状态还是 idle，document 上的 pointerup
+ * 什么都不做，随后录音启动 → 状态卡在 listening 直到 60s 上限（表现为"麦克风自己开着"）。
+ * 现在按键当场记时间、当场进 arming，松手一定能被 finishVoiceCapture 接住。
+ */
+function beginVoicePress(): void {
   if (voiceState === 'arming' || voiceState === 'listening' || voiceState === 'transcribing') return;
-  const bridge = chatBridge ?? getBridge();
   if (chatViewingSessionId) {
+    // 走状态条而不是工具条状态：气泡窗折叠态下工具条状态是隐藏的，写进去等于没说
     setChatToolbarStatus('正在查看历史对话，先点「返回当前」再发语音', true);
+    setVoiceState('error', '正在查看历史对话，先点「返回当前」再发语音', 'error');
     return;
   }
+  const bridge = chatBridge ?? getBridge();
   if (!bridge || typeof bridge.voiceTranscribe !== 'function') {
     setVoiceState('error', '当前版本没有接入语音转写', 'error');
     return;
   }
+  voiceArmAt = performance.now();
+  voicePressSeq += 1;
+  const seq = voicePressSeq;
+  setVoiceState('arming');
+  // 状态条 + 声纹：先亮起来再连接麦克风，用户按下立刻有反馈
+  showVoiceStrip();
+  if (!startVoiceWave('正在连接语音')) setVoiceRow('语音输入 · 准备中');
+  void startVoiceCapture(bridge, seq);
+}
+
+/** 连接麦克风并开始录音（异步部分；失败一律转成一条可读文案，不抛异常） */
+async function startVoiceCapture(bridge: RendererBridge, seq: number): Promise<void> {
+  /** 这一次按下还算数吗？（期间松手/取消/又按了新的 → 老链路必须自己作废） */
+  const pressAlive = (): boolean => seq === voicePressSeq && currentVoiceState() === 'arming';
   // 先问主进程"配置好了没"：没配就不要弹麦克风权限（避免用户白授权）
   if (typeof bridge.voiceStatus === 'function') {
     try {
       const st = await bridge.voiceStatus();
+      if (!pressAlive()) return; // 期间已经松手/取消/又按了一下 → 不要再开麦克风
       if (st && st.configured === false) {
         setVoiceState('error', st.hint || '语音输入未配置（设置 → AI 接口地址与密钥）', 'error');
-        window.setTimeout(() => { if (voiceState === 'error') { clearVoiceRow(); setVoiceState('idle'); } }, 5200);
         return;
       }
     } catch (err) {
       console.warn('[renderer] voiceStatus 查询失败（继续尝试录音）', err);
     }
   }
-  if (voiceState !== 'idle' && voiceState !== 'ready' && voiceState !== 'error' && voiceState !== 'cancelled') return;
-  clearVoiceRow();
-  voiceArmAt = performance.now();
-  setVoiceState('arming');
-  // 声纹条替代“语音输入 · 准备中”这类瞬时文字行（连接阶段只显示“正在连接语音”，
-  // 第一帧电平到了才切成波形）；拿不到 voicelab 时退回原来的文字行，功能不变。
-  if (!startVoiceWave('正在连接语音')) setVoiceRow('语音输入 · 准备中');
   let stream: MediaStream;
   try {
     const nav = navigator as Navigator & { mediaDevices?: MediaDevices };
@@ -3486,7 +3638,7 @@ async function startVoiceCapture(): Promise<void> {
     return;
   }
   // 松手早于权限弹窗返回：这里要能自愈（否则会出现"没在录却显示录音中"）
-  if (currentVoiceState() !== 'arming') {
+  if (!pressAlive()) {
     try { stream.getTracks().forEach((t) => t.stop()); } catch { /* ignore */ }
     return;
   }
@@ -3516,17 +3668,51 @@ async function startVoiceCapture(): Promise<void> {
 }
 
 /** 挂按住说话事件：document 级别监听松手，避免鼠标移出按钮时"停不下来" */
+/**
+ * 指针是否仍在按钮附近（含容差）。
+ *
+ * 为什么需要：按钮的位置会随布局变化（窗口改高、消息区滚动、状态条显隐、贴到屏幕边缘被
+ * 夹回来…）。布局一变，浏览器在下一次鼠标移动时就会补发 pointerleave —— 指针其实一步没动，
+ * 却被当成"用户走开了"，录音当场被取消（这正是"按住说话起不来"的病根）。
+ *
+ * 所以判据是"指针相对**按钮**在哪"，而不是"按钮现在在哪"：
+ *   ① 指针落在按钮**当前**矩形内（±容差）；或
+ *   ② 指针落在**按下当时**的按钮矩形内（±容差）。
+ * 两条都不成立，才算用户真的把指针拖走了（此时才取消）。
+ * 因为按下点必然落在按下当时的矩形里，所以"按钮自己挪走、指针没动"这条路径一定走 ② 而不取消。
+ */
 function installVoiceInput(): void {
   const btn = voiceButton();
   if (!btn) return;
+  /** 按下时的按钮矩形（判断"到底是谁动了"的基准） */
+  let pressRect: { left: number; top: number; right: number; bottom: number } | null = null;
+  const insideRect = (
+    r: { left: number; top: number; right: number; bottom: number } | null,
+    x: number,
+    y: number,
+    pad: number
+  ): boolean => !!r && x >= r.left - pad && x <= r.right + pad && y >= r.top - pad && y <= r.bottom + pad;
+  const stillNearButton = (event: PointerEvent): boolean => {
+    const x = Number(event.clientX);
+    const y = Number(event.clientY);
+    // 拿不到坐标（合成事件/异常）→ 宁可不取消，也不能把录音误杀
+    if (!Number.isFinite(x) || !Number.isFinite(y) || (x === 0 && y === 0)) return true;
+    const r = btn.getBoundingClientRect();
+    if (!r.width && !r.height) return true; // 按钮被藏起来时也不在这里判取消
+    return insideRect(r, x, y, VOICE_LEAVE_PAD_PX) || insideRect(pressRect, x, y, VOICE_LEAVE_PAD_PX);
+  };
   const cancelByPointerAway = (event: PointerEvent): void => {
     if (voiceState !== 'listening' && voiceState !== 'arming') return;
     if (event.relatedTarget && (btn === event.relatedTarget || btn.contains(event.relatedTarget as Node))) return;
+    if (stillNearButton(event)) return; // 布局位移造成的假"离开" → 不取消
     finishVoiceCapture(true);
   };
   btn.addEventListener('pointerdown', (event) => {
     event.preventDefault();
-    void startVoiceCapture();
+    const r = btn.getBoundingClientRect();
+    pressRect = { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
+    // 同步进入 arming：松手事件一定接得住（见 beginVoicePress 的注释）
+    beginVoicePress();
   });
   btn.addEventListener('pointerleave', cancelByPointerAway);
   btn.addEventListener('contextmenu', (event) => event.preventDefault());
@@ -3546,7 +3732,7 @@ function installVoiceInput(): void {
   window.addEventListener('pagehide', () => releaseVoiceStream());
   // 预留：唤醒词（当前不做常驻唤醒；外部脚本可 setWakeWordHook 后由它触发）
   (window as Any).petVoice = {
-    start: () => void startVoiceCapture(),
+    start: () => beginVoicePress(),
     stop: () => finishVoiceCapture(false),
     cancel: () => finishVoiceCapture(true),
     state: () => voiceState,
@@ -4403,6 +4589,7 @@ function installChatPanelUi(bridge: RendererBridge): void {
 async function collapseChatSurface(bridge: RendererBridge): Promise<void> {
   closeChatMenu();
   if (CHAT_PANEL_MODE) {
+    hideVoiceStrip(); // 收起对话别把状态条留在窗口里（否则窗口会一直高一条、下次打开也带着）
     await bridge.chatWindowClose?.();
     return;
   }
@@ -4598,7 +4785,20 @@ function installDebugHooks(bridge: RendererBridge): void {
       micApi: typeof navigator !== 'undefined' && !!navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function',
       recorder: typeof MediaRecorder !== 'undefined',
       wakeWordSupported: false,
+      stripShown: voiceStripShown,
     }),
+    /**
+     * 语音状态条（声纹 / 转写报错）显隐 + 几何快照。
+     * 自动化验证"状态条显隐时麦克风按钮坐标不变"（= 不再挤动布局）用。
+     */
+    voiceStrip: (on: boolean): Any => {
+      if (on) showVoiceStrip();
+      else hideVoiceStrip();
+      return voiceStripDebug();
+    },
+    /** 对话消息区展开/收起（自动化验证状态条几何与窗口高度用） */
+    expandChat: (): Any => { setChatCollapsed(bridge, false); return voiceStripDebug(); },
+    collapseChat: (): Any => { setChatCollapsed(bridge, true); return voiceStripDebug(); },
     voiceCancel: () => finishVoiceCapture(true),
     /**
      * 只用于视觉验证：往对话里插几条"演示行"（user / pet / tool / failed 各一条）+ 驱动声纹。
@@ -4614,6 +4814,7 @@ function installDebugHooks(bridge: RendererBridge): void {
       markUserRowSent(u);
       const wave = (window as Any).PetVoiceLab;
       if (wave && typeof wave.begin === 'function') {
+        showVoiceStrip(); // 状态条本身由 renderer 控制显隐（窗口会长高一条）
         const token = wave.begin({ label: '正在连接语音' });
         let now = performance.now();
         // 填满 40 点窗口（否则左边是空的、右边一个包，看起来像"箭头"而不是波形）

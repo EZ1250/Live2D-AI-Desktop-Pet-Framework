@@ -117,6 +117,133 @@
     return framingMode === 'half' ? 0.42 : 1;
   }
 
+  /** 取景等比缩放留下的边距（给摆动部件预留） */
+  const MOC3_FIT_MARGIN = 0.89;
+  /** 采用内容锚点的最低要求：内容至少要有这个比例落在窗口里（低于它一律退回画布包围盒） */
+  const MIN_VISIBLE_CONTENT_RATIO = 0.25;
+  /** 内容框允许超出画布包围盒的容差（遮罩取样是按 1/128 量化的，边界会有几像素误差） */
+  const CONTENT_IN_CANVAS_SLACK = 0.08;
+
+  /**
+   * 内容框是否"像真的"（纯函数，可单测）。
+   *
+   * 判定依据是**它必须落在画布包围盒里**：内容是从画布上取样的，天然是画布的子集。
+   * 一旦换算用错了帧（遮罩是几帧前抓的、和当时的 position/scale 不一致），算出来的
+   * "局部内容框"就会跑到画布外面去 —— 这正是不该被采用的锚点。放它过去的表现就是
+   * 角色被按错的锚点摆位，直接偏出窗口（实测的"启动时角色向左偏出窗口"）。
+   */
+  function isContentRectPlausible(
+    rect: { x: number; y: number; w: number; h: number } | null | undefined,
+    natW: number,
+    natH: number
+  ): boolean {
+    if (!rect) return false;
+    if (![rect.x, rect.y, rect.w, rect.h].every((v) => Number.isFinite(v))) return false;
+    if (!(rect.w > 0) || !(rect.h > 0)) return false;
+    if (!(natW > 0) || !(natH > 0)) return false;
+    const rw = rect.w / natW;
+    const rh = rect.h / natH;
+    if (rw < 0.05 || rh < 0.05) return false; // 比画布小两个数量级 → 量歪了
+    if (rw > 1.5 || rh > 1.5) return false;   // 比画布还大 → 不可能
+    return (
+      rect.x >= -CONTENT_IN_CANVAS_SLACK * natW &&
+      rect.y >= -CONTENT_IN_CANVAS_SLACK * natH &&
+      rect.x + rect.w <= (1 + CONTENT_IN_CANVAS_SLACK) * natW &&
+      rect.y + rect.h <= (1 + CONTENT_IN_CANVAS_SLACK) * natH
+    );
+  }
+
+  interface PlacementInput {
+    vw: number;
+    vh: number;
+    /** 画布包围盒（scale=1）：缩放的**唯一**基准（内容框量歪也不会让缩放跑飞） */
+    natW: number;
+    natH: number;
+    framing: FramingMode;
+    /** 额外缩放（滚轮档位 × 呼吸） */
+    extra?: number;
+    /** 纵向浮动（呼吸上下） */
+    bobY?: number;
+    /** 内容锚点（容器局部坐标，可能量歪）；null/缺省 = 直接用画布包围盒 */
+    content?: { x: number; y: number; w: number; h: number } | null;
+  }
+
+  interface PlacementResult {
+    scale: number;
+    x: number;
+    y: number;
+    /** 实际采用的基准 */
+    used: 'content' | 'bbox';
+    /** 内容锚点被否掉（量歪 / 会把角色摆出窗口）——调用方应停止再用它 */
+    contentRejected: boolean;
+  }
+
+  /**
+   * moc3 取景落位的**纯函数**（不碰 PIXI，可单测）。
+   *
+   * 两条老规矩保留：
+   *   ① 缩放只按画布包围盒算：内容框量歪时缩放会整档跑飞（不是糊满整窗就是缩成一个点）；
+   *   ② 居中基准优先用真实内容（画布留白大的模型才不会被带偏）。
+   *
+   * 新增的一道保险（"启动时角色有时向左偏出窗口"的修复）：
+   *   内容锚点先验一次——用它摆完之后，**内容必须有足够比例落在窗口里**；不满足就退回
+   *   画布包围盒并回报 contentRejected=true（调用方据此丢掉这个锚点）。宁可回到"居中但
+   *   可能偏一点"的旧行为，也不能让角色消失在窗口外。
+   */
+  function computeMoc3Placement(input: PlacementInput): PlacementResult | null {
+    const vw = Number(input.vw) || 0;
+    const vh = Number(input.vh) || 0;
+    const natW = Number(input.natW) || 0;
+    const natH = Number(input.natH) || 0;
+    if (!(vw > 0) || !(vh > 0) || !(natW > 0) || !(natH > 0)) return null;
+    const extra = Number.isFinite(input.extra) ? (input.extra as number) : 1;
+    const bobY = Number.isFinite(input.bobY) ? (input.bobY as number) : 0;
+    const s = Math.min((vw * MOC3_FIT_MARGIN) / natW, (vh * MOC3_FIT_MARGIN) / natH)
+      * (input.framing === 'half' ? HALF_ZOOM : 1) * extra;
+    if (!Number.isFinite(s) || s <= 0) return null;
+
+    const bbox = { x: 0, y: 0, w: natW, h: natH };
+    /** 按给定锚点算容器位置 */
+    const placeWith = (a: { x: number; y: number; w: number; h: number }): { x: number; y: number } => {
+      const cx = (a.x + a.w / 2) * s; // 锚点中心相对容器原点的偏移
+      if (input.framing === 'half') {
+        // 半身：横向对准内容中心；纵向把**头顶**顶到窗口上沿附近（脚被裁掉是对的）
+        return { x: vw / 2 - cx, y: vh * HALF_TOP_PAD_RATIO - a.y * s + bobY };
+      }
+      // 全身：整个内容居中（不再被画布留白带偏）
+      return { x: vw / 2 - cx, y: vh / 2 - (a.y + a.h / 2) * s + bobY };
+    };
+    /** 位置必须让角色还落在窗口附近，否则说明锚点不可信 */
+    const nearWindow = (p: { x: number; y: number }): boolean =>
+      Number.isFinite(p.x) && Number.isFinite(p.y) && Math.abs(p.x) <= vw * 3 && Math.abs(p.y) <= vh * 3;
+    /** 按给定锚点摆完之后，内容在窗口里还剩多宽（px） */
+    const visibleWidth = (a: { x: number; y: number; w: number; h: number }, p: { x: number; y: number }): number => {
+      const left = p.x + a.x * s;
+      const right = p.x + (a.x + a.w) * s;
+      return Math.max(0, Math.min(right, vw) - Math.max(left, 0));
+    };
+
+    let pos = placeWith(bbox);
+    let used: 'content' | 'bbox' = 'bbox';
+    let contentRejected = false;
+    if (input.content) {
+      const candidate = placeWith(input.content);
+      const want = Math.min(input.content.w * s, vw);
+      if (
+        isContentRectPlausible(input.content, natW, natH) &&
+        nearWindow(candidate) &&
+        visibleWidth(input.content, candidate) >= want * MIN_VISIBLE_CONTENT_RATIO
+      ) {
+        pos = candidate;
+        used = 'content';
+      } else {
+        contentRejected = true;
+      }
+    }
+    if (!nearWindow(pos)) return null; // 连包围盒都不可信：宁可不动，也不能把模型甩出去
+    return { scale: s, x: pos.x, y: pos.y, used, contentRejected };
+  }
+
   /* ================================================================
      追踪参数层（骨骼追踪 / 表情追踪 / 语音口型的统一入口）
      - 底层**不直接绑摄像头**，只接受"一帧参数"（TrackingFrame）；
@@ -472,6 +599,22 @@
     /** 标定期间临时切到全身（半身会把角色裁出窗口，量不准） */
     let calibratingInFull = false;
     let calibrateLogged = false;
+    /**
+     * 取样那一帧的模型变换快照（pos/scale + 窗口尺寸）。
+     *
+     * 为什么必须存快照：遮罩不是每帧都刷（只有首帧和显式请求时才抓一次），所以"遮罩里的
+     * 内容"和"此刻的 model.position/scale"经常不是同一帧的东西。把两者混着换算，局部坐标
+     * 会算歪 → 内容锚点偏出去 → 角色被摆到窗口外（实测的"启动时角色向左偏出窗口"）。
+     * 换算一律用**取样当帧**的变换，量出来的锚点才是自洽的。
+     */
+    let maskFrame: { x: number; y: number; s: number; vw: number; vh: number } | null = null;
+    /**
+     * 采用内容锚点后，用**下一帧的真实绘制结果**复核一次：锚点若量歪，角色不会真的落在
+     * 窗口中间，这里能直接看出来并退回画布包围盒（安全的旧行为）。
+     */
+    let anchorVerifyPending = false;
+    /** 复核用的偏差上限（占窗口宽的比例）：正常取景下内容中心≈窗口中心 */
+    const ANCHOR_VERIFY_TOLERANCE = 0.14;
 
     /**
      * 遮罩里不透明像素的归一化包围盒（[x0,y0,x1,y1]，0..1）与像素数；没有遮罩返回 null。
@@ -507,6 +650,9 @@
      * 内容会量成一个 1x2 的点（实测日志：画布 4206x9802 / 内容 1x2@(0,-1)），
      * 按它适配缩放会把模型放大几百倍、整窗糊成一片。遮罩是真实绘制结果，不依赖任何内部矩阵。
      *
+     * 换算必须用**取样那一帧**的变换快照（`maskFrame`），不能用此刻的 model.position/scale：
+     * 遮罩可能是好几帧前抓的，混着算会把锚点算歪（见 maskFrame 的注释）。
+     *
      * 返回的矩形与 `model.position` 同一坐标系（容器局部，y 向下），可直接当取景锚点。
      */
     function calibrateAnchorFromMask(): { x: number; y: number; w: number; h: number } | null {
@@ -515,66 +661,85 @@
       const [bx0, by0, bx1, by1] = stats.bbox;
       // 横向被窗口裁掉（占满整宽）就量不准；纵向被裁是半身的正常现象，不拦
       if (bx1 - bx0 >= 0.98) return null;
-      const vw = window.innerWidth || 1;
-      const vh = window.innerHeight || 1;
-      const s = model && model.scale ? model.scale.x : 0;
-      const pos = model && model.position;
-      if (!(s > 0) || !pos) return null;
+      // 只有**左右都被窗口切掉**（或一侧贴边另一侧也接近满宽）才会既偏又大：
+      // 单侧被裁时量到的是"可见的那一半"，中心必然偏，采用它就会把角色推出去 → 直接放弃
+      if (bx0 <= 0.005 && bx1 >= 0.9) return null;
+      if (bx1 >= 0.995 && bx0 <= 0.1) return null;
+      const f = maskFrame;
+      const vw = f ? f.vw : window.innerWidth || 1;
+      const vh = f ? f.vh : window.innerHeight || 1;
+      const s = f ? f.s : (model && model.scale ? model.scale.x : 0);
+      const posX = f ? f.x : (model && model.position ? model.position.x : 0);
+      const posY = f ? f.y : (model && model.position ? model.position.y : 0);
+      if (!(s > 0)) return null;
       return {
-        x: (bx0 * vw - pos.x) / s,
-        y: (by0 * vh - pos.y) / s,
+        x: (bx0 * vw - posX) / s,
+        y: (by0 * vh - posY) / s,
         w: ((bx1 - bx0) * vw) / s,
         h: ((by1 - by0) * vh) / s,
       };
     }
 
-    /** 量到的内容框是否可信；不可信就继续用画布包围盒兜底 */
+    /**
+     * 内容锚点复核：用**刚取样的那一帧**量内容中心，看它是否真的落在窗口中间。
+     *
+     * 为什么这一步不可省：锚点量歪时，"用它摆位"这件事本身是自洽的 —— 摆完之后角色一定
+     * 不在窗口中间，但代码看着一切正常。只有拿真实绘制结果回头对一次，才能把量歪的锚点抓出来。
+     * 复核不过就退回画布包围盒（改动前的行为，角色一定在窗口里），并停止再标定。
+     */
+    function verifyContentAnchor(): void {
+      if (!anchorVerifyPending) return;
+      anchorVerifyPending = false;
+      const stats = maskOpaqueBBox();
+      if (!stats) return; // 这一帧没数据 → 放弃复核（不冒险改取景）
+      const [bx0, , bx1] = stats.bbox;
+      const vw = window.innerWidth || 1;
+      const center = ((bx0 + bx1) / 2) * vw;
+      const off = Math.abs(center - vw / 2);
+      if (off <= vw * ANCHOR_VERIFY_TOLERANCE) return; // 真的居中 → 锚点可信
+      contentRect = null;
+      contentRectStale = false;
+      console.warn(
+        `[live2d] 内容锚点复核不通过（内容中心偏离窗口中心 ${Math.round(off)}px > ${Math.round(vw * ANCHOR_VERIFY_TOLERANCE)}px）：` +
+          '取景退回画布包围盒，避免角色被摆到窗口外'
+      );
+      refit();
+    }
+
+    /** 量到的内容框是否可信；不可信就继续用画布包围盒兜底（规则与纯函数一致，见 isContentRectPlausible） */
     function isSaneContentRect(r: { x: number; y: number; w: number; h: number } | null): boolean {
+      if (!isContentRectPlausible(r, natW, natH)) return false;
       if (!r) return false;
-      if (![r.x, r.y, r.w, r.h].every((v) => Number.isFinite(v))) return false;
-      if (!(r.w > 0) || !(r.h > 0)) return false;
-      const rw = r.w / natW;
-      const rh = r.h / natH;
-      if (rw < 0.05 || rh < 0.05) return false; // 比画布小两个数量级 → 量歪了
-      if (rw > 1.5 || rh > 1.5) return false; // 比画布还大 → 不可能
       if (r.x < -natW || r.y < -natH || r.x > natW * 2 || r.y > natH * 2) return false; // 跑得没边
       return true;
     }
 
     /**
-     * 取景：定位 + 缩放。
-     *
-     * **缩放沿用画布包围盒**（与改动前逐字一致）——缩放的基准绝不能换成量出来的内容框：
-     * 内容框一旦量歪，缩放会整档跑飞，模型不是糊满整窗就是缩成一个点（实测踩到过）。
-     * 这里只把**居中的基准**换成真实内容。
+     * 取景：定位 + 缩放 —— 把决策交给纯函数 computeMoc3Placement（可单测），这里只负责落地。
      * @param extra 额外缩放（滚轮档位、呼吸）
      * @param bobY  纵向浮动（呼吸上下）
      */
     function frameModel(extra: number, bobY: number): void {
       if (!model || !natW || !natH) return;
-      const vw = window.innerWidth || 1;
-      const vh = window.innerHeight || 1;
-      const s = Math.min((vw * FIT_MARGIN) / natW, (vh * FIT_MARGIN) / natH) * framingZoom() * extra;
-      if (!Number.isFinite(s) || s <= 0) return;
-      const bbox = { x: 0, y: 0, w: natW, h: natH };
-      /** 按给定锚点算容器位置 */
-      const placeWith = (a: { x: number; y: number; w: number; h: number }) => {
-        const cx = (a.x + a.w / 2) * s; // 锚点中心相对容器原点的偏移
-        if (framingMode === 'half') {
-          // 半身：横向对准内容中心；纵向把**头顶**顶到窗口上沿附近（脚被裁掉是对的）
-          return { x: vw / 2 - cx, y: vh * HALF_TOP_PAD_RATIO - a.y * s + bobY };
-        }
-        // 全身：整个内容居中（不再被画布留白带偏）
-        return { x: vw / 2 - cx, y: vh / 2 - (a.y + a.h / 2) * s + bobY };
-      };
-      /** 位置必须让角色还落在窗口附近，否则说明锚点不可信 */
-      const nearWindow = (p: { x: number; y: number }) =>
-        Number.isFinite(p.x) && Number.isFinite(p.y) && Math.abs(p.x) <= vw * 3 && Math.abs(p.y) <= vh * 3;
-      let pos = placeWith(contentRect ?? bbox);
-      if (!nearWindow(pos) && contentRect) pos = placeWith(bbox); // 锚点不可信 → 退回画布包围盒
-      if (!nearWindow(pos)) return; // 两个都不行就别动，保持上一帧（宁可不动也不能把模型甩出去）
-      model.scale.set(s);
-      model.position.set(pos.x, pos.y);
+      const res = computeMoc3Placement({
+        vw: window.innerWidth || 1,
+        vh: window.innerHeight || 1,
+        natW,
+        natH,
+        framing: framingMode,
+        extra,
+        bobY,
+        content: contentRect,
+      });
+      if (!res) return;
+      if (res.contentRejected) {
+        // 内容锚点会把角色摆出窗口：丢掉它并停止再标定（回到画布包围盒 = 改动前的安全行为）
+        contentRect = null;
+        contentRectStale = false;
+        console.warn('[live2d] 内容锚点会把角色摆出窗口，取景退回画布包围盒');
+      }
+      model.scale.set(res.scale);
+      model.position.set(res.x, res.y);
     }
     /**
      * 命中遮罩（点击穿透用）：把画布**降采样**成一张小位图缓存起来，
@@ -629,6 +794,12 @@
         if (opaque <= 4) return;
         maskData = px;
         maskAt = performance.now();
+        // 记下同一帧的模型变换：之后用遮罩换算内容锚点时必须用这份快照，不能用"此刻"的值
+        const s = model && model.scale ? model.scale.x : 0;
+        const pos = model && model.position ? model.position : null;
+        maskFrame = pos && s > 0
+          ? { x: pos.x, y: pos.y, s, vw: window.innerWidth || 1, vh: window.innerHeight || 1 }
+          : null;
       } catch (err) {
         console.warn('[live2d] 命中遮罩取样失败', err);
       }
@@ -648,7 +819,6 @@
       return maskData[(my * MASK_W + mx) * 4 + 3] > 24;
     }
     const phase = Math.random() * Math.PI * 2;
-    const FIT_MARGIN = 0.89; // 给摆动部件预留边距
 
     function refit(): void {
       if (destroyed || !model) return;
@@ -1386,7 +1556,8 @@
               // 内容锚点标定（每个模型只做一次）：
               // ① 半身会把角色裁出窗口、量不准 → 先临时切全身摆一帧（肉眼看不到这一帧）
               // ② 用命中遮罩（真实绘制结果）量内容范围，量到就换成内容锚点
-              // ③ 一直量不到就老实退回画布包围盒（=改动前的行为）
+              // ③ 采用后**用下一帧的真实绘制结果复核一次**（量歪的锚点在这里会被退回画布包围盒）
+              // ④ 一直量不到就老实退回画布包围盒（=改动前的行为）
               if (contentRectStale && renderedThisFrame) {
                 contentRectTries += 1;
                 if (framingMode === 'half') {
@@ -1403,7 +1574,7 @@
                     console.log(
                       `[live2d] 内容锚点: 画布=${Math.round(natW)}x${Math.round(natH)} ` +
                         `内容=${measured ? `${Math.round(measured.w)}x${Math.round(measured.h)}@(${Math.round(measured.x)},${Math.round(measured.y)})` : 'null'} ` +
-                        `→ ${ok ? '采用' : '退回包围盒'}`
+                        `→ ${ok ? '采用（待复核）' : '退回包围盒'}`
                     );
                   }
                   if (ok && measured) {
@@ -1414,6 +1585,9 @@
                       calibratingInFull = false;
                     }
                     frameModel(breathe * Math.pow(1.08, zoomSteps), bob); // 立刻按新锚点重排
+                    // 复核：下一帧拿到"按新锚点画出来的结果"，看内容中心是否真的在窗口中间
+                    anchorVerifyPending = true;
+                    refreshHitMask();
                   } else {
                     refreshHitMask(); // 遮罩可能还是空的/过期的：刷新后下一帧再试
                     if (contentRectTries >= CONTENT_RECT_MAX_TRIES) {
@@ -1428,6 +1602,8 @@
                   }
                 }
               }
+              // 复核内容锚点（只用遮罩里的真实绘制结果，不依赖任何内部矩阵）
+              if (anchorVerifyPending && renderedThisFrame && !maskRefreshQueued) verifyContentAnchor();
               // 追踪 / 语音层：按权重在基座值上混合；层过期后自动衰减，回到鼠标跟随（无设备时零副作用）
               const tracked = mixer.sample();
               if (tracked.size) {
@@ -1729,6 +1905,11 @@
     mountPlaceholder,
     /** 参数混合器（分层权重 + TTL 衰减）：暴露出来给单元测试与调试台验证混合/过期行为 */
     __ParamMixer: ParamMixer,
+    /**
+     * moc3 取景落位的纯函数（无 PIXI 依赖）：单元测试用。
+     * 只做算术 —— 输入窗口/画布/内容锚点，输出缩放与位置，并回答"内容锚点是否被否掉"。
+     */
+    __computeMoc3Placement: computeMoc3Placement,
   };
   w.PetLive2d = api;
 })();

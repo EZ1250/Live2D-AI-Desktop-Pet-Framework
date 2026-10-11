@@ -607,8 +607,10 @@ async function installDevDebug(ctx) {
               })();
           }, 7000);
       }
-      // 调试用：声纹波形实测——用合成电平驱动（不需要真麦克风），打印状态/路径/几何，
-      // 并顺带把对话气泡行的计算样式与输入行控件高度打出来（截图配合 vl 目检）
+      // 调试用：声纹波形实测——用合成电平驱动（不需要真麦克风），打印状态/路径/几何。
+      // 关键断言（不靠肉眼）：**状态条显隐前后麦克风按钮的坐标必须一模一样** ——
+      // 以前声纹条插在输入行的文档流里，一显示就把按钮顶走，按住的指针随即"离开"按钮，
+      // 录音被误取消（"按住说话起不来"的病根）。这里用几何数字把它钉死。
       if (process.env.PET_VOICELAB_TEST === '1') {
           setTimeout(() => {
               void (async () => {
@@ -617,8 +619,18 @@ async function installDevDebug(ctx) {
                       return;
                   try {
                       const dump = await win.webContents.executeJavaScript(`(async () => {
+                 const d = window.__petDebug;
                  const lab = window.PetVoiceLab;
                  if (!lab) return { error: 'no PetVoiceLab' };
+                 const geo = (sel) => { const e = document.querySelector(sel); if (!e) return null; const r = e.getBoundingClientRect();
+                   return { x: Math.round(r.left * 10) / 10, y: Math.round(r.top * 10) / 10, w: Math.round(r.width * 10) / 10, h: Math.round(r.height * 10) / 10 }; };
+                 // 展开态下更接近真实使用（折叠态窗口只有 72px，塞不下状态条）
+                 if (d && typeof d.expandChat === 'function') d.expandChat();
+                 await new Promise((r) => setTimeout(r, 260));
+                 const before = { win: { w: innerWidth, h: innerHeight }, mic: geo('#chat-mic'), inputRow: geo('.chat-input-row'), bar: geo('#chatbar') };
+                 // 显示状态条（真实路径：会经 IPC 让气泡窗向上长高一条）
+                 const stripInfo = d && typeof d.voiceStrip === 'function' ? d.voiceStrip(true) : null;
+                 await new Promise((r) => setTimeout(r, 300));
                  const token = lab.begin({ label: '正在连接语音' });
                  const afterBegin = { ...lab.state(), mounted: lab.__mounted() };
                  // 合成一段"说话"电平：先小后大再回落（覆盖映射与镜像带）
@@ -632,12 +644,7 @@ async function installDevDebug(ctx) {
                  const el = document.getElementById('pet-voice-lab');
                  const rect = el ? el.getBoundingClientRect() : null;
                  const path = lab.__path();
-                 const rowStyles = Array.from(document.querySelectorAll('#chat-log .chat-row')).slice(-4).map((r) => {
-                   const cs = getComputedStyle(r);
-                   return { cls: r.className, bg: cs.backgroundColor, radius: cs.borderRadius, margin: cs.margin, pad: cs.padding };
-                 });
-                 const inputRow = document.querySelector('.chat-input-row');
-                 const ics = inputRow ? getComputedStyle(inputRow) : null;
+                 const after = { win: { w: innerWidth, h: innerHeight }, mic: geo('#chat-mic'), inputRow: geo('.chat-input-row'), bar: geo('#chatbar'), strip: geo('#pet-voice-lab') };
                  const heights = (() => {
                    const pick = (sel) => { const e = document.querySelector(sel); return e ? Math.round(e.getBoundingClientRect().height * 10) / 10 : null; };
                    return { input: pick('#chat-input'), mic: pick('#chat-mic'), send: pick('#chat-send'), voiceLab: pick('#pet-voice-lab') };
@@ -652,9 +659,16 @@ async function installDevDebug(ctx) {
                    ariaValue: el ? el.getAttribute('aria-valuetext') : null,
                    hidden: el ? el.hidden : null,
                    rect: rect ? { top: Math.round(rect.top), height: Math.round(rect.height), width: Math.round(rect.width) } : null,
-                   beforeInputRow: !!(el && inputRow && el.nextElementSibling === inputRow),
-                   rowStyles,
-                   inputRowStyle: ics ? { radius: ics.borderRadius, border: ics.borderTopColor, bg: ics.backgroundColor } : null,
+                   before,
+                   after,
+                   // 麦克风/输入行在屏幕上不许动（这是本次修复的核心断言）
+                   micUnmoved: !!(before.mic && after.mic && before.mic.x === after.mic.x && before.mic.y === after.mic.y),
+                   inputRowUnmoved: !!(before.inputRow && after.inputRow && before.inputRow.y === after.inputRow.y),
+                   // 状态条必须在气泡上方，且窗口确实长高了一条
+                   stripAboveBar: !!(after.strip && after.bar && after.strip.y + after.strip.h <= after.bar.y + 1),
+                   windowGrew: after.win.h - before.win.h,
+                   stripInfo,
+                   barH: after.bar ? after.bar.h : null,
                    heights,
                  };
                })()`);

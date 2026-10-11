@@ -425,9 +425,13 @@ API Key 丢了 / 设置改了不生效"——两套配置各改各的，排查�
 
 - `PET_*` 调试钩子集中在 `src/main/devDebug.js`。入口只有一句条件 require，没设 `PET_*` 时该文件
   不会被加载；打包体积上它仍在 asar 内，但不参与正常运行。
-- 渲染层调试入口：`window.__petDebug`（只读查询：`bounds()`/`tracking()`/`paramInfo()` 等）。
+- 渲染层调试入口：`window.__petDebug`（只读查询：`bounds()`/`tracking()`/`paramInfo()` 等；
+  另有 `voiceStrip(true|false)` 与 `expandChat()` 用来验证"语音状态条显隐时麦克风按钮坐标不变"）。
 - `PET_GPU_AUDIT=1`：打印 WebGL 上下文属性（含 antialias / premultipliedAlpha）、画布缓冲与 DPR、
   CSS 合成层、moc3 内部状态与 60 帧平均耗时——排查"毛边/糊/掉帧"时先看它。
+- `PET_VOICELAB_TEST=1`：用合成电平驱动声纹，打印波形 path / 相位 / 几何，并**断言**
+  `micUnmoved`（状态条显隐前后麦克风按钮坐标一致）、`stripAboveBar`（状态条在气泡上方）、
+  `windowGrew`（窗口长高了状态条那一条）。
 
 ## 7.1 AI 工具一览（加工具要改哪三处）
 
@@ -463,14 +467,67 @@ API Key 丢了 / 设置改了不生效"——两套配置各改各的，排查�
 3. 模型给的代码要逐条核对边界：本轮修掉了"折行解析写成死循环""`.ics` 结尾缺 CRLF"
    "`tls.connect(port, host, cb)` 重载不存在""`save_path` 变量可能未赋值"等问题。
 
+## 7.2 语音状态条的位置契约（改布局前先读）
+
+语音输入（按住说话）的**声纹波形与全部文案**都画在 `#pet-voice-lab` 这条状态条上。两条约束：
+
+1. **它绝不能回到输入行的文档流里**。以前声纹条插在 `.chat-input-row` 之前，一显示就把输入行
+   连同**按住的麦克风按钮**顶走；浏览器在下一次鼠标移动时补发 `pointerleave`，指针其实一步没动
+   却被判成"用户走开"，录音当场取消 —— 表现就是"在正常对话框里按住说话毫无反应"。
+   现在状态条是绝对定位（不参与布局），并且 `cancelByPointerAway` 还会按**按钮当前矩形**
+   复核坐标，只有指针真的离远才取消。
+2. **高度是跨进程约定**：气泡窗本体是一整块固定尺寸的窗口，没有"气泡外面"的地方可画，
+   所以显示状态条时由主进程把窗口向上长高一条、**底边钉住**（气泡与输入行在屏幕上原地不动）。
+   渲染层 CSS 的 `--voice-strip-h` 与主进程的 `CHAT_WINDOW_VOICE_STRIP_HEIGHT` 必须相等
+   （`tests/contracts.test.js` 会比对这两个数字），高度经 `IPC_CHAT_WINDOW_VOICE_STRIP` 通知。
+   桌宠窗口内的回退输入条上方没有窗外空间，状态条在那里改为悬浮在输入行上方。
+
+另外两条与它直接相关的实现约定：
+- 语音文案**不写进聊天记录**：消息区（`#chat-log`）在气泡窗折叠态是整片隐藏的，而折叠态正是
+  气泡窗打开时的默认形态 —— 报错写进去等于没提示。
+- 状态文案的自动收起集中在 `setVoiceState` → `scheduleVoiceRowHide`：每个分支各写一个
+  `setTimeout` 时，漏写的那条（例如"当前版本没有接入语音转写"）会让状态条与窗口高度一直留着。
+
+## 7.3 转写模型怎么选（"一直语音识别失败"的病根）
+
+本应用只有两条转写路：`POST <base>/audio/transcriptions` 与 `POST <base>/chat/completions`
+（`input_audio` data URL）。**能不能用取决于模型名，而不是模型在不在 `/models` 列表里。**
+
+2026-10-11 在用户自己的百炼工作区域名（`ws-*.maas.aliyuncs.com/compatible-mode/v1`）上逐项实测：
+
+| 模型名 | 结果 |
+|---|---|
+| `qwen3-asr-flash` | ✅ chat-audio 0.4~0.8s 出文本（合成 wav 与真实 ogg/opus 都过）——**唯一可用**，而它**不在** `/models` 列表里 |
+| `fun-asr-flash-2026-06-15` | ❌ transcriptions 404 / chat-audio 400（它是原生/异步接口专用）；偏偏是 `/models` 里排第一的"转写候选" |
+| `qwen3-asr-flash-realtime` 等 `*-realtime` | ❌ 实时 WebSocket 专用，chat-audio 500 或空响应 |
+| `qwen3.8-omni-flash`、`qwen-audio-3.0-asr-flash` 等 omni/audio | ⚠️ 能收音频，但返回的是"对音频的回答"而不是逐字听写 |
+| `paraformer-*` / `sensevoice-*` | ❌ 非 OpenAI 兼容口，报 url error |
+
+三条结论（都写进了代码与测试）：
+
+1. **列表 ≠ 可调用**：`/models` 不含某个模型时不能判"名字写错"（`indexVoiceModels` 对实测可用的
+   `qwen3-asr-flash` 只给 warn + "去自检"，不再劝用户换名字）。
+2. **候选排序要按"本应用能不能驱动"排**：`asrRouteCompat()` 把实时/原生专用（`*-realtime`、
+   `^fun-asr`、`paraformer`、`sensevoice`、`s2s`、`livetranslate`、`tts`）压到最后，omni/audio 类
+   标成"能听但会聊天"，`qwen3-asr-flash` 系列置顶（`asrScore` 给 5）。
+3. **失败提示要能落地**：两条路由都失败时，先判断是不是模型名不对，直接给出
+   "把转写模型改成 `qwen3-asr-flash`"，而不是笼统地说"换个支持 ASR 的网关"。
+
+> 换网关/换模型前**先点「🎙 自检语音识别」**：它用内置合成音频实测两条路由，是唯一权威结论；
+> `/models` 索引只当参考。相关单测：`tests/voiceModelRanking.test.js`（假 fetch，不联网）。
+
 ## 8. 自检命令
 
 ```bash
 node scripts/check-model.js "<模型文件夹>"   # 模型能不能渲染
 npm run build:all                            # 类型 + 装配
-npm test                                     # 单测（devTools）
+npm test                                     # 类型 + 装配 + 单测（IPC 契约 / 声纹 / 语音状态机 / 取景落位 / 转写模型选型）
 npm run check:privacy --all                  # 打包前后密钥/隐私闸门
 ```
+
+> `npm test` 里带着 `assemble`：`public/renderer/**` 是打包真正吃进去的那份渲染层，
+> 曾经出现过"源码改了但没 assemble → 测试跑旧产物、打出来的包也是旧代码"的坑，
+> 所以测试入口顺手把它刷新，别把它挪出去。
 
 项目内置校验范围见上面的命令；窗口交互、渲染和权限提示仍需在 Windows 目标环境中手动确认。
 
@@ -483,9 +540,16 @@ npm run check:privacy --all                  # 打包前后密钥/隐私闸门
   重构需要看着动画调状态切换，属"没有运行环境不该盲改"的部分。
 - **双击**：需求未定义双击该做什么，未实现（随意绑定有干扰单击的风险）。
 - **序列帧动画**：当前模型集是 Live2D + 立绘，无序列帧素材来源。
+- **语音状态条的窗口长高**：位置契约见 §7.2，逻辑已由 `tests/voiceInput.test.js`（假 DOM 驱动
+  真实渲染层状态机）与 `tests/contracts.test.js`（高度跨进程一致）覆盖，但"窗口真的向上长高一条、
+  气泡在屏幕上不动"仍建议用 `PET_OPEN_CHAT=1 PET_VOICELAB_TEST=1 PET_SHOT_DIR=<目录>` 目视一次。
+- **内容锚点取景**：落位规则已抽成纯函数并单测（`tests/live2dPlacement.test.js`），但"用错帧
+  量出来的锚点"只有真机跑模型才会出现，建议用 `PET_FRAMING=half/full` + `PET_BOOT_TIMING=1`
+  看 `[live2d] 内容锚点` / `内容锚点复核不通过` 两条日志。
 
 ## 10. 验证边界
 
-自动化检查覆盖类型、开发工具和隐私边界；Live2D 渲染质量、窗口交互、托盘、快捷键与系统权限
-仍需在 Windows 目标环境中手动确认。
+自动化检查覆盖类型、IPC 契约、语音状态机（假 DOM 驱动真实渲染层）、取景落位纯函数、开发工具
+和隐私边界；Live2D 渲染质量、窗口交互、托盘、快捷键与系统权限仍需在 Windows 目标环境中手动确认
+（本条与 §9 的"待实机确认"是同一件事的两处提示）。
 

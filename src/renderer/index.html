@@ -86,6 +86,15 @@
       </button>
       <button id="chat-send" class="chat-send" type="button">发送</button>
     </div>
+    <!-- 语音状态条（声纹 + 转写报错）：绝对定位，**不参与输入行的 flex 布局**。
+         气泡窗模式（?panel=chat）里贴在气泡正上方一条，由主进程把窗口向上长高一条
+         （底边钉住，气泡与输入行在屏幕上原地不动）；桌宠窗口内的回退输入条没有上方空间，
+         改为悬浮在输入行上方。两种摆法都不挤动麦克风按钮——挤动了按住的指针就会"离开"
+         按钮，录音会被误取消。元素与文本的可见性由 renderer 控制，波形由 voicelab.ts 画。 -->
+    <div id="pet-voice-lab" class="pet-voice-lab" hidden>
+      <span id="pet-voice-status" class="pet-voice-status" role="status" aria-live="polite"></span>
+      <span id="pet-voice-wave" class="pet-voice-wave" role="img" aria-label="实时输入音量" hidden></span>
+    </div>
     <div class="chat-tail" aria-hidden="true"></div>
   </div>
 

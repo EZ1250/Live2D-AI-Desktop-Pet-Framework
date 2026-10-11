@@ -9,13 +9,19 @@
  *   - PCM 没来之前只显示"正在连接语音"文字、波形隐藏；
  *   - token 代际校验：旧会话的帧/电平不会污染新会话。
  *
- * 我们的三处不同（都是为了让它在 360×270 的气泡窗里成立）：
- *   1) **不绝对定位**：作为 `#chatbar` 的 flex 子行插在输入行之前 —— 270px 高的窗口里绝对定位
- *      很容易压住输入行；走文档流则"有就占一行、没有就不占"。
- *   2) **可在无 DOM 环境跑**：没有 document 时只算数据（history / path / smoothed），
- *      这样 Node 测试能直接加载本文件跑行为断言（见 test_voicelab.js）。
- *   3) **无障碍**：容器带 `role="img"` + `aria-label`，电平按"小声/正常/大声"三档粗粒度更新
- *      `aria-valuetext`（50ms 一次的数值会吵到读屏软件，所以按档位更新）。
+ * 显示位置：**对话气泡正上方的状态条**（`#pet-voice-lab`，index.html 里已画好，这里只接管）。
+ * 为什么不在输入行里插一行：那条状态条一出现就会把输入行（连同按住的麦克风按钮）顶走，
+ * 指针随即"离开"按钮 → 录音被误判成用户走开而取消（实测的"按住说话起不来"）。
+ * 现在它由 CSS 绝对定位（气泡窗模式下主进程会把窗口向上长高一条、底边钉住），
+ * 因此**任何布局都不会动**。这个模块只写自己的文案与波形，不管状态条本身的显隐
+ * （显隐由 renderer.ts 的状态机决定：`showVoiceStrip` / `hideVoiceStrip`）。
+ *
+ * 另外两条：
+ *   1) **可在无 DOM 环境跑**：没有 document 时只算数据（history / path / smoothed），
+ *      这样 Node 测试能直接加载本文件跑行为断言（见 tests/voicelab.test.js）。
+ *   2) **无障碍**：文案是 `role="status"`（只在状态变化时更新），波形是 `role="img"` +
+ *      `aria-label`，电平按"小声/正常/大声"三档粗粒度更新 `aria-valuetext`
+ *      （50ms 一次的数值会吵到读屏软件，所以按档位更新）。
  *
  * 全局脚本（无 import/export、无 CommonJS 垫片），对外挂 `window.PetVoiceLab`。
  */
@@ -95,51 +101,64 @@
       return '大声';
     }
 
+    /**
+     * 接管页面里已经画好的状态条（`#pet-voice-lab` / `#pet-voice-status` / `#pet-voice-wave`）。
+     * 页面里没有（老页面 / 测试页面）时才自己建一套并挂到 `#chatbar` 上——绝不插进输入行的文档流。
+     */
     function mount(): void {
       if (!hasDom() || el) return;
-      const host = document.getElementById('chatbar') ?? document.body;
-      if (!host) return;
-      const box = document.createElement('div');
-      box.id = 'pet-voice-lab';
-      box.className = 'pet-voice-lab';
-      box.hidden = true;
-      box.dataset.phase = 'idle';
-      box.setAttribute('role', 'img');
-      box.setAttribute('aria-label', '实时输入音量');
+      let box = document.getElementById('pet-voice-lab') as HTMLElement | null;
+      if (!box) {
+        const host = document.getElementById('chatbar') ?? document.body;
+        if (!host) return;
+        box = document.createElement('div');
+        box.id = 'pet-voice-lab';
+        box.className = 'pet-voice-lab';
+        box.hidden = true;
+        host.appendChild(box);
+      }
+      box.dataset.phase = box.dataset.phase || 'idle';
 
-      const label = document.createElement('span');
-      label.id = 'pet-voice-status';
-      label.className = 'pet-voice-status';
-      label.setAttribute('role', 'status');
-      label.textContent = '正在连接语音';
+      let label = document.getElementById('pet-voice-status') as HTMLElement | null;
+      if (!label) {
+        label = document.createElement('span');
+        label.id = 'pet-voice-status';
+        label.className = 'pet-voice-status';
+        label.setAttribute('role', 'status');
+        box.appendChild(label);
+      }
+      if (!label.textContent) label.textContent = '正在连接语音';
 
-      const wave = document.createElement('span');
-      wave.id = 'pet-voice-wave';
-      wave.className = 'pet-voice-wave';
-      wave.hidden = true;
-      // 用 createElementNS 建 SVG：innerHTML 注入 svg 在部分严格模式下命名空间会丢
-      const NS = 'http://www.w3.org/2000/svg';
-      const svg = document.createElementNS(NS, 'svg');
-      svg.setAttribute('viewBox', `0 0 ${VIEW_W} ${VIEW_H}`);
-      svg.setAttribute('aria-hidden', 'true');
-      svg.setAttribute('preserveAspectRatio', 'none');
-      const p = document.createElementNS(NS, 'path');
-      p.setAttribute('id', 'pet-voice-wave-path');
-      p.setAttribute('d', IDLE_PATH);
-      svg.appendChild(p);
-      wave.appendChild(svg);
-
-      box.appendChild(label);
-      box.appendChild(wave);
-      // 插到输入行之前：有就占一行，没有就不占（不做绝对定位，避免压住输入区）
-      const inputRow = host.querySelector('.chat-input-row');
-      if (inputRow && inputRow.parentElement === host) host.insertBefore(box, inputRow);
-      else host.appendChild(box);
+      let wave = document.getElementById('pet-voice-wave') as HTMLElement | null;
+      if (!wave) {
+        wave = document.createElement('span');
+        wave.id = 'pet-voice-wave';
+        wave.className = 'pet-voice-wave';
+        wave.setAttribute('role', 'img');
+        wave.setAttribute('aria-label', '实时输入音量');
+        wave.hidden = true;
+        box.appendChild(wave);
+      }
+      if (!wave.querySelector('svg')) {
+        // 用 createElementNS 建 SVG：innerHTML 注入 svg 在部分严格模式下命名空间会丢
+        const NS = 'http://www.w3.org/2000/svg';
+        const svg = document.createElementNS(NS, 'svg');
+        svg.setAttribute('viewBox', `0 0 ${VIEW_W} ${VIEW_H}`);
+        svg.setAttribute('aria-hidden', 'true');
+        svg.setAttribute('preserveAspectRatio', 'none');
+        const p = document.createElementNS(NS, 'path');
+        p.setAttribute('id', 'pet-voice-wave-path');
+        p.setAttribute('d', IDLE_PATH);
+        svg.appendChild(p);
+        wave.appendChild(svg);
+        pathEl = p;
+      } else {
+        pathEl = wave.querySelector('#pet-voice-wave-path') as SVGPathElement | null;
+      }
 
       el = box;
       statusEl = label;
       waveEl = wave;
-      pathEl = p;
     }
 
     function applyPath(next: string): void {
@@ -176,9 +195,11 @@
       if (statusEl) statusEl.hidden = true;
       if (waveEl) waveEl.hidden = false;
       const bucket = bucketOf(smoothed);
-      if (el && bucket !== ariaBucket) {
+      if (waveEl && bucket !== ariaBucket) {
+        // 档位写在波形这张 "img" 上（role=img + aria-valuetext）：50ms 一次的数值会吵到读屏，
+        // 所以只有跨档（静音/小声/正常/大声）才更新一次
         ariaBucket = bucket;
-        el.setAttribute('aria-valuetext', bucket);
+        waveEl.setAttribute('aria-valuetext', bucket);
       }
       return true;
     }
@@ -255,7 +276,8 @@
         }
         rafId = 0;
         setPhase('idle');
-        if (el) el.hidden = true;
+        // 注意：**不在这里隐藏状态条本体**。状态条的显隐由 renderer 的状态机决定
+        // （stop() 之后紧接着要显示"转写中… / 转写失败…"这类文案，这里一隐藏就把它吞了）。
         if (statusEl) statusEl.hidden = false;
         if (waveEl) waveEl.hidden = true;
         applyPath('');

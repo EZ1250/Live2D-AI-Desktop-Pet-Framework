@@ -110,6 +110,14 @@ export const IPC_HIT_RESULT = 'pet:hitResult';
 export const IPC_THINK_WINDOW_STATE = 'think:windowState';
 /** invoke renderer→main：设置对话气泡窗的折叠态 {collapsed}（折叠=只显示输入条）。 */
 export const IPC_CHAT_WINDOW_COLLAPSED = 'chat:windowCollapsed';
+/**
+ * invoke renderer→main：语音状态条（声纹 / 转写报错）显示或收起 {visible}。
+ *
+ * 为什么要主进程配合：状态条贴在**气泡正上方**，而气泡窗是一整块固定尺寸的窗口，
+ * 没有"气泡外面"的地方可画。显示时由主进程把窗口向上长高一条（底边钉住），
+ * 气泡本身在屏幕上原地不动——这样声纹与报错既不挤动输入行，也不会被折叠态藏住。
+ */
+export const IPC_CHAT_WINDOW_VOICE_STRIP = 'chat:windowVoiceStrip';
 
 /** 打开聊天窗口的结果。 */
 export interface ChatWindowResult {
@@ -572,6 +580,11 @@ export interface ElectronAPI {
   onChatWindowState?(cb: (payload: { open: boolean }) => void): () => void;
   /** 设置对话气泡窗折叠态（折叠=只显示输入条）；menu=true 时折叠态撑高给 ＋ 菜单腾地方。 */
   chatWindowSetCollapsed?(collapsed: boolean, menu?: boolean): Promise<{ ok: boolean; height?: number }>;
+  /**
+   * 语音状态条（声纹 / 转写报错）显示或收起。
+   * 显示时气泡窗向上长高一条、底边钉住 → 气泡与输入行在屏幕上原地不动。
+   */
+  chatWindowVoiceStrip?(visible: boolean): Promise<{ ok: boolean; height?: number }>;
   /** 显示思考浮窗（提问时主进程会自动打开，这里供 ＋ 菜单手动开）。 */
   thinkWindowShow?(): Promise<{ ok: boolean }>;
   /** 收起思考浮窗。 */

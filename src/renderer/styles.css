@@ -1051,29 +1051,46 @@ body.is-dragover #stage::after {
   box-shadow: 0 0 0 3px rgba(136, 168, 210, 0.11);
 }
 
-/* ---- 声纹（实时输入电平波形）：voicelab.ts 注入，插在输入行之前 ----
-  28px 高的圆角浮条 + 160×24 的镜像对称波形。
-   这里不做绝对定位（气泡窗只有 270px 高，绝对定位会压住输入行），走文档流占一行。 */
+/* ---- 声纹 / 语音状态条（voicelab.ts 画波形，renderer 写文案）----
+   位置："对话气泡正上方"——
+     ① 气泡窗模式（is-chat-window）：贴在气泡外面正上方的一条。气泡窗本体是一整块窗口，
+        没有"气泡外面"的地方，所以显示时主进程把窗口向上长高 --voice-strip-h（底边钉住），
+        气泡本体在屏幕上原地不动，输入行与麦克风按钮都不移位。
+     ② 桌宠窗口内的回退输入条：上方没有空间，改为悬浮在输入行上方。
+   两种摆法都是**绝对定位、不参与布局**（这正是关键：以前声纹条插在输入行前面的文档流里，
+   一显示就把麦克风按钮顶走，按住的指针随即"离开"按钮 → 录音被误判为用户移开而取消）。 */
 .pet-voice-lab {
-  flex: none;
-  display: grid;
-  place-items: center;
-  width: 100%;
-  max-width: 200px;
-  height: 26px;
-  margin: 0 auto;
+  position: absolute;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  box-sizing: border-box;
+  overflow: hidden;
   border: 1px solid rgba(120, 150, 190, 0.3);
   border-radius: 13px;
-  background: rgba(30, 40, 60, 0.68);
+  background: rgba(20, 26, 38, 0.86);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.34);
   color: #c2d5ed;
   font-size: 11px;
   line-height: 1;
-  pointer-events: none;
-  overflow: hidden;
+  text-align: center;
+  pointer-events: none; /* 状态条不吃点击：绝不让它挡住输入行或按钮 */
 }
 .pet-voice-lab[hidden] { display: none !important; }
-.pet-voice-status { white-space: nowrap; }
-.pet-voice-wave { display: block; width: 160px; max-width: calc(100% - 12px); height: 22px; }
+.pet-voice-status {
+  max-width: 100%;
+  padding: 0 8px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.pet-voice-status[hidden] { display: none !important; }
+/* 报错文案（转写失败 / 没配密钥 / 没拿到麦克风…）：一直显示在气泡上方，
+   不再写进消息区——消息区在折叠态是隐藏的，报错写进去用户根本看不到。 */
+.pet-voice-status.is-error { color: #ffb4b4; }
+.pet-voice-wave { display: block; width: 160px; max-width: calc(100% - 16px); height: 22px; }
 .pet-voice-wave[hidden] { display: none !important; }
 .pet-voice-wave svg { display: block; width: 100%; height: 100%; }
 #pet-voice-wave-path {
@@ -1088,6 +1105,26 @@ body.is-dragover #stage::after {
   stroke: #6fc3f2;
   fill: rgba(111, 195, 242, 0.3);
 }
+/* ① 气泡窗模式：贴在气泡正上方那一条（宽度与气泡一致） */
+body.is-voice-strip { --voice-strip-h: 34px; }
+body.is-chat-window .pet-voice-lab {
+  left: 0;
+  right: 0;
+  top: calc(-1 * var(--voice-strip-h, 34px));
+  height: var(--voice-strip-h, 34px);
+  border-radius: 11px;
+}
+/* 状态条显示时气泡整体下移一条（窗口同时已向上长高，所以屏幕上原地不动） */
+body.is-chat-window.is-voice-strip #chatbar { top: var(--voice-strip-h, 34px); }
+/* ② 桌宠窗口内的回退输入条：悬浮在输入行上方（上方没有窗外空间可用） */
+body:not(.is-chat-window) .pet-voice-lab {
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 46px;
+  width: calc(100% - 16px);
+  height: 26px;
+}
+body:not(.is-chat-window) .pet-voice-wave { height: 20px; }
 @media (prefers-reduced-motion: reduce) {
   .chat-input-row { transition: none; }
 }
@@ -1224,9 +1261,8 @@ body.is-dragover #stage::after {
   100% { transform: scale(1.25); opacity: 0; }
 }
 
-/* 语音状态行：与主题同色系（浅蓝 = 进行中；错误才用柔和红） */
-.chat-row.is-voice .chat-text { color: #9ecbff; font-style: normal; }
-.chat-row.is-voice.is-error .chat-text { color: #ffb4b4; }
+/* 语音文案（进行中 / 报错）改到气泡上方的状态条上显示：见 .pet-voice-status
+   （以前写成聊天记录里的一条 .chat-row.is-voice，折叠态整片消息区是隐藏的 → 报错看不见） */
 
 /* ---- 声纹图标（麦克风按钮里的 7 条圆头竖条，描边不填充）----
    参考用户给的图：中间最高、左右两条依次变矮；录音时竖条自己跳动（音量感）。 */

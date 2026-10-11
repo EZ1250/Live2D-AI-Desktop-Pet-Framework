@@ -371,10 +371,19 @@ export async function transcribeAudio(input: TranscribeInput): Promise<Transcrib
     // 两条都失败：把每条的原因压成一行，并给一句"该怎么办"
     const detail = attempts.map((a) => `${a.route}: ${a.error ?? '失败'}`).join('；');
     const allMissing = attempts.every((a) => /没有这个接口/.test(a.error ?? ''));
-    const hint = allMissing
-      ? `（网关 ${(() => { try { return new URL(config.baseUrl).host; } catch { return config.baseUrl; } })()} 不支持语音转写，请在设置→语音识别里单独填一个支持 ASR 的地址/模型）`
-      : '（可在设置→语音识别点「自检」看到两条路由的详细返回）';
-    console.warn('[voice] 转写两条路由都失败：', detail.slice(0, 300));
+    // 模型名不对 vs 网关不提供转写：这两种情况的处置完全不同，别把用户带去"换网关"
+    const compat = asrRouteCompat(config.model);
+    const modelHint = compat === 'incompatible'
+      ? `（「${config.model}」是实时/原生接口专用的模型名，本应用驱动不了：把转写模型改成 ${DEFAULT_VOICE_MODEL} 即可）`
+      : compat === 'chatty'
+        ? `（「${config.model}」是多模态模型，返回的是"回答"而不是听写：转写请用 ${DEFAULT_VOICE_MODEL}）`
+        : '';
+    const hint = modelHint
+      ? modelHint
+      : allMissing
+        ? `（网关 ${(() => { try { return new URL(config.baseUrl).host; } catch { return config.baseUrl; } })()} 没有 /audio/transcriptions 接口；先试 chat+音频路由或把转写模型改成 ${DEFAULT_VOICE_MODEL}）`
+        : '（可在设置→语音识别点「自检」看到两条路由的详细返回）';
+    console.warn('[voice] 转写两条路由都失败：', detail.slice(0, 300), '| model=', config.model, 'compat=', compat);
     return done(false, '', `语音识别失败：${detail.slice(0, 180)}${hint}`);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -433,17 +442,62 @@ const ASR_STRONG = [/whisper/i, /transcri/i, /speech[-_]?to[-_]?text/i, /speech[
 /** 语音/音频类命名（弱特征：可能不是转写，但值得优先展示） */
 const ASR_WEAK = [/audio/i, /voice/i, /realtime/i, /omni/i];
 
-/** 0=不像转写模型；1=音频/语音类；2=明确转写类；3=带 asr；4=带 asr 的**专用**转写模型（最像） */
+/**
+ * 路由兼容性分级 —— 本应用只有两条路：`/audio/transcriptions` 与 `chat/completions + input_audio`。
+ *
+ * 实测（2026-10-11，ws-*.maas.aliyuncs.com 工作区域名，用真实配置逐个打）：
+ *   qwen3-asr-flash                 → chat-audio ✅ 0.5s 出文本（合成 wav 与真实 ogg/opus 都过）
+ *   fun-asr-flash-2026-06-15        → 两条都不通（/audio/transcriptions 404、chat-audio 400）
+ *   qwen3-asr-flash-realtime 等      → 实时 WS / 原生接口专用，chat-audio 报 500 / 空响应
+ *   qwen*-omni-*、qwen-audio-*       → 能收音频，但**会"回答"而不是转写**（拿到的是聊天回复）
+ *
+ * ★ 关键：**模型列表里没有 ≠ 不可用**。同一个网关上 `qwen3-asr-flash` 不在 /models 列表里，
+ *   却恰恰是唯一能用的那个；而列表里排第一的 `fun-asr-flash-*` 反而走不通。
+ *   所以这里的分级只用于"候选排序与提示"，最终一律以「🎙 自检语音识别」的实测结果为准。
+ */
+export type AsrRouteCompat = 'verified' | 'likely' | 'chatty' | 'incompatible';
+
+/** 本应用实测可用的转写模型（含日期快照） */
+const ASR_VERIFIED = /^qwen3-asr-flash(-[\d-]+)?$/i;
+/** 实时/原生接口专用：我们的两条路由驱动不了 */
+const ASR_ROUTE_INCOMPATIBLE = [/realtime/i, /s2s/i, /livetranslate/i, /tts/i, /^fun[-_]?asr/i, /paraformer/i, /sensevoice/i];
+/** 能收音频但会当聊天回答的（omni / audio 系列） */
+const ASR_CHATTY = [/omni/i, /audio/i];
+
+/** 这个模型名能不能被本应用的两条路由驱动（见上面的实测表） */
+export function asrRouteCompat(name: string): AsrRouteCompat {
+  const n = String(name ?? '').trim();
+  if (!n) return 'incompatible';
+  if (ASR_VERIFIED.test(n)) return 'verified';
+  if (ASR_ROUTE_INCOMPATIBLE.some((re) => re.test(n))) return 'incompatible';
+  if (ASR_CHATTY.some((re) => re.test(n))) return 'chatty';
+  return ASR_TOP.some((re) => re.test(n)) || ASR_STRONG.some((re) => re.test(n)) ? 'likely' : 'incompatible';
+}
+
+/** 0=不像转写模型；1=音频/语音类；2=明确转写类；3=带 asr；4=带 asr 的**专用**转写模型；5=本应用实测可用 */
 export function asrScore(name: string): number {
   const n = String(name ?? '');
   if (!n) return 0;
+  let base = 0;
   if (ASR_TOP.some((re) => re.test(n))) {
     // qwen3-asr-flash 这类"纯转写"排在 qwen-audio-*-asr-flash 这类多模态前面
-    return ASR_TOP_EXCLUDE.some((re) => re.test(n)) ? 3 : 4;
+    base = ASR_TOP_EXCLUDE.some((re) => re.test(n)) ? 3 : 4;
+  } else if (ASR_STRONG.some((re) => re.test(n))) {
+    base = 2;
+  } else if (ASR_WEAK.some((re) => re.test(n))) {
+    base = 1;
   }
-  if (ASR_STRONG.some((re) => re.test(n))) return 2;
-  if (ASR_WEAK.some((re) => re.test(n))) return 1;
-  return 0;
+  if (!base) return 0;
+  switch (asrRouteCompat(n)) {
+    case 'verified':
+      return 5; // 本应用实测可用 → 永远排最前
+    case 'likely':
+      return Math.max(base, 2);
+    case 'chatty':
+      return 2; // 能收音频，但拿回来的是"回答"不是听写 → 比"驱动不了"强，比纯听写差
+    default:
+      return 1; // 实时/原生接口专用：本应用两条路由走不通，只留个影子
+  }
 }
 
 /** 从服务端模型列表里挑转写候选：专用 asr → asr → 转写类 → 音频语音类（各自保持服务端顺序） */
@@ -618,6 +672,34 @@ export async function indexVoiceModels(
     };
   }
   if (currentSupported) {
+    const compat = asrRouteCompat(current);
+    if (compat === 'incompatible') {
+      // 列表里有它 ≠ 本应用能驱动它：实时/原生接口专用的模型走 chat-audio 会直接报错
+      return {
+        ...base,
+        ok: true,
+        total: models.length,
+        candidates,
+        currentSupported: true,
+        verdict: 'warn',
+        reason: `「${current}」在模型列表里，但它是**实时/原生接口专用**的，本应用的两条路由驱动不了（实测 chat-audio 会报 400/500）`,
+        action: `把转写模型改成「${DEFAULT_VOICE_MODEL}」再点「🎙 自检语音识别」实测`,
+        ...(routeHint ? { routeHint } : {}),
+      };
+    }
+    if (compat === 'chatty') {
+      return {
+        ...base,
+        ok: true,
+        total: models.length,
+        candidates,
+        currentSupported: true,
+        verdict: 'warn',
+        reason: `「${current}」能收音频，但它是多模态模型：返回的往往是"对音频的回答"而不是逐字转写`,
+        action: `想要纯听写请改用「${DEFAULT_VOICE_MODEL}」，再用「🎙 自检语音识别」确认`,
+        ...(routeHint ? { routeHint } : {}),
+      };
+    }
     return {
       ...base,
       ok: true,
@@ -647,6 +729,21 @@ export async function indexVoiceModels(
       ...(routeHint ? { routeHint } : {}),
     };
   }
+  // 模型不在列表里：**不能**据此判"名字写错"——列表 ≠ 可调用（实测 qwen3-asr-flash
+  // 不在列表里却能正常转写；列表里排第一的模型反而走不通）。实测可用的一律按"去自检"处理。
+  if (asrRouteCompat(current) === 'verified') {
+    return {
+      ...base,
+      ok: true,
+      total: models.length,
+      candidates,
+      currentSupported: false,
+      verdict: 'warn',
+      reason: `模型列表里没有「${current}」——但这个网关的列表并不全（实测它确实能调通），列表里没有 ≠ 不可用`,
+      action: '直接点「🎙 自检语音识别」实测：两条路由都通就照常用，不必因为列表里没有就换名字',
+      ...(routeHint ? { routeHint } : {}),
+    };
+  }
   return {
     ...base,
     ok: true,
@@ -657,7 +754,7 @@ export async function indexVoiceModels(
     reason: `这个地址的模型列表里没有「${current}」`,
     action: candidates.length
       ? `可能是名字写错或该模型未开通；可改用候选：${candidates.slice(0, 4).join('、')}`
-      : '可能是名字写错、模型未开通，或地址指错了；也可以点「🎙 自检语音识别」实测路由',
+      : `可能是名字写错、模型未开通，或地址指错了；也可以先手填「${DEFAULT_VOICE_MODEL}」再点「🎙 自检语音识别」实测`,
     ...(routeHint ? { routeHint } : {}),
   };
 }
@@ -712,16 +809,17 @@ export async function checkVoiceRoutes(cfg: Partial<VoiceConfig> | null | undefi
   }
   const winner = reports.find((r) => r.ok);
   if (winner) rememberRoute(config.baseUrl, config.model, winner.route);
-  return {
-    ok: !!winner,
-    ...(winner ? { route: winner.route } : {}),
-    model: config.model,
-    endpoint,
-    reports,
-    ...(winner
-      ? {}
-      : { hint: '两条路由都没通：多半是这个网关不提供语音转写，请在设置→语音识别里单独填一个支持 ASR 的地址与模型' }),
-  };
+  if (winner) {
+    return { ok: true, route: winner.route, model: config.model, endpoint, reports };
+  }
+  // 两条都不通：先分清"模型名不对"和"网关不提供转写"——这两件事的处置完全不同
+  const compat = asrRouteCompat(config.model);
+  const hint = compat === 'incompatible'
+    ? `两条路由都没通，而且「${config.model}」是实时/原生接口专用的模型（本应用只有 /audio/transcriptions 与 chat+音频 两条路）——把转写模型改成「${DEFAULT_VOICE_MODEL}」再自检一次`
+    : compat === 'chatty'
+      ? `「${config.model}」是多模态模型：能收音频但返回的是"回答"而不是逐字转写——想要听写请改成「${DEFAULT_VOICE_MODEL}」`
+      : `两条路由都没通：先换「${DEFAULT_VOICE_MODEL}」再自检（本机实测这个模型在百炼 compatible-mode / 工作区域名上走 chat+音频可用）；仍不通再考虑在设置→语音识别里单独填一个支持 ASR 的地址与密钥`;
+  return { ok: false, model: config.model, endpoint, reports, hint };
 }
 
 /** Buffer 版本（主进程从渲染层收到 ArrayBuffer 后常用）——保留给 IPC 层，避免各处重复转换。 */

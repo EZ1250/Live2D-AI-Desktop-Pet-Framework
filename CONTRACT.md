@@ -10,6 +10,9 @@
   通道名一律 import 自 contracts，不写字面量。
 - 渲染层只能访问 `window.electron`，拿不到 `ipcRenderer`、Node 或文件系统。
 - 主窗口、对话气泡窗（`?panel=chat`）、思考浮窗（`?panel=think`）共用同一套 preload 契约。
+- 浮窗的**尺寸归主进程**：折叠态、＋ 菜单高度、语音状态条那一条，都由渲染层经 IPC 请求后
+  由主进程 `setBounds`（气泡窗"底边钉住"改高，气泡在屏幕上不动）。渲染层的 CSS 高度必须与
+  主进程的高度常量一致，否则气泡会被裁掉或多出一条空白。
 
 改 IPC、资源路径或插件 API 时，必须同步检查四处：`contracts.ts`、preload、主进程、渲染层。
 

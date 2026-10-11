@@ -36,6 +36,7 @@ import {
   IPC_CHAT_WINDOW_COLLAPSED,
   IPC_CHAT_WINDOW_OPEN,
   IPC_CHAT_WINDOW_STATE,
+  IPC_CHAT_WINDOW_VOICE_STRIP,
   IPC_CONTEXT_MENU,
   IPC_GLOBAL_CURSOR,
   IPC_HIT_PROBE,
@@ -325,6 +326,10 @@ const api: ElectronAPI = {
   /** 设置对话气泡窗折叠态（折叠=只显示输入条）；menu=true 让折叠态临时撑高给菜单腾地方。 */
   chatWindowSetCollapsed(collapsed: boolean, menu = false): Promise<{ ok: boolean; height?: number }> {
     return ipcRenderer.invoke(IPC_CHAT_WINDOW_COLLAPSED, { collapsed: Boolean(collapsed), menu: Boolean(menu) });
+  },
+  /** 语音状态条（声纹 / 转写报错）：显示时气泡窗向上长高一条（底边钉住，气泡不动）。 */
+  chatWindowVoiceStrip(visible: boolean): Promise<{ ok: boolean; height?: number }> {
+    return ipcRenderer.invoke(IPC_CHAT_WINDOW_VOICE_STRIP, { visible: Boolean(visible) });
   },
   /** 显示思考浮窗。 */
   thinkWindowShow(): Promise<{ ok: boolean }> {
