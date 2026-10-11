@@ -33,6 +33,7 @@ import {
   IPC_CHAT_SESSION_NEW,
   IPC_CHAT_SESSION_SELECT,
   IPC_CHAT_WINDOW_CLOSE,
+  IPC_CHAT_WINDOW_COLLAPSED,
   IPC_CHAT_WINDOW_OPEN,
   IPC_CHAT_WINDOW_STATE,
   IPC_CONTEXT_MENU,
@@ -321,6 +322,10 @@ const api: ElectronAPI = {
   onChatWindowState(cb) {
     return subscribeChannel<{ open: boolean }>(IPC_CHAT_WINDOW_STATE, cb);
   },
+  /** 设置对话气泡窗折叠态（折叠=只显示输入条）；menu=true 让折叠态临时撑高给菜单腾地方。 */
+  chatWindowSetCollapsed(collapsed: boolean, menu = false): Promise<{ ok: boolean; height?: number }> {
+    return ipcRenderer.invoke(IPC_CHAT_WINDOW_COLLAPSED, { collapsed: Boolean(collapsed), menu: Boolean(menu) });
+  },
   /** 显示思考浮窗。 */
   thinkWindowShow(): Promise<{ ok: boolean }> {
     return ipcRenderer.invoke(IPC_THINK_WINDOW_SHOW);
@@ -359,7 +364,7 @@ const api: ElectronAPI = {
 
   /** 订阅 AI 思考过程（推理内容 + 工具步骤）。 */
   onThink(cb) {
-    return subscribeChannel<{ kind: 'start' | 'reasoning' | 'tool' | 'result' | 'done' | 'error'; text: string }>(
+    return subscribeChannel<{ kind: 'start' | 'reasoning' | 'tool' | 'result' | 'done' | 'error'; text: string; tool?: string }>(
       IPC_THINK_PUSH,
       cb,
     );

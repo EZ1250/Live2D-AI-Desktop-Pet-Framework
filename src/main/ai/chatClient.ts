@@ -45,7 +45,7 @@ export interface ChatHandlers {
   onDone(full: string, usage?: ChatUsage): void;
   onError(message: string): void;
   /** 思考过程事件（推理内容 / 工具步骤 / 完成）：供"思考浮窗"实时展示 */
-  onThink?(evt: { kind: 'start' | 'reasoning' | 'tool' | 'result' | 'done' | 'error'; text: string }): void;
+  onThink?(evt: { kind: 'start' | 'reasoning' | 'tool' | 'result' | 'done' | 'error'; text: string; tool?: string }): void;
 }
 
 /** 消息（支持 function-calling 的 tool_calls / tool 消息字段） */
@@ -585,6 +585,17 @@ export function loadAppSettings(): AppSettings {
       })(),
       mailImapUser: str('mailImapUser') ?? '',
       mailImapPass: str('mailImapPass') ?? '',
+      // 行为触发映射同样**必须在这里读回来**，否则设置页配好的绑定一重启就没了。
+      // 只收字符串值，非法项丢弃（与 sanitizeSettings 的宽松策略一致）。
+      motionTriggers: ((): Record<string, string> => {
+        const src = ai.motionTriggers ?? raw.motionTriggers;
+        if (!src || typeof src !== 'object') return {};
+        const out: Record<string, string> = {};
+        for (const [key, value] of Object.entries(src as Record<string, unknown>)) {
+          if (typeof value === 'string') out[key] = value;
+        }
+        return out;
+      })(),
     };
   } catch (err) {
     console.warn('[chatClient] settings.json 解析失败，回退环境变量：', (err as Error).message);
@@ -1232,8 +1243,8 @@ export class ChatClient {
           }
           const toolName = normalizeToolName(jsonAction.tool);
           toolCallCount++;
-          this.handlers.onThink?.({ kind: 'tool', text: `（文本协议）${jsonAction.thought || toolName}` });
-          this.handlers.onThink?.({ kind: 'tool', text: `调用 ${toolName}` });
+          this.handlers.onThink?.({ kind: 'tool', text: `（文本协议）${jsonAction.thought || toolName}`, tool: toolName });
+          this.handlers.onThink?.({ kind: 'tool', text: `调用 ${toolName}`, tool: toolName });
           let jsonResult: string;
           try {
             jsonResult = await withTimeout(this.toolExecutor!(toolName, jsonAction.parameters), toolTimeoutMs(toolName));
@@ -1255,7 +1266,7 @@ export class ChatClient {
           lastToolNote = `${toolName} → ${jsonResult.replace(/\s+/g, ' ').slice(0, 160)}`;
           continue;
         }
-        this.handlers.onThink?.({ kind: 'tool', text: `决定调用：${calls.map((c) => c.name).join('、')}` });
+        this.handlers.onThink?.({ kind: 'tool', text: `决定调用：${calls.map((c) => c.name).join('、')}`, tool: calls[0]?.name });
         if (toolCallCount + calls.length > MAX_TOOL_CALLS) {
           finalText = '这次需要执行的操作太多了，我们分几步来比较稳妥。';
           break;
@@ -1268,7 +1279,7 @@ export class ChatClient {
         for (const tc of calls) {
           if (this.cancelled || generation !== this.chatGeneration) return;
           toolCallCount++;
-          this.handlers.onThink?.({ kind: 'tool', text: `调用 ${tc.name}` });
+          this.handlers.onThink?.({ kind: 'tool', text: `调用 ${tc.name}`, tool: tc.name });
           let result: string;
           try {
             if (!tc.id) throw new Error('工具调用缺少调用 ID');
@@ -1619,7 +1630,7 @@ export class ChatClient {
         const jsonAction = parseJsonAction(resp.text);
         const subTool = jsonAction ? normalizeToolName(jsonAction.tool) : '';
         if (jsonAction && allow.includes(subTool)) {
-          this.handlers.onThink?.({ kind: 'tool', text: `[子代理]（文本协议）调用 ${subTool}` });
+          this.handlers.onThink?.({ kind: 'tool', text: `[子代理]（文本协议）调用 ${subTool}`, tool: subTool });
           let subResult: string;
           try {
             subResult = await withTimeout(this.toolExecutor!(subTool, jsonAction.parameters), toolTimeoutMs(subTool));
@@ -1643,7 +1654,7 @@ export class ChatClient {
       });
       for (const c of calls) {
         if (this.cancelled) return '子代理已取消。';
-        this.handlers.onThink?.({ kind: 'tool', text: `[子代理] 调用 ${c.name}` });
+        this.handlers.onThink?.({ kind: 'tool', text: `[子代理] 调用 ${c.name}`, tool: c.name });
         let result: string;
         try {
           const callArgs = c.args ? JSON.parse(c.args) : {};

@@ -43,6 +43,8 @@
     setExpression?(name: string | null): void;
     /** 当前模型可用表情名（无表情能力返回空数组） */
     listExpressions?(): string[];
+    /** 当前模型可用动作组名（无动作返回空数组） */
+    listMotions?(): string[];
     /** 设置视线目标：nx/ny ∈ [-1,1]，向右/向上为正；0 = 归位 */
     setGaze?(nx: number, ny: number): void;
     /** 滚轮缩放：dir=+1 放大 / -1 缩小（档位 1.08^n，0=fit 基准） */
@@ -97,16 +99,14 @@
   /** 当前设备像素比（下限 1）。画布创建与每帧重适配共用，故放模块作用域。 */
   const dpr = (): number => Math.max(1, window.devicePixelRatio || 1);
   const HALF_ZOOM = 2.5; // 半身放大倍率：参考图是"胸像特写"（头到上胸填满窗口），≈1/0.4
-  const HALF_SHIFT_RATIO = 0.28; // 半身下移量（占模型高度的比例）：把头顶顶到窗口上沿附近
+  /** 半身时内容顶部距窗口上沿的比例（留一点点呼吸空间） */
+  const HALF_TOP_PAD_RATIO = 0.04;
   // 立绘专用（缩放锚点在头顶，见 CSS）：只要一点点下移，头顶就贴上窗口上沿
   const HALF_SHIFT_RATIO_PORTRAIT = 0.05;
 
   /** 取景缩放系数（乘在 fit 基准上） */
   function framingZoom(): number {
     return framingMode === 'half' ? HALF_ZOOM : 1;
-  }
-  function framingShiftPx(modelHeightPx: number): number {
-    return framingMode === 'half' ? modelHeightPx * HALF_SHIFT_RATIO : 0;
   }
   /**
    * 半身时视线增益要降下来：取景放大了，同样的鼠标位移换算到参数上会过冲
@@ -156,7 +156,9 @@
     | 'angleX' | 'angleY' | 'angleZ'
     | 'eyeLOpen' | 'eyeROpen'
     | 'eyeBallX' | 'eyeBallY'
-    | 'mouthOpenY' | 'mouthForm';
+    | 'mouthOpenY' | 'mouthForm'
+    | 'bodyX' | 'bodyY' | 'bodyZ'
+    | 'breath';
 
   /** parameterMap 里常见的写法 → 逻辑名（大小写/下划线都不敏感，尽量少让用户踩坑） */
   const PARAM_ALIASES: Record<string, ParamKey> = {
@@ -169,6 +171,10 @@
     eyebally: 'eyeBallY', eye_ball_y: 'eyeBallY', gazey: 'eyeBallY',
     mouthopeny: 'mouthOpenY', mouth_open_y: 'mouthOpenY', mouthopen: 'mouthOpenY',
     mouthform: 'mouthForm', mouth_form: 'mouthForm',
+    bodyx: 'bodyX', body_x: 'bodyX', bodyanglex: 'bodyX', body_angle_x: 'bodyX',
+    bodyy: 'bodyY', body_y: 'bodyY', bodyangley: 'bodyY', body_angle_y: 'bodyY',
+    bodyz: 'bodyZ', body_z: 'bodyZ', bodyanglez: 'bodyZ', body_angle_z: 'bodyZ', bodyangle: 'bodyZ',
+    breath: 'breath', breathing: 'breath', breathparam: 'breath',
   };
 
   /**
@@ -446,6 +452,76 @@
     let lastH = 0;
     let lastDpr = 0; // 上次生效的设备像素比（跨屏拖动/改系统缩放的检测基准）
     /**
+     * 真实可见内容的包围盒（**容器局部坐标**，scale=1）。
+     *
+     * 为什么不能直接用 model.width/height：那是 pixi 的**画布包围盒**，很多模型画布留白极大
+     * （项目里实测过 2048² 贴图的模型报告画布 3778px），按它居中/适配会让角色偏出窗口中心，
+     * 半身放大后尤其明显。用逐 drawable 的顶点范围才算"用户真正看到的东西"。
+     *
+     * 只在 refit 时重测并缓存：取景锚点必须**稳定**，跟着动作每帧变会让画面自己抖。
+     */
+    let contentRect: { x: number; y: number; w: number; h: number } | null = null;
+
+    /** 测一次真实内容包围盒；拿不到就返回 null（上层退回画布包围盒，这是第一层预案） */
+    function measureContentRect(): { x: number; y: number; w: number; h: number } | null {
+      try {
+        const im = model && model.internalModel;
+        const core = im && im.coreModel;
+        const lt = im && im.localTransform;
+        if (!core || !lt || typeof core.getDrawableCount !== 'function') return null;
+        if (typeof core.getDrawableVertexPositions !== 'function') return null;
+        const count = core.getDrawableCount() || 0;
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        let used = 0;
+        for (let d = 0; d < count; d++) {
+          let pos: Any;
+          try { pos = core.getDrawableVertexPositions(d); } catch { continue; }
+          if (!pos || pos.length < 2) continue;
+          used++;
+          for (let i = 0; i + 1 < pos.length; i += 2) {
+            // 模型坐标(y 向上) → 容器局部坐标(y 向下)：用引擎自己的 localTransform，不猜
+            const x = lt.a * pos[i] + lt.c * pos[i + 1] + lt.tx;
+            const y = lt.b * pos[i] + lt.d * pos[i + 1] + lt.ty;
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+        }
+        if (!used || !(maxX > minX) || !(maxY > minY)) return null;
+        return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+      } catch {
+        return null;
+      }
+    }
+
+    /**
+     * 取景：缩放 + 定位。**锚在真实内容的中心/顶部**，而不是画布包围盒。
+     * @param extra 额外缩放（滚轮档位、呼吸）
+     * @param bobY  纵向浮动（呼吸上下）
+     */
+    function frameModel(extra: number, bobY: number): void {
+      if (!model || !natW || !natH) return;
+      const vw = window.innerWidth || 1;
+      const vh = window.innerHeight || 1;
+      // 参考框：优先真实内容；测不到就退回画布包围盒（第一层预案）
+      const ref = contentRect ?? { x: 0, y: 0, w: natW, h: natH };
+      const s = Math.min((vw * FIT_MARGIN) / ref.w, (vh * FIT_MARGIN) / ref.h) * framingZoom() * extra;
+      model.scale.set(s);
+      const cx = (ref.x + ref.w / 2) * s; // 内容中心相对容器原点的偏移
+      const top = ref.y * s;              // 内容顶部相对容器原点的偏移
+      if (framingMode === 'half') {
+        // 半身：横向居中对准内容中心；纵向把**头顶**顶到窗口上沿附近（脚被裁掉是对的）
+        model.position.set(vw / 2 - cx, vh * HALF_TOP_PAD_RATIO - top + bobY);
+      } else {
+        // 全身：整个内容居中（不再被画布留白带偏）
+        model.position.set(vw / 2 - cx, vh / 2 - (ref.y + ref.h / 2) * s + bobY);
+      }
+    }
+    /**
      * 命中遮罩（点击穿透用）：把画布**降采样**成一张小位图缓存起来，
      * 用它回答"这个点是角色还是透明背景"。
      *
@@ -544,11 +620,8 @@
         natW = model.width || 0;
         natH = model.height || 0;
         if (!natW || !natH) return;
-        const s = Math.min((vw * FIT_MARGIN) / natW, (vh * FIT_MARGIN) / natH) * framingZoom();
-        model.scale.set(s);
-        const wPx = natW * s;
-        const hPx = natH * s;
-        model.position.set((vw - wPx) / 2, (vh - hPx) / 2 + framingShiftPx(hPx));
+        contentRect = measureContentRect(); // 重测真实内容（refit 很少发生，开销可接受）
+        frameModel(1, 0);
       } catch (err) {
         console.warn('[live2d] moc3 refit 失败', err);
       }
@@ -756,6 +829,9 @@
         const HEAD_TRACK_MAX_X = 12;
         const HEAD_TRACK_MAX_Y = 8;
         const HEAD_TRACK_MAX_Z = 2.5;
+        /** 身体摆动上限（度）：比头部小一档，才像"身体跟着轻轻晃"而不是整个人在转 */
+        const BODY_TRACK_MAX_X = 6;
+        const BODY_TRACK_MAX_Z = 3;
         /**
          * 逻辑参数 → 模型实际参数 ID。
          * 默认就是 Cubism 标准名；命名不标准的模型可以在它的 pet-model.json 里写 parameterMap，
@@ -771,12 +847,23 @@
           eyeBallY: 'ParamEyeBallY',
           mouthOpenY: 'ParamMouthOpenY',
           mouthForm: 'ParamMouthForm',
+          // Cubism 标准命名；命名不标准的模型可在 pet-model.json 的 parameterMap 里改
+          bodyX: 'ParamBodyAngleX',
+          bodyY: 'ParamBodyAngleY',
+          bodyZ: 'ParamBodyAngleZ',
+          breath: 'ParamBreath',
         };
         let headTrackX = 0;
         let headTrackY = 0;
         let headTrackZ = 0;
         const idleMotionAvailable = hasMotionGroup('Idle');
         let headTrackOK = false;
+        /** 身体摆动参数是否可用（不可用就走"整体倾斜"兜底） */
+        let bodyTrackOK = false;
+        let bodyTrackX = 0;
+        let bodyTrackZ = 0;
+        /** 呼吸参数是否可用（可用就交给它，不可用只靠整体缩放呼吸） */
+        let breathParamOK = false;
         // 追踪层要用到的参数是否存在（缺哪个就只驱动存在的那些，不报错）
         let eyeLOK = false;
         let eyeROK = false;
@@ -790,6 +877,10 @@
           headTrackY = Math.min(paramLimit(paramIds.angleY), HEAD_TRACK_MAX_Y);
           headTrackZ = Math.min(paramLimit(paramIds.angleZ), HEAD_TRACK_MAX_Z);
           headTrackOK = headTrackX > 0 || headTrackY > 0;
+          bodyTrackX = Math.min(paramLimit(paramIds.bodyX), BODY_TRACK_MAX_X);
+          bodyTrackZ = Math.min(paramLimit(paramIds.bodyZ), BODY_TRACK_MAX_Z);
+          bodyTrackOK = bodyTrackX > 0 || bodyTrackZ > 0;
+          breathParamOK = paramLimit(paramIds.breath) > 0;
           eyeLOK = paramLimit(paramIds.eyeLOpen) > 0;
           eyeROK = paramLimit(paramIds.eyeROpen) > 0;
           eyeBallXOK = paramLimit(paramIds.eyeBallX) > 0;
@@ -827,7 +918,13 @@
         const SWAY_DURATION = 1.5;
         let eBreath = 1; // 呼吸/浮动 ease 状态（指数趋近，避免生硬换向）
         let eBob = 0;
+        let eSway = 0; // 常态身体摆动（度）的 ease 状态
         let zoomSteps = 0; // 滚轮缩放档位：scale × 1.08^steps；0 = fit 基准
+        /**
+         * 常态摆动幅度（度）。
+         * 有原生 Idle 动作时收着点（动作本身就在动）；没有就补足，保证"一定在动"。
+         */
+        const idleSwayAmp = idleMotionAvailable ? 0.45 : 0.95;
 
         const handle: RenderHandle = {
           kind: 'moc3',
@@ -871,6 +968,16 @@
               return [];
             }
           },
+          listMotions(): string[] {
+            try {
+              const mm = model.internalModel && model.internalModel.motionManager;
+              const d = mm && mm.definitions;
+              if (!d) return [];
+              return Object.keys(d).filter((g) => Array.isArray((d as Any)[g]) && (d as Any)[g].length > 0);
+            } catch {
+              return [];
+            }
+          },
           setGaze(nx: number, ny: number): void {
           gazeTX = (Number.isFinite(nx) ? Math.max(-1, Math.min(1, nx)) : 0) * framingGazeGain();
           gazeTY = (Number.isFinite(ny) ? Math.max(-1, Math.min(1, ny)) : 0) * framingGazeGain();
@@ -880,14 +987,13 @@
            * 主进程用它把对话气泡摆在"头顶上方"而不是窗口上方——窗口顶部有一大段是透明的。
            */
           bounds(): { top: number; height: number } | null {
-            const vw = window.innerWidth || 1;
-            const vh = window.innerHeight || 1;
-            if (!natW || !natH) return null;
-            const s =
-              Math.min((vw * FIT_MARGIN) / natW, (vh * FIT_MARGIN) / natH) * framingZoom() * Math.pow(1.08, zoomSteps);
+            if (!model || !natW || !natH) return null;
+            const s = model.scale && model.scale.x ? model.scale.x : 0;
             if (!Number.isFinite(s) || s <= 0) return null;
-            const hPx = natH * s;
-            return { top: Math.round((vh - hPx) / 2 + framingShiftPx(hPx)), height: Math.round(hPx) };
+            // 报**真实可见内容**的范围：气泡据此贴在头顶上方，而不是贴在画布留白的顶上
+            const ref = contentRect ?? { x: 0, y: 0, w: natW, h: natH };
+            const pos = model.position ?? { x: 0, y: 0 };
+            return { top: Math.round(pos.y + ref.y * s), height: Math.round(ref.h * s) };
           },
           zoom(dir: number): void {
             zoomSteps = Math.max(-8, Math.min(14, zoomSteps + (dir > 0 ? 1 : -1)));
@@ -1160,30 +1266,30 @@
             const ke = Math.min(1, (deltaSec || 1 / 60) * 6);
             eBreath += (breathTarget - eBreath) * ke;
             eBob += (bobTarget - eBob) * ke;
+            // 常态身体摆动（度）：两个慢正弦错开，避免看出周期
+            const swayTargetDeg =
+              Math.sin(nowSec * 0.37 + phase * 1.3) * idleSwayAmp +
+              Math.sin(nowSec * 0.19 + phase * 0.7) * idleSwayAmp * 0.6;
+            eSway += (swayTargetDeg - eSway) * ke;
             const breathe = eBreath;
             const bob = eBob;
-            // “挥手”手势：左右摇摆 ±~5°，2.5 周期、缓入缓出
-            let swayRad = 0;
+            // “挥手”手势：左右摇摆 ±~5°，2.5 周期、缓入缓出（叠加在常态摆动上）
+            let waveDeg = 0;
             if (swayStart > 0) {
               const p = (nowSec - swayStart) / SWAY_DURATION;
               if (p >= 1) {
                 swayStart = 0;
               } else {
                 const env = Math.sin(Math.max(0, p) * Math.PI); // 0→1→0 包络
-                swayRad = Math.sin(Math.max(0, p) * Math.PI * 5) * 0.09 * env;
+                waveDeg = (Math.sin(Math.max(0, p) * Math.PI * 5) * 0.09 * env * 180) / Math.PI;
               }
             }
+            const swayDeg = eSway + waveDeg;
             try {
-              const sFit =
-                Math.min((vw * FIT_MARGIN) / natW, (vh * FIT_MARGIN) / natH) *
-                framingZoom() *
-                breathe *
-                Math.pow(1.08, zoomSteps);
-              model.scale.set(sFit);
-              const wPx = natW * sFit;
-              const hPx = natH * sFit;
-              model.position.set((vw - wPx) / 2, (vh - hPx) / 2 + bob + framingShiftPx(hPx));
-              model.rotation = swayRad;
+              // 取景：fit × 取景 × 呼吸 × 滚轮档位，锚在真实可见内容上（见 frameModel）
+              frameModel(breathe * Math.pow(1.08, zoomSteps), bob);
+              // 身体摆动·第二层预案：模型没有身体参数时，靠整体倾斜补偿，保证"一定在动"
+              if (!bodyTrackOK) model.rotation = (swayDeg * Math.PI) / 180;
               if (typeof model.update === 'function') model.update(deltaSec * 1000);
 
               // —— 视线跟踪（moc3，明显跟随）：写在 model.update 之后（避免被 Idle 动作帧覆盖）；
@@ -1198,16 +1304,29 @@
               const hk = Math.min(1, dt * 4);
               headCX += (gazeCX - headCX) * hk;
               headCY += (gazeCY - headCY) * hk;
+              const bodyCX = headCX * 0.55; // 身体比头更滞后、幅度更小
               if (gazeCX !== 0 || gazeCY !== 0) {
                 // AngleX=左右，AngleY=上下；使用较慢的 headC* 保持自然滞后。
                 if (headTrackX > 0) setBaseParam(paramIds.angleX, headCX * headTrackX);
                 if (headTrackY > 0) setBaseParam(paramIds.angleY, headCY * headTrackY);
                 if (headTrackZ > 0) setBaseParam(paramIds.angleZ, headCX * headTrackZ);
+                // 眼球也跟着鼠标动（有该参数才驱动）：只转头不动眼会显得呆
+                if (eyeBallXOK) setBaseParam(paramIds.eyeBallX, gazeCX);
+                if (eyeBallYOK) setBaseParam(paramIds.eyeBallY, gazeCY);
               } else if (headTrackOK && !idleMotionAvailable) {
                 // 没有原生 Idle 时才补充幅度很小的头部游移。
                 if (headTrackX > 0) setBaseParam(paramIds.angleX, Math.sin(nowSec * 0.45 + phase * 0.7) * Math.min(headTrackX, 2.2));
                 if (headTrackY > 0) setBaseParam(paramIds.angleY, Math.sin(nowSec * 0.33 + phase * 1.1) * Math.min(headTrackY, 2.0));
                 if (headTrackZ > 0) setBaseParam(paramIds.angleZ, Math.sin(nowSec * 0.27 + phase * 0.9) * Math.min(headTrackZ, 2.4));
+              }
+              // 身体摆动·第一层预案：模型有 ParamBodyAngle* → 参数级跟随（跟着物理走，最自然）
+              if (bodyTrackOK) {
+                if (bodyTrackX > 0) setBaseParam(paramIds.bodyX, bodyCX * bodyTrackX);
+                if (bodyTrackZ > 0) setBaseParam(paramIds.bodyZ, swayDeg);
+              }
+              // 呼吸·有 ParamBreath 就交给它，没有则只靠整体缩放呼吸（frameModel 的 breathe）
+              if (breathParamOK) {
+                setBaseParam(paramIds.breath, (Math.sin(nowSec * 1.22 + phase * 2.1) * 0.5 + 0.5) * 0.8 + 0.1);
               }
               // 追踪 / 语音层：按权重在基座值上混合；层过期后自动衰减，回到鼠标跟随（无设备时零副作用）
               const tracked = mixer.sample();
@@ -1381,6 +1500,9 @@
 
     const handle: RenderHandle = {
       kind: 'portrait',
+      listMotions(): string[] {
+        return [];
+      },
       playMotion(group: string): void {
         const g = group || '';
         if (g === 'wave') {
@@ -1495,6 +1617,9 @@
 
     const handle: RenderHandle = {
       kind: 'placeholder',
+      listMotions(): string[] {
+        return [];
+      },
       update(nowSec: number): void {
         const t = nowSec + phase;
         const breathe = 1 + Math.sin(t * 1.1) * 0.01;

@@ -739,6 +739,9 @@ body.is-dragover #stage::after {
 .settings-fieldset .settings-row { margin-top: 4px; }
 /* 状态文案（含长 URL）占满一整行：与按钮挤在同一行时既折不开也读不清 */
 .settings-fieldset .settings-status { flex: 1 1 100%; min-width: 0; }
+/* 行为触发行：行为名固定宽度，下拉占剩余宽度 */
+#motion-trigger-body .settings-row > span { flex: 0 0 7.5em; }
+#motion-trigger-body .settings-row select { flex: 1 1 10em; min-width: 0; }
 
 /* 转写模型「按地址索引」的提示行：三档颜色复用资产徽章那套语义色 */
 .voice-model-hint.is-ok { color: #9fe6bb; }
@@ -1872,6 +1875,69 @@ body.is-chat-window .chat-toolbar-status { font-size: 11px; }
 .chat-send.is-busy { opacity: 0.55; cursor: default; }
 .chat-send:disabled { cursor: default; }
 
+/* ＋ 移到输入框左侧：菜单改为在加号上方弹出（输入条在窗口底部） */
+body.is-chat-window .chat-menu {
+  left: 8px;
+  top: auto;
+  bottom: 44px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+/* 折叠态下菜单仍需可用（它是「对话信息」的唯一入口） */
+body.is-chat-window .chat-input-row { align-items: center; gap: 6px; }
+body.is-chat-window .chat-input-row .chat-plus { flex: none; }
+body.is-chat-window .chat-input-row .chat-input { flex: 1 1 auto; min-width: 0; }
+
+/* 收起消息区按钮：仅展开态出现 */
+.chat-collapse {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.26);
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.9);
+  cursor: pointer;
+}
+.chat-collapse:hover {
+  background: rgba(158, 203, 255, 0.28);
+  border-color: rgba(158, 203, 255, 0.7);
+  color: #fff;
+}
+
+/* 折叠态：只留输入条 + 关闭按钮（窗口高度由主进程同步缩小到 72px）
+   注意：历史列表是**浮层**，不能在这里藏——藏了就出现"点历史对话什么都不显示"；
+   它的入口会先把面板展开（见 toggleHistoryList），所以这里保持可见即可。 */
+body.is-chat-window.is-chat-collapsed #chat-log,
+body.is-chat-window.is-chat-collapsed #chat-toolbar-status,
+body.is-chat-window.is-chat-collapsed #chat-collapse,
+body.is-chat-window.is-chat-collapsed #ask-box {
+  display: none !important;
+}
+body.is-chat-window.is-chat-collapsed #chatbar {
+  gap: 2px;
+  padding: 4px 8px 5px;
+  /* 折叠态没有消息区：工具条顶边、输入条底边，中间整块留给 ＋ 菜单往上弹 */
+  justify-content: space-between;
+}
+/* 折叠态开菜单时窗口会被主进程撑高，菜单现在有地方往上弹了 */
+body.is-chat-window.is-chat-collapsed .chat-menu {
+  bottom: 44px;
+  max-height: 170px;
+  overflow-y: auto;
+}
+body.is-chat-window.is-chat-collapsed #chat-toolbar {
+  justify-content: flex-end;
+  padding: 0 2px;
+}
+body.is-chat-window.is-chat-collapsed .chat-tail { display: none; }
+
 /* 提问/写操作确认框：贴在气泡底部输入区上方 */
 body.is-chat-window #ask-box {
   left: 8px;
@@ -1901,10 +1967,20 @@ body.is-think-window #context-menu,
 body.is-think-window #todo-panel,
 body.is-think-window #settings-panel,
 body.is-think-window #chatbar,
-body.is-think-window #ask-box,
 body.is-think-window #think-capsule {
   display: none !important; /* 胶囊只在桌宠窗口里用；这里整窗就是面板 */
 }
+
+/* 提问/确认框：思考浮窗里就贴在面板底部（"思考到一半停下来问你"） */
+body.is-think-window #ask-box {
+  left: 10px;
+  right: 10px;
+  bottom: 10px;
+  max-height: 62vh;
+  overflow-y: auto;
+  border-color: rgba(214, 178, 116, 0.5);
+}
+body.is-think-window .ask-question { font-size: 14px; }
 
 body.is-think-window #think-panel {
   position: fixed;

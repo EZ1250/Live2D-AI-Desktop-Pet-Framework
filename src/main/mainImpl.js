@@ -102,6 +102,20 @@ const WINDOW_HEIGHT = 520;
 /** 对话气泡窗：小、无边框、透明，浮在桌宠上方（不是一个大窗口） */
 const CHAT_WINDOW_WIDTH = 360;
 const CHAT_WINDOW_HEIGHT = 270;
+/** 折叠态高度：只放得下输入条 + 一行关闭按钮 */
+const CHAT_WINDOW_COLLAPSED_HEIGHT = 72;
+/** 折叠态「开 ＋ 菜单」时的高度：菜单从加号往上弹，需要竖向空间 */
+const CHAT_WINDOW_MENU_HEIGHT = 220;
+/** 气泡窗是否折叠（渲染层经 IPC 改） */
+let chatCollapsed = true;
+/** 折叠态是否正开着 ＋ 菜单（开菜单要临时把窗口撑高） */
+let chatMenuOpen = false;
+/** 气泡窗当前应有的高度：展开 270 / 折叠开菜单 220 / 折叠 72 */
+function chatWindowHeight() {
+    if (!chatCollapsed)
+        return CHAT_WINDOW_HEIGHT;
+    return chatMenuOpen ? CHAT_WINDOW_MENU_HEIGHT : CHAT_WINDOW_COLLAPSED_HEIGHT;
+}
 /** 思考浮窗：摆在桌宠旁边（原来那个大窗口的位置），提问时自动开、答完自动关 */
 const THINK_WINDOW_WIDTH = 460;
 const THINK_WINDOW_HEIGHT = 600;
@@ -245,6 +259,34 @@ let lastBubblePushAt = 0;
 const sceneCooldownMs = {};
 const SCENE_BUBBLE_MIN_GAP_MS = 8000; // 任意两次气泡最小间隔
 const SCENE_GROUP_GAP_MS = 25000; // 同组气泡最小间隔
+/** 同一条语料的最小复用间隔 */
+const LINE_COOLDOWN_MS = 20 * 60 * 1000;
+/** 语料冷却表：分组+文本 → 上次使用时刻（只存内存） */
+const lineCooldownMs = new Map();
+/** 语料冷却键：文本可能跨分组重复，故带分组 */
+function lineKey(line) {
+    return `${line.group}\u0000${line.text}`;
+}
+/** 这条语料是否还在冷却中（过期即顺手清掉） */
+function isLineCooling(line, now) {
+    const key = lineKey(line);
+    const at = lineCooldownMs.get(key);
+    if (at === undefined)
+        return false;
+    if (now - at >= LINE_COOLDOWN_MS) {
+        lineCooldownMs.delete(key);
+        return false;
+    }
+    return true;
+}
+/** 记下这条语料刚被用过 */
+function markLineUsed(line, now) {
+    lineCooldownMs.set(lineKey(line), now);
+}
+/** 过滤掉冷却中的语料 */
+function withoutCooling(lines, now) {
+    return lines.filter((l) => !isLineCooling(l, now));
+}
 /** 分组名同义回退：新命名找不到时尝试旧语料里的相近分组（避免老库触发不到） */
 const GROUP_SYNONYMS = {
     游戏全屏: ['全屏游戏', '游戏'],
@@ -306,6 +348,7 @@ function loadOfflinePool(knowledgeDir, modelName) {
         readFile(path.join(knowledgeDir, `${safe}.offline.txt`)) ??
             readFile(path.join(knowledgeDir, 'character.offline.txt')) ??
             [];
+    lineCooldownMs.clear(); // 换人设 → 冷却表重来
     return offlinePool.length > 0;
 }
 /** 随机闲聊更偏向这些“闲时/陪伴”分组（避免静默待机时抽到会议等场景专属语料显得突兀） */
@@ -313,23 +356,40 @@ const CHAT_GROUP_HINTS = ['待机', '桌面日常', '日常', '闲聊', '彩蛋'
 function randomOfflineLine() {
     if (offlinePool.length === 0)
         return null;
+    const now = Date.now();
     const chatty = offlinePool.filter((l) => CHAT_GROUP_HINTS.some((h) => l.group.includes(h)));
-    const pool = chatty.length ? chatty : offlinePool;
-    let pick = pool[Math.floor(Math.random() * pool.length)].text;
-    if (pick === lastBubbleText && pool.length > 1) {
-        pick = pool[Math.floor(Math.random() * pool.length)].text;
+    // 先在"闲时"池里挑没冷却的；全在冷却再放宽到全池；仍没有就这次不出声
+    let candidates = withoutCooling(chatty.length ? chatty : offlinePool, now);
+    if (candidates.length === 0 && chatty.length)
+        candidates = withoutCooling(offlinePool, now);
+    if (candidates.length === 0)
+        return null;
+    let pick = candidates[Math.floor(Math.random() * candidates.length)];
+    if (pick.text === lastBubbleText && candidates.length > 1) {
+        pick = candidates[Math.floor(Math.random() * candidates.length)];
     }
-    return pick;
+    markLineUsed(pick, now);
+    return pick.text;
 }
 /** 分组名归一化：去掉连接词/标点/空白，让「健康护眼」↔「健康与护眼」这类命名漂移能互相命中 */
 function normalizeGroupName(name) {
     return name.replace(/[与和之的\s\-_·、，,。.；;：:！!？?（）()【】[\]「」『』]/g, '');
 }
-const pickRandom = (lines) => lines[Math.floor(Math.random() * lines.length)].text;
+const pickRandom = (lines) => lines[Math.floor(Math.random() * lines.length)];
+/** 从候选里挑一条没冷却的并记冷却；全在冷却返回 null */
+function pickFresh(lines, now) {
+    const fresh = withoutCooling(lines, now);
+    if (fresh.length === 0)
+        return null;
+    const line = pickRandom(fresh);
+    markLineUsed(line, now);
+    return line.text;
+}
 /** 按精确分组名取一句；无则沿同义组回退；仍无则做归一化包含匹配；再无返回 null */
 function pickLineByGroup(group) {
     if (offlinePool.length === 0)
         return null;
+    const now = Date.now();
     const tryGroup = (g) => {
         const hit = offlinePool.filter((l) => l.group === g);
         return hit.length ? hit : null;
@@ -337,8 +397,11 @@ function pickLineByGroup(group) {
     const chain = [group, ...(GROUP_SYNONYMS[group] ?? [])];
     for (const g of chain) {
         const lines = tryGroup(g);
-        if (lines)
-            return pickRandom(lines);
+        if (!lines)
+            continue;
+        const text = pickFresh(lines, now);
+        if (text)
+            return text;
     }
     // 兜底：语料小节命名与代码分组名漂移时（如「咖啡与骑行」「摸鱼提醒」），归一化后双向包含匹配
     const keys = chain.map(normalizeGroupName).filter((k) => k.length >= 2);
@@ -348,7 +411,7 @@ function pickLineByGroup(group) {
         const n = normalizeGroupName(l.group);
         return !!n && keys.some((k) => n === k || n.includes(k) || k.includes(n));
     });
-    return fuzzy.length ? pickRandom(fuzzy) : null;
+    return fuzzy.length ? pickFresh(fuzzy, now) : null;
 }
 /** 推送气泡（带 8s 最小间隔节流） */
 function pushBubble(text) {
@@ -374,7 +437,7 @@ function handleSceneGroup(group) {
     if (text)
         pushBubble(text);
 }
-/** 随机冒泡定时器：首次 60–120s，此后每 60–150s 一句（闲时自言自语，去重上一句） */
+/** 随机冒泡定时器：首次 2–4min，此后每 6–15min 一句（闲时自言自语，去重上一条并遵守 20min 单条冷却） */
 function startOfflineBubbleTimer() {
     const tick = (delayMs) => {
         if (bubbleTimer !== null)
@@ -383,10 +446,10 @@ function startOfflineBubbleTimer() {
             const text = randomOfflineLine();
             if (text)
                 pushBubble(text);
-            tick(60000 + Math.random() * 90000);
+            tick(360000 + Math.random() * 540000);
         }, delayMs);
     };
-    tick(60000 + Math.random() * 60000);
+    tick(120000 + Math.random() * 120000);
 }
 /** 模型切换时重载台词池（场景台词与当前人设一致） */
 function reloadOfflinePoolForModel(modelName) {
@@ -989,7 +1052,7 @@ function placeChatBubble(win) {
         const [pw, ph] = pet.getSize();
         // 尺寸一律用配置值：拿 getSize() 会把操作系统的 1~2px 舍入误差滚雪球（实测 270 → 279）
         const w = CHAT_WINDOW_WIDTH;
-        const h = CHAT_WINDOW_HEIGHT;
+        const h = chatWindowHeight();
         const spot = resolveBubbleSpot(pw, ph, w, h, area);
         const x = clampToArea(spot.x, area.x, area.x + area.width - w);
         const y = clampToArea(spot.y, area.y, area.y + area.height - h);
@@ -1144,7 +1207,9 @@ function lockNavigation(win, srv, label) {
     });
 }
 function createChatWindow(resolver, srv) {
-    const win = new electron_1.BrowserWindow(panelWindowOptions(CHAT_WINDOW_WIDTH, CHAT_WINDOW_HEIGHT, '对话气泡'));
+    chatCollapsed = true; // 新建窗口从折叠态开始
+    chatMenuOpen = false;
+    const win = new electron_1.BrowserWindow(panelWindowOptions(CHAT_WINDOW_WIDTH, chatWindowHeight(), '对话气泡'));
     chatWindow = win;
     // 记住这次的尾巴朝向，等页面加载完再作为查询参数传给渲染层（决定 CSS 画朝上还是朝下的尾巴）
     chatBubbleTail = placeChatBubble(win);
@@ -1241,6 +1306,36 @@ function repositionBubble(win) {
     }
 }
 /**
+ * 折叠/展开气泡窗，或折叠态下开关 ＋ 菜单（menu=true 时临时撑高给菜单腾地方）。
+ * 只改高矮、**不动贴桌宠的那条边**：重新挑位会让窗口整个翻到桌宠另一边，看起来像"跳了一下"。
+ */
+function setChatWindowCollapsed(collapsed, menu) {
+    chatCollapsed = Boolean(collapsed);
+    chatMenuOpen = chatCollapsed && Boolean(menu);
+    const win = chatWindow;
+    if (!win || win.isDestroyed())
+        return { ok: true };
+    resizeBubbleKeepingEdge(win, chatWindowHeight());
+    return { ok: true, height: chatWindowHeight() };
+}
+/** 只改气泡窗高矮：尾巴朝下时钉住底边、朝上时钉住顶边，再夹进工作区 */
+function resizeBubbleKeepingEdge(win, h) {
+    const pet = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+    const area = petWorkArea();
+    if (!pet || !area) {
+        moveBubbleTo(win, win.getBounds().x, win.getBounds().y, CHAT_WINDOW_WIDTH, h);
+        return;
+    }
+    try {
+        const b = win.getBounds();
+        const y = chatBubbleTail === 'up' ? b.y : b.y + b.height - h;
+        moveBubbleTo(win, b.x, clampToArea(y, area.y, area.y + area.height - h), CHAT_WINDOW_WIDTH, h);
+    }
+    catch (err) {
+        console.warn('[main] 气泡窗改高失败：', err.message);
+    }
+}
+/**
  * 桌宠移动 / 模型缩放 → 气泡同拍跟着挪。
  * 关键点：
  *   1. 走候选位挑选（纯算术）+ 相对偏移，不做显示器查询、不重新测量、不打日志；
@@ -1260,7 +1355,7 @@ function followPetForBubble() {
         const [px, py] = pet.getPosition();
         const [pw, ph] = pet.getSize();
         const w = CHAT_WINDOW_WIDTH;
-        const h = CHAT_WINDOW_HEIGHT;
+        const h = chatWindowHeight();
         // 自动模式每帧重新挑候选位（避开思考浮窗）；手动摆过就按用户给的位置跟随
         let x;
         let y;
@@ -1411,9 +1506,53 @@ function pushToWindows(channel, payload) {
     if (CHAT_MIRROR_CHANNELS.has(channel))
         sendToWindow(chatWindow, channel, payload);
 }
-/** 提问/确认框的目标窗口：有可见的气泡窗就弹在对话里（用户正看着它），否则弹在桌宠窗口 */
+/**
+ * 提问/确认框的目标窗口：**优先思考浮窗**（它就贴在桌宠旁边、用户正看着它，
+ * 弹在那里等于"思考到一半停下来问你"），其次对话气泡窗，最后桌宠窗口。
+ */
 function askTargetWindow() {
+    if (isThinkWindowVisible())
+        return thinkWindow;
     return isChatWindowVisible() ? chatWindow : mainWindow;
+}
+/**
+ * 打开思考浮窗并等它把页面加载完。
+ * 提问是要"发进去"的，窗口刚建好就 send 会直接丢掉（webContents 还没跑起来），
+ * 所以这里等一下 did-finish-load；超时就交给上层回退到别的窗口。
+ */
+function ensureThinkWindowReady(timeoutMs = 1500) {
+    if (!bootRef)
+        return Promise.resolve(false);
+    showThinkWindowWindow(bootRef.resolver, bootRef.server);
+    const win = thinkWindow;
+    if (!win || win.isDestroyed())
+        return Promise.resolve(false);
+    try {
+        if (!win.webContents.isLoading())
+            return Promise.resolve(true);
+    }
+    catch {
+        return Promise.resolve(false);
+    }
+    return new Promise((resolve) => {
+        let done = false;
+        const finish = (ok) => {
+            if (done)
+                return;
+            done = true;
+            clearTimeout(timer);
+            resolve(ok);
+        };
+        const timer = setTimeout(() => finish(false), timeoutMs);
+        try {
+            win.webContents.once('did-finish-load', () => finish(true));
+            if (!win.webContents.isLoading())
+                finish(true); // 刚好在这两行之间加载完
+        }
+        catch {
+            finish(false);
+        }
+    });
 }
 /** 推送取消信号：所有窗口都发（只有持有该提问的那个会真的收起弹窗） */
 function cancelAskEverywhere(id) {
@@ -1442,10 +1581,18 @@ function onChatRoundFinished() {
     activeChatRounds = Math.max(0, activeChatRounds - 1);
     if (activeChatRounds > 0)
         return; // 还有一轮在跑：先别关
+    scheduleThinkAutoHide();
+}
+/** 排一次"自动收起思考浮窗"；**还有提问挂着就先别关**（那是在等用户，不是结束） */
+function scheduleThinkAutoHide() {
     if (thinkAutoHideTimer)
         clearTimeout(thinkAutoHideTimer);
     thinkAutoHideTimer = setTimeout(() => {
         thinkAutoHideTimer = null;
+        if (pendingAsks.size > 0) {
+            scheduleThinkAutoHide(); // 用户还没作答：浮窗保持打开，稍后再看
+            return;
+        }
         hideThinkWindowWindow();
     }, THINK_AUTO_HIDE_MS);
 }
@@ -1500,7 +1647,7 @@ function registerWindowDragHandlers() {
 const pendingAsks = new Map();
 let askSeq = 0;
 /** 推送一个问题给窗口并等待用户回答（点击选项或自由文本）；120s 超时。 */
-function askUser(question, options) {
+async function askUser(question, options) {
     const q = (question || '').trim();
     const opts = options
         .map((o) => ({
@@ -1513,12 +1660,15 @@ function askUser(question, options) {
     if (opts.length < 2)
         return Promise.resolve('提问失败：至少需要 2 个选项。');
     const id = `ask-${Date.now()}-${++askSeq}`;
+    // 先把思考浮窗打开并等它就绪：问题要弹在"思考页面"里，且此时必须已经在跑
+    await ensureThinkWindowReady();
     return new Promise((resolve) => {
         const timer = setTimeout(() => {
             pendingAsks.delete(id);
             // 通知渲染层收起提问框并结束"等待确认"暂停态（否则超时后弹窗会一直留在屏幕上）
             cancelAskEverywhere(id);
             resolve('用户未在时限内回答。');
+            scheduleThinkAutoHide(); // 等它等完了：浮窗可以正常收起了
         }, 120000);
         pendingAsks.set(id, { resolve, timer });
         const target = askTargetWindow();
@@ -1549,6 +1699,9 @@ function registerAskAnswerHandler() {
         const selected = Array.isArray(p.selected) && typeof p.selected[0] === 'string' ? String(p.selected[0]) : '';
         const text = typeof p.text === 'string' ? p.text.trim() : '';
         pending.resolve(text || selected || '用户未提供有效回答');
+        // 已经没人在跑的轮次（回答期间那轮出错/被取消）：这里的作答就是最后一件事，浮窗可以收了
+        if (activeChatRounds === 0)
+            scheduleThinkAutoHide();
         return { ok: true };
     });
 }
@@ -1835,6 +1988,7 @@ async function bootstrap() {
         toolbox,
         openChatWindow: () => openChatWindow(resolver, srv),
         closeChatWindow: () => closeChatWindowWindow(),
+        setChatWindowCollapsed: (collapsed, menu) => setChatWindowCollapsed(collapsed, menu),
         showThinkWindow: () => showThinkWindowWindow(resolver, srv),
         hideThinkWindow: () => hideThinkWindowWindow(),
         onChatStarted: () => onChatRoundStarted(resolver, srv),

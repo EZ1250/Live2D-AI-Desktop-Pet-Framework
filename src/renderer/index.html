@@ -50,11 +50,12 @@
   <!-- 对话气泡窗 -->
   <div id="chatbar" class="chatbar" aria-label="和 Pet 聊天" aria-hidden="true">
     <div id="chat-toolbar" class="chat-toolbar">
-      <button id="chat-plus" class="chat-plus" type="button" title="更多" aria-haspopup="true" aria-expanded="false">＋</button>
       <span id="chat-toolbar-status" class="chat-toolbar-status"></span>
+      <button id="chat-collapse" class="chat-collapse" type="button" title="收起消息区" hidden>⌄</button>
       <button id="chat-close" class="chat-close" type="button" title="收起对话（Esc）">×</button>
     </div>
     <div id="chat-menu" class="chat-menu" hidden>
+      <button type="button" data-chat-menu="expand" title="展开消息区">💬 对话信息</button>
       <button type="button" data-chat-menu="new" title="新对话">＋ 新对话</button>
       <button type="button" data-chat-menu="history" title="查看历史对话">🕘 历史对话</button>
       <button type="button" data-chat-menu="think" title="显示过程">🧠 过程</button>
@@ -63,6 +64,7 @@
     <div id="chat-history-list" class="chat-history-list" hidden></div>
     <div id="chat-log" class="chat-log" aria-live="polite"></div>
     <div class="chat-input-row">
+      <button id="chat-plus" class="chat-plus" type="button" title="更多" aria-haspopup="true" aria-expanded="false">＋</button>
       <input id="chat-input" class="chat-input" type="text" placeholder="输入消息" maxlength="500" autocomplete="off" spellcheck="false" />
       <button id="chat-mic" class="chat-mic" type="button" aria-pressed="false" title="按住说话（松开后转写，不会自动发送）" aria-label="按住说话">
         <!-- 声纹图标（参考用户给的图：7 条圆头竖条，中间最高、左右对称，描边不填充）；
@@ -212,6 +214,12 @@
         <input id="setting-sfx-volume" name="sfxVolume" type="range" min="0" max="1" step="0.05" value="0.6" />
         <span id="sfx-volume-display" class="settings-range-value">60%</span>
       </label>
+      <!-- 行为触发：把「用户发言 / 调用工具 / 执行命令 / 开始回答 / 待机搭话 / 出错」各绑一个动作组或表情；
+           选项按当前模型真实可用的动作组与表情生成，模型没有的不播放 -->
+      <fieldset class="settings-fieldset">
+        <legend>行为触发（每个行为绑一个动作或表情）</legend>
+        <div id="motion-trigger-body"></div>
+      </fieldset>
       <div class="settings-divider">开发辅助（建文件夹 / 写文件 / 执行命令）</div>
       <label class="settings-row">开发工作区
         <input id="setting-dev-root" name="devWorkspaceRoot" type="text" readonly placeholder="未选择（选择后 Pet 才能建文件夹 / 写文件）" />

@@ -14,6 +14,8 @@ import { BrowserWindow, app, dialog, ipcMain, shell } from 'electron';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
+  BEHAVIOR_KEYS,
+  IPC_ACTION,
   IPC_AI_DONE,
   IPC_AI_MODEL_LIST,
   IPC_ASSET_IMPORT,
@@ -29,6 +31,7 @@ import {
   IPC_CHAT_SESSION_NEW,
   IPC_CHAT_SESSION_SELECT,
   IPC_CHAT_WINDOW_CLOSE,
+  IPC_CHAT_WINDOW_COLLAPSED,
   IPC_CHAT_WINDOW_OPEN,
   IPC_LOAD_MODEL,
   IPC_MODEL_LIST,
@@ -104,6 +107,8 @@ export interface IpcDeps {
    */
   openChatWindow?: () => Promise<ChatWindowResult>;
   closeChatWindow?: () => void;
+  /** 设置对话气泡窗折叠态（折叠=只显示输入条）；menu=true 时折叠态撑高给 ＋ 菜单腾地方。 */
+  setChatWindowCollapsed?: (collapsed: boolean, menu?: boolean) => { ok: boolean; height?: number };
   /** 显示/收起思考浮窗（提问时自动开、答完自动关，也供 ＋ 菜单手动调用） */
   showThinkWindow?: () => void;
   hideThinkWindow?: () => void;
@@ -350,8 +355,12 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
       const settings = sanitizeSettings(raw);
       if (!settings) return { ok: false, error: '设置格式无效' };
       try {
+        // 与现有设置**合并**再落盘：设置页只提交它表单里的字段，
+        // 直接整体覆盖会把渲染层根本没提交的项（邮箱 IMAP、窗口位置等）抹掉。
         const current = loadAppSettings();
-        const next = settings.aiApiKey ? settings : { ...settings, aiApiKey: current.aiApiKey };
+        const next: AppSettings = { ...current, ...settings };
+        // API Key 留空 = "不改"（renderer 始终看不到真实 Key，不能用空值覆盖）
+        if (!settings.aiApiKey) next.aiApiKey = current.aiApiKey;
         saveAppSettings(next);
         deps.chat.updateSettings(next);
         return { ok: true };
@@ -362,9 +371,19 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
   );
 
   // ---- IPC_SEND_MESSAGE -----------------------------------------------------
-  ipcMain.handle(IPC_SEND_MESSAGE, (_event, text: unknown): { ok: boolean; error?: string } => {
+  ipcMain.handle(IPC_SEND_MESSAGE, (event, text: unknown): { ok: boolean; error?: string } => {
     const message = typeof text === 'string' ? text.trim() : '';
     if (!message) return { ok: false, error: '消息为空' };
+
+    // 用户发言 → 转发行为到桌宠窗口
+    try {
+      const pet = deps.getWindow();
+      if (pet && !pet.isDestroyed() && pet.webContents !== event.sender) {
+        pet.webContents.send(IPC_ACTION, { type: 'behavior', payload: { name: 'user_message' } });
+      }
+    } catch {
+      /* 窗口不可用忽略 */
+    }
 
     const reply = (full: string): { ok: boolean } => {
       try {
@@ -762,6 +781,16 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
     }
   });
 
+  // ---- 对话气泡窗折叠态：改窗口高度并重新贴回桌宠 ----
+  ipcMain.handle(IPC_CHAT_WINDOW_COLLAPSED, (_event, raw: unknown): { ok: boolean; height?: number } => {
+    const input = (raw ?? {}) as { collapsed?: unknown; menu?: unknown };
+    try {
+      return deps.setChatWindowCollapsed?.(Boolean(input.collapsed), Boolean(input.menu)) ?? { ok: true };
+    } catch (err) {
+      return { ok: false };
+    }
+  });
+
   // ---- 思考浮窗（提问时自动开、答完自动关；＋ 菜单可手动开关）------------------
   ipcMain.handle(IPC_THINK_WINDOW_SHOW, (): { ok: boolean } => {
     try {
@@ -934,6 +963,17 @@ function sanitizeSettings(raw: unknown): AppSettings | null {
     if (input.mailImapPass.length > 300) return null;
     // 不去 trim 以外的加工：授权码里可能有空格，但首尾空白一定是误输
     settings.mailImapPass = input.mailImapPass.trim();
+  }
+  // 行为触发映射：只收合法行为键的字符串值，坏项丢弃（不整体拒绝保存）
+  if (input.motionTriggers !== undefined) {
+    if (input.motionTriggers !== null && typeof input.motionTriggers !== 'object') return null;
+    const raw = (input.motionTriggers ?? {}) as Record<string, unknown>;
+    const cleaned: Record<string, string> = {};
+    for (const key of BEHAVIOR_KEYS) {
+      const value = raw[key];
+      if (typeof value === 'string' && value.length <= 120) cleaned[key] = value;
+    }
+    settings.motionTriggers = cleaned;
   }
   // 桌宠窗口位置/尺寸：整数、范围宽松夹取（不合法就整体拒绝保存，与其它字段一致）。
   // 范围只防明显的脏值；"是否在可见显示器内"由 mainImpl 在恢复时判断。

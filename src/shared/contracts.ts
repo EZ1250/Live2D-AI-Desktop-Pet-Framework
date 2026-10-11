@@ -108,6 +108,8 @@ export const IPC_HIT_PROBE = 'pet:hitProbe';
 export const IPC_HIT_RESULT = 'pet:hitResult';
 /** 主进程 push→renderer：思考浮窗开/关状态 {open}（气泡窗里据此显示「思考浮窗」是开还是关）。 */
 export const IPC_THINK_WINDOW_STATE = 'think:windowState';
+/** invoke renderer→main：设置对话气泡窗的折叠态 {collapsed}（折叠=只显示输入条）。 */
+export const IPC_CHAT_WINDOW_COLLAPSED = 'chat:windowCollapsed';
 
 /** 打开聊天窗口的结果。 */
 export interface ChatWindowResult {
@@ -568,6 +570,8 @@ export interface ElectronAPI {
   chatWindowClose?(): Promise<{ ok: boolean }>;
   /** 订阅独立聊天窗口开/关状态。 */
   onChatWindowState?(cb: (payload: { open: boolean }) => void): () => void;
+  /** 设置对话气泡窗折叠态（折叠=只显示输入条）；menu=true 时折叠态撑高给 ＋ 菜单腾地方。 */
+  chatWindowSetCollapsed?(collapsed: boolean, menu?: boolean): Promise<{ ok: boolean; height?: number }>;
   /** 显示思考浮窗（提问时主进程会自动打开，这里供 ＋ 菜单手动开）。 */
   thinkWindowShow?(): Promise<{ ok: boolean }>;
   /** 收起思考浮窗。 */
@@ -592,10 +596,36 @@ export interface ElectronAPI {
   /** 订阅"提问已失效"（超时/退出）：渲染层应收起提问框、结束等待态。 */
   onAskCancel?(cb: () => void): () => void;
   /** 订阅 AI 思考过程事件（推理内容 + 工具调用步骤），用于“思考浮窗”。 */
-  onThink?(cb: (evt: { kind: 'start' | 'reasoning' | 'tool' | 'result' | 'done' | 'error'; text: string }) => void): () => void;
+  onThink?(cb: (evt: { kind: 'start' | 'reasoning' | 'tool' | 'result' | 'done' | 'error'; text: string; tool?: string }) => void): () => void;
   /** 订阅 AI 的任务进度清单（plan_update 工具推送），用于在浮窗里显示进度。 */
   onPlan?(cb: (payload: { items: Array<{ text: string; status: 'pending' | 'doing' | 'done' }> }) => void): () => void;
 }
+
+// ---------------------------------------------------------------------------
+// 行为触发（行为 → 动作组 / 表情）
+// ---------------------------------------------------------------------------
+
+/** 可绑定动作或表情的行为。 */
+export type BehaviorKey = 'user_message' | 'tool_call' | 'command_exec' | 'ai_start' | 'model_idle' | 'error';
+
+/** 全部行为键（顺序即设置页顺序）。 */
+export const BEHAVIOR_KEYS: BehaviorKey[] = ['user_message', 'tool_call', 'command_exec', 'ai_start', 'model_idle', 'error'];
+
+/** 行为中文名。 */
+export const BEHAVIOR_LABELS: Record<BehaviorKey, string> = {
+  user_message: '用户发送消息',
+  tool_call: '调用工具',
+  command_exec: '执行命令',
+  ai_start: '开始回答',
+  model_idle: '待机搭话',
+  error: '出错',
+};
+
+/**
+ * 触发目标：'auto'=自动 / ''=不触发 / 'motion:<动作组名>' / 'expr:<表情名>'；
+ * 别名 'click'、'costume' 取能力归类第一项，'emotion:<标签>' 取情绪映射到的表情。
+ */
+export type MotionTriggerValue = string;
 
 /** 可由设置页编辑的应用配置；API key 仅在本地 userData/settings.json 保存。 */
 export interface AppSettings {
@@ -667,6 +697,8 @@ export interface AppSettings {
   mailImapUser?: string;
   /** 授权码/密码。绝不写进日志，也不回显给模型。 */
   mailImapPass?: string;
+  /** 行为触发映射：行为键 → 触发目标；缺失等价 'auto'，目标不存在则不触发。 */
+  motionTriggers?: Partial<Record<BehaviorKey, MotionTriggerValue>>;
 }
 
 /** 渲染进程类型增强：window.electron 在全局可用。 */

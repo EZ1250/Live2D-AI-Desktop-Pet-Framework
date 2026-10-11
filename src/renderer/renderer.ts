@@ -53,6 +53,8 @@ interface RenderHandle {
   setExpression?(name: string | null): void;
   /** 当前模型可用表情名（无表情能力 → []） */
   listExpressions?(): string[];
+  /** 当前模型可用动作组名（无动作 → []） */
+  listMotions?(): string[];
   /** 视线目标 nx/ny ∈[-1,1]，向右/向上为正；0 = 归位 */
   setGaze?(nx: number, ny: number): void;
   /** 滚轮缩放：dir=+1 放大 / -1 缩小（moc3/portrait 支持；placeholder 不实现） */
@@ -122,6 +124,12 @@ const THINK_PANEL_MODE: boolean = (() => {
 const TYPE_SPEED_MS = 20;
 /** 气泡默认停留时长（打完字后开始计时） */
 const DEFAULT_TTL_MS = 3800;
+/** 气泡停留时长下限 */
+const MIN_BUBBLE_TTL_MS = 3000;
+/** 气泡停留时长上限（用户要求区间 3–300s） */
+const MAX_BUBBLE_TTL_MS = 300_000;
+/** 阅读速度折算：每字多留 ms（约 6.7 字/秒） */
+const BUBBLE_TTL_PER_CHAR_MS = 150;
 
 const IDLE_PHRASES = [
   '看起来好忙呀，摸摸鱼吧～',
@@ -232,7 +240,15 @@ let streamBuffer = '';
 let revealPos = 0;
 let streamDone = false;
 let streamTTL = DEFAULT_TTL_MS;
+/** 本轮气泡的 ttlMs 是否由调用方显式指定（显式值原样夹取，否则按内容长度自适应） */
+let ttlExplicit = false;
 let bubbleTone: 'info' | 'error' = 'info';
+
+/** 气泡停留时长：显式值夹取到 [3s,300s]；未指定则按内容长度自适应 */
+function computeBubbleTtl(text: string, explicitMs?: number): number {
+  const raw = explicitMs ?? MIN_BUBBLE_TTL_MS + text.length * BUBBLE_TTL_PER_CHAR_MS;
+  return Math.min(MAX_BUBBLE_TTL_MS, Math.max(MIN_BUBBLE_TTL_MS, raw));
+}
 
 function setBubbleTone(tone: 'info' | 'error'): void {
   bubbleTone = tone;
@@ -265,13 +281,12 @@ function pumpTypewriter(): void {
     typeTimer = window.setTimeout(pumpTypewriter, step);
     return;
   }
-  // 打完：移除光标，TTL 后隐藏（长回复按长度多留一会儿，方便读完）
+  // 打完：移除光标，TTL 后隐藏（时长按内容长度自适应，钳在 3–300s）
   typewriterActive = false;
   typeTimer = 0; // 关键：本轮定时器已自然结束，必须归零；否则 feedChatDelta 里 `if (!typeTimer)` 永远为假，后续流式增量再也打不出来
   window.setTimeout(stopSpeechMouth, 320); // 说完留一拍再闭嘴（与下面 TTL 淡出衔接）
   if (bubbleEl) bubbleEl.classList.remove('is-typing');
-  const scaledTtl = Math.min(30_000, Math.max(streamTTL, 3000 + streamBuffer.length * 90));
-  hideTimer = window.setTimeout(hideBubble, scaledTtl);
+  hideTimer = window.setTimeout(hideBubble, computeBubbleTtl(streamBuffer, ttlExplicit ? streamTTL : undefined));
 }
 
 /**
@@ -288,6 +303,7 @@ function showBubble(text: string, opts?: { ttlMs?: number; tone?: 'info' | 'erro
   revealPos = 0;
   streamDone = true;
   streamTTL = opts?.ttlMs ?? DEFAULT_TTL_MS;
+  ttlExplicit = opts?.ttlMs !== undefined;
   setBubbleTone(opts?.tone ?? 'info');
   bubbleEl.classList.add('is-visible');
 
@@ -299,7 +315,7 @@ function showBubble(text: string, opts?: { ttlMs?: number; tone?: 'info' | 'erro
     bubbleTextEl.textContent = text;
     typewriterActive = false;
     bubbleEl.classList.remove('is-typing');
-    hideTimer = window.setTimeout(hideBubble, streamTTL);
+    hideTimer = window.setTimeout(hideBubble, computeBubbleTtl(text, ttlExplicit ? streamTTL : undefined));
     return;
   }
   typewriterActive = true;
@@ -322,7 +338,8 @@ function feedChatDelta(delta: string): void {
     streamBuffer = '';
     revealPos = 0;
     streamDone = false;
-    streamTTL = 5000;
+    streamTTL = DEFAULT_TTL_MS;
+    ttlExplicit = false;
     typewriterActive = true;
     setBubbleTone('info');
     bubbleEl.classList.add('is-visible', 'is-typing');
@@ -436,6 +453,7 @@ async function mountManifest(manifest: ModelManifest): Promise<void> {
   // 模型级预设（pet-model.json）：情绪→表情映射 / 取景建议。缺失即 null，行为与从前一致。
   activeModelPreset = manifest.preset ?? null;
   activeModelCapabilities = manifest.preset?.capabilities ?? null;
+  refreshMotionTriggerOptions(); // 模型换了 → 行为下拉里的动作组/表情清单跟着换
   // 体检结果（能渲染 / 有警告 / 不能渲染）：不能渲染时直接用它的文案提示，不再硬加载
   activeModelCompat = manifest.compat ?? null;
   if (manifest.compat && manifest.compat.verdict !== 'ok') {
@@ -1225,6 +1243,135 @@ function triggerPetTap(x: number, y: number): void {
 }
 
 /* ================================================================
+   7.6 行为触发：行为 → 动作组 / 表情
+   ================================================================ */
+/** 行为键（与 contracts.ts 的 BEHAVIOR_KEYS 同步） */
+type BehaviorKey = 'user_message' | 'tool_call' | 'command_exec' | 'ai_start' | 'model_idle' | 'error';
+const BEHAVIOR_KEYS: BehaviorKey[] = ['user_message', 'tool_call', 'command_exec', 'ai_start', 'model_idle', 'error'];
+/** 行为中文名 */
+const BEHAVIOR_LABELS: Record<BehaviorKey, string> = {
+  user_message: '用户发送消息',
+  tool_call: '调用工具',
+  command_exec: '执行命令',
+  ai_start: '开始回答',
+  model_idle: '待机搭话',
+  error: '出错',
+};
+/** 同一行为的两次触发最小间隔 */
+const BEHAVIOR_DEBOUNCE_MS: Record<BehaviorKey, number> = {
+  user_message: 500,
+  tool_call: 300,
+  command_exec: 300,
+  ai_start: 0,
+  model_idle: 8000,
+  error: 1000,
+};
+/** auto 模式的候选顺序：'motion:x' / 'expr:x' / 'emotion:标签' / 'click' / 'costume' */
+const BEHAVIOR_AUTO: Record<BehaviorKey, string[]> = {
+  user_message: ['click', 'motion:Tap', 'motion:TapBody', 'motion:wave'],
+  tool_call: ['motion:Idle', 'motion:Tap', 'costume'],
+  command_exec: ['motion:Idle', 'motion:Tap'],
+  ai_start: ['motion:Idle'],
+  model_idle: ['motion:Idle'],
+  error: ['emotion:surprised', 'emotion:angry', 'emotion:sad', 'motion:Shake'],
+};
+/** 触发目标是动作组还是表情 */
+type BehaviorTarget = { kind: 'motion' | 'expression'; name: string };
+/** 命令类工具 */
+const COMMAND_TOOLS = new Set(['shell_run', 'shell_bg', 'shell_output', 'shell_kill']);
+/** 行为触发表情后恢复默认的时长 */
+const BEHAVIOR_EXPRESSION_HOLD_MS = 2600;
+
+/** 设置里的行为触发映射 */
+let motionTriggers: Record<string, string> = {};
+/** 各行为上次触发时刻 */
+const behaviorLastAt: Partial<Record<BehaviorKey, number>> = {};
+/** 本轮回复是否已触发过「开始回答」 */
+let aiStartEmitted = false;
+
+function listCurrentMotions(): string[] {
+  return currentHandle && typeof currentHandle.listMotions === 'function' ? currentHandle.listMotions() : [];
+}
+function listCurrentExpressions(): string[] {
+  return currentHandle && typeof currentHandle.listExpressions === 'function' ? currentHandle.listExpressions() : [];
+}
+
+/** 能力别名 → 该模型真实拥有的动作组或表情名 */
+function resolveCapabilityAlias(alias: 'click' | 'costume'): BehaviorTarget | null {
+  const cap = activeModelCapabilities;
+  if (!cap) return null;
+  const name = (alias === 'click' ? cap.click?.[0] ?? cap.costume?.[0] : cap.costume?.[0]) ?? '';
+  if (!name) return null;
+  if (listCurrentMotions().includes(name)) return { kind: 'motion', name };
+  if (listCurrentExpressions().includes(name)) return { kind: 'expression', name };
+  return null;
+}
+
+/** 解析一个候选；目标不存在返回 null */
+function resolveTriggerCandidate(candidate: string): BehaviorTarget | null {
+  if (candidate === 'click' || candidate === 'costume') return resolveCapabilityAlias(candidate);
+  if (candidate.startsWith('motion:')) {
+    const name = candidate.slice(7);
+    return name && listCurrentMotions().includes(name) ? { kind: 'motion', name } : null;
+  }
+  if (candidate.startsWith('expr:')) {
+    const name = candidate.slice(5);
+    return name && listCurrentExpressions().includes(name) ? { kind: 'expression', name } : null;
+  }
+  if (candidate.startsWith('emotion:')) {
+    const label = candidate.slice(8);
+    const name = activeModelPreset?.emotionMap?.[label] ?? activeModelCapabilities?.emotion?.[label] ?? '';
+    return name && listCurrentExpressions().includes(name) ? { kind: 'expression', name } : null;
+  }
+  return null;
+}
+
+/** 解析某行为的触发目标；命中不了返回 null */
+function resolveBehaviorTarget(behavior: BehaviorKey): BehaviorTarget | null {
+  const raw = (motionTriggers[behavior] ?? 'auto').trim();
+  if (!raw) return null;
+  const candidates = raw === 'auto' ? BEHAVIOR_AUTO[behavior] ?? [] : [raw];
+  for (const candidate of candidates) {
+    const target = resolveTriggerCandidate(candidate);
+    if (target) return target;
+  }
+  return null;
+}
+
+/** 播放行为目标的表情，并到点恢复默认 */
+function playBehaviorExpression(name: string): void {
+  if (!currentHandle || typeof currentHandle.setExpression !== 'function') return;
+  cancelTapExpressionReset();
+  activeTapExpression = name;
+  try {
+    currentHandle.setExpression(name);
+  } catch {
+    /* 表情失败不影响行为 */
+  }
+  tapExpressionResetTimer = window.setTimeout(() => {
+    tapExpressionResetTimer = 0;
+    activeTapExpression = '';
+    try {
+      currentHandle?.setExpression?.(null);
+    } catch {
+      /* ignore */
+    }
+  }, BEHAVIOR_EXPRESSION_HOLD_MS);
+}
+
+/** 触发一次行为：去抖 → 解析目标 → 没有就不播放 */
+function emitBehavior(behavior: BehaviorKey): void {
+  if (!currentHandle) return;
+  const now = Date.now();
+  if (now - (behaviorLastAt[behavior] ?? 0) < BEHAVIOR_DEBOUNCE_MS[behavior]) return;
+  behaviorLastAt[behavior] = now;
+  const target = resolveBehaviorTarget(behavior);
+  if (!target) return;
+  if (target.kind === 'motion') currentHandle.playMotion?.(target.name);
+  else playBehaviorExpression(target.name);
+}
+
+/* ================================================================
    8. Electron bridge 接线
    ================================================================ */
 /** 聊天记录用的 bridge（在 init 里赋值；appendChatLog 需要它做持久化） */
@@ -1463,6 +1610,8 @@ async function openChatSession(id: string, bridge: RendererBridge | null): Promi
 /** 新对话：清空 AI 上下文 + 新建会话（记录里开一段新的） */
 async function startNewChat(bridge: RendererBridge): Promise<void> {
   try {
+    // 折叠态看不到消息区、连状态提示也藏着 → 先展开，否则点了等于没反应
+    if (chatCollapsed) setChatCollapsed(bridge, false);
     const reset = await bridge.chatContextReset?.();
     const snap = await bridge.chatSessionNew?.();
     if (chatLogEl) {
@@ -1492,9 +1641,43 @@ function closeChatMenu(): void {
   if (!menu || menu.hidden) return;
   menu.hidden = true;
   elementById<HTMLButtonElement>('chat-plus')?.setAttribute('aria-expanded', 'false');
+  // 菜单收起来 → 折叠态不再需要额外高度
+  if (chatMenuRoom) {
+    chatMenuRoom = false;
+    syncChatWindowHeight(chatBridge);
+  }
 }
 
-/** 工具条接线：左侧 ＋ 菜单（新对话 / 历史 / 思考浮窗 / 收起）+ 右侧 × */
+/** 气泡窗是否折叠 */
+let chatCollapsed = true;
+/** 折叠态是否正开着 ＋ 菜单（开菜单要把窗口撑高，菜单才弹得下） */
+let chatMenuRoom = false;
+
+/** 把「折叠 / 开菜单」两个高度状态同步给主进程 */
+function syncChatWindowHeight(bridge: RendererBridge | null): void {
+  try {
+    void bridge?.chatWindowSetCollapsed?.(chatCollapsed, chatMenuRoom)?.catch(() => undefined);
+  } catch {
+    /* 旧版 preload 没有这个方法：UI 仍能用，只是窗口高度不变 */
+  }
+}
+
+/** 切换折叠/展开：改窗口高度（走主进程）并同步 DOM */
+function setChatCollapsed(bridge: RendererBridge, collapsed: boolean): void {
+  chatCollapsed = collapsed;
+  if (!collapsed) chatMenuRoom = false; // 展开态本来就够高
+  document.body.classList.toggle('is-chat-collapsed', collapsed);
+  closeChatMenu();
+  const expandItem = document.querySelector<HTMLElement>('[data-chat-menu="expand"]');
+  if (expandItem) expandItem.hidden = !collapsed; // 已展开时「对话信息」没有意义
+  const collapseBtn = elementById<HTMLElement>('chat-collapse');
+  if (collapseBtn) collapseBtn.hidden = collapsed;
+  if (!collapsed) chatScrollToEnd();
+  // closeChatMenu 可能已经同步过一次；这里再同步一次保证折叠态与高度一致
+  syncChatWindowHeight(bridge);
+}
+
+/** 工具条接线：＋ 菜单（新对话 / 历史 / 思考浮窗 / 对话信息 / 收起）+ 折叠 + 关闭 */
 function installChatToolbar(bridge: RendererBridge): void {
   const plus = elementById<HTMLButtonElement>('chat-plus');
   const menu = elementById<HTMLElement>('chat-menu');
@@ -1504,21 +1687,30 @@ function installChatToolbar(bridge: RendererBridge): void {
     const willOpen = menu.hidden;
     menu.hidden = !willOpen;
     plus.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+    // 折叠态窗口只有 72px，菜单往上弹会超出窗口被裁掉 → 先撑高
+    chatMenuRoom = willOpen && chatCollapsed;
+    syncChatWindowHeight(bridge);
     if (willOpen) void refreshChatSessions(bridge);
   });
   menu?.addEventListener('click', (event) => {
     const item = (event.target as HTMLElement).closest('button')?.getAttribute('data-chat-menu');
     if (!item) return;
-    closeChatMenu();
+    // 先执行动作再收菜单：动作可能要改折叠态（顺带改窗口高度），
+    // 反过来的话高度会被"收菜单缩回 72"再"展开到 270"来回设两遍，看着像闪一下。
     if (item === 'new') void startNewChat(bridge);
     else if (item === 'history') void toggleHistoryList(bridge);
     else if (item === 'think') void toggleThinkWindow(bridge);
+    else if (item === 'expand') setChatCollapsed(bridge, false);
     else if (item === 'collapse') void collapseChatSurface(bridge);
+    closeChatMenu();
   });
   // 点菜单外面任意处：只收菜单（不改动气泡窗本身）
   document.addEventListener('click', (event) => {
     if ((event.target as HTMLElement)?.closest?.('#chat-menu, #chat-plus')) return;
     closeChatMenu();
+  });
+  elementById<HTMLButtonElement>('chat-collapse')?.addEventListener('click', () => {
+    setChatCollapsed(bridge, true);
   });
   elementById<HTMLButtonElement>('chat-close')?.addEventListener('click', () => {
     void collapseChatSurface(bridge);
@@ -1584,6 +1776,7 @@ function subscribeOptionalPushes(bridge: RendererBridge): void {
     bridge.onBubble((payload) => {
       if (payload && typeof payload.text === 'string') {
         showBubble(payload.text, { ttlMs: payload.ttlMs });
+        emitBehavior('model_idle'); // 主进程主动搭话 = 待机行为
       }
       return;
     });
@@ -1592,7 +1785,13 @@ function subscribeOptionalPushes(bridge: RendererBridge): void {
     bridge.onChat((payload) => {
       if (payload && typeof payload.delta === 'string') {
         feedChatDelta(payload.delta);
+        if (!aiStartEmitted) {
+          aiStartEmitted = true;
+          emitBehavior('ai_start');
+        }
       } else if (payload && typeof payload.full === 'string') {
+        if (!aiStartEmitted) emitBehavior('ai_start'); // 非流式回复：补一次
+        aiStartEmitted = false;
         showBubble(payload.full, { immediate: true });
         // 文本情感 → 表情（emotion.js 规则判定；模型没有对应表情就保持原样）
         applyEmotionFromText(payload.full);
@@ -1609,7 +1808,9 @@ function subscribeOptionalPushes(bridge: RendererBridge): void {
         chatScrollToEnd();
       } else if (payload && typeof payload.message === 'string') {
         // AI 调用错误：以错误气泡提示，不清空正在进行的流
+        aiStartEmitted = false;
         showBubble(`⚠️ ${payload.message}`, { tone: 'error', immediate: true });
+        emitBehavior('error');
         if (!chatOwnedByChatWindow) appendChatLog('error', payload.message);
         setChatTyping(false);
         streamDone = true;
@@ -1647,7 +1848,24 @@ function subscribeOptionalPushes(bridge: RendererBridge): void {
       } else if (type === 'expression') {
         const name = action.payload && typeof action.payload.name === 'string' ? action.payload.name : '';
         if (currentHandle?.setExpression) currentHandle.setExpression(name || null);
+      } else if (type === 'behavior') {
+        // 主进程转发来的行为事件
+        const name = action.payload && typeof action.payload.name === 'string' ? action.payload.name : '';
+        if ((BEHAVIOR_KEYS as string[]).includes(name)) emitBehavior(name as BehaviorKey);
       }
+      return;
+    });
+  }
+  if (typeof bridge.onThink === 'function') {
+    bridge.onThink((evt) => {
+      if (!evt) return;
+      // 先调工具再出文本时不会走 delta 分支，故这里补触发「开始回答」
+      if (evt.kind === 'start' && !aiStartEmitted) {
+        aiStartEmitted = true;
+        emitBehavior('ai_start');
+      }
+      if (evt.kind !== 'tool' || typeof evt.tool !== 'string' || !evt.tool) return;
+      emitBehavior(COMMAND_TOOLS.has(evt.tool) ? 'command_exec' : 'tool_call');
       return;
     });
   }
@@ -2454,6 +2672,10 @@ async function toggleFraming(bridge: RendererBridge): Promise<void> {
 
 async function populateSettings(bridge: RendererBridge): Promise<void> {
   const [settings, models] = await Promise.all([bridge.getSettings(), bridge.modelList()]);
+  motionTriggers = (settings.motionTriggers as Record<string, string> | undefined) ?? {};
+  renderMotionTriggerRows();
+  refreshMotionTriggerOptions();
+  populateMotionTriggerSelects();
   const modelSelect = elementById<HTMLSelectElement>('setting-model');
   if (modelSelect) {
     modelSelect.replaceChildren();
@@ -2509,6 +2731,98 @@ async function populateSettings(bridge: RendererBridge): Promise<void> {
   void refreshAssetPanel(bridge);
   void refreshVoiceStatus(bridge); // 语音识别这行的状态（是否配好、走哪条路由、发往哪个主机）
   void refreshVoiceModelIndex(bridge); // 转写模型：按地址索引候选 + 体检提示（模型留空时自动填一个）
+}
+
+/* ---------- 设置页：行为触发（行为 → 动作组 / 表情）---------- */
+/** 建出每个行为一行（只建一次） */
+function renderMotionTriggerRows(): void {
+  const body = elementById<HTMLElement>('motion-trigger-body');
+  if (!body || body.childElementCount > 0) return;
+  for (const key of BEHAVIOR_KEYS) {
+    const row = document.createElement('label');
+    row.className = 'settings-row';
+    const title = document.createElement('span');
+    title.textContent = BEHAVIOR_LABELS[key];
+    const select = document.createElement('select');
+    select.id = `setting-motion-${key}`;
+    row.append(title, select);
+    body.appendChild(row);
+  }
+}
+
+/** 保证下拉里有这个取值；当前模型没有它时也补一个选项留住（换模型不该悄悄丢掉绑定） */
+function ensureTriggerOption(select: HTMLSelectElement, value: string): void {
+  if (Array.from(select.options).some((o) => o.value === value)) return;
+  const option = document.createElement('option');
+  option.value = value;
+  option.textContent = value ? `${value}（当前模型没有）` : '不触发';
+  select.appendChild(option);
+}
+
+/** 用当前模型的动作组/表情刷新每个下拉的选项 */
+function refreshMotionTriggerOptions(): void {
+  const motions = listCurrentMotions();
+  const expressions = listCurrentExpressions();
+  for (const key of BEHAVIOR_KEYS) {
+    const select = elementById<HTMLSelectElement>(`setting-motion-${key}`);
+    if (!select) continue;
+    const previous = select.options.length ? select.value : 'auto';
+    select.replaceChildren();
+    const add = (value: string, label: string): void => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      select.appendChild(option);
+    };
+    add('auto', '自动（按行为猜一个）');
+    add('', '不触发');
+    if (motions.length) {
+      const group = document.createElement('optgroup');
+      group.label = '动作组';
+      for (const name of motions) {
+        const option = document.createElement('option');
+        option.value = `motion:${name}`;
+        option.textContent = name;
+        group.appendChild(option);
+      }
+      select.appendChild(group);
+    }
+    if (expressions.length) {
+      const group = document.createElement('optgroup');
+      group.label = '表情';
+      for (const name of expressions) {
+        const option = document.createElement('option');
+        option.value = `expr:${name}`;
+        option.textContent = name;
+        group.appendChild(option);
+      }
+      select.appendChild(group);
+    }
+    // 旧值在当前模型上不存在时也补一个选项留住（换模型不该悄悄丢掉绑定）
+    ensureTriggerOption(select, previous);
+    select.value = previous;
+  }
+}
+
+/** 回填已保存的行为触发映射 */
+function populateMotionTriggerSelects(): void {
+  for (const key of BEHAVIOR_KEYS) {
+    const select = elementById<HTMLSelectElement>(`setting-motion-${key}`);
+    if (!select) continue;
+    const saved = typeof motionTriggers[key] === 'string' ? motionTriggers[key] : 'auto';
+    ensureTriggerOption(select, saved);
+    select.value = saved;
+  }
+}
+
+/** 收集行为触发映射（'auto' 不落盘，缺省即 auto） */
+function collectMotionTriggers(): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const key of BEHAVIOR_KEYS) {
+    const value = elementById<HTMLSelectElement>(`setting-motion-${key}`)?.value ?? 'auto';
+    if (value && value !== 'auto') map[key] = value;
+  }
+  return map;
 }
 
 /** 语音识别状态行：是否可用 + 实际路由 + 目标主机（不显示密钥） */
@@ -2614,6 +2928,7 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
     voiceRoute: (elementById<HTMLSelectElement>('setting-voice-route')?.value as AppSettings['voiceRoute']) ?? 'auto',
     voiceBaseUrl: value('setting-voice-base-url'),
     voiceApiKey: value('setting-voice-api-key'),
+    motionTriggers: collectMotionTriggers(),
   };
   setSettingsStatus('保存中…');
   const result = await bridge.setSettings(settings);
@@ -2621,6 +2936,7 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
     setSettingsStatus(result.error ?? '保存失败', true);
     return;
   }
+  motionTriggers = (settings.motionTriggers as Record<string, string> | undefined) ?? {}; // 行为触发立刻生效
   applySfxSettings(settings); // 音效开关/音量立刻生效（无需重启）
   applyFraming(settings.displayMode === 'half' ? 'half' : 'full'); // 取景立刻生效
   void refreshVoiceStatus(bridge); // 语音状态行跟着更新
@@ -3277,6 +3593,8 @@ async function sendChat(bridge: RendererBridge): Promise<void> {
     pendingUserRow = appendChatLog('user', text);
     markUserRowSending(pendingUserRow);
     streamRowEl = null; // 新的一轮：流式行从头开始
+    aiStartEmitted = false;
+    emitBehavior('user_message'); // 桌宠窗口内发消息：本地触发（气泡窗发的那条由主进程转发）
     const res = await bridge.sendMessage(text);
     if (!res.ok) {
       // 契约未携带 error 字段：给出通用失败提示（空消息/主进程拒绝等）
@@ -3427,6 +3745,10 @@ function showAskBox(bridge: RendererBridge, payload: AskQuestionPayload): void {
   const optionsEl = elementById<HTMLElement>('ask-options');
   const input = elementById<HTMLInputElement>('ask-input');
   if (!box || !questionEl || !optionsEl || !input) return;
+  // 折叠态看不到提问框 → 先展开
+  if (CHAT_PANEL_MODE && chatCollapsed) setChatCollapsed(bridge, false);
+  // 思考浮窗里提问 = "思考到一半停下来问你"：面板必须展开着，否则问题被折叠藏住
+  if (THINK_PANEL_MODE) expandThinkPanel();
   hideContextMenu();
   const chatBar = elementById<HTMLElement>('chatbar');
   if (chatBar) chatBar.classList.remove('is-open'); // 只收输入条，保留思考浮窗
@@ -4111,6 +4433,8 @@ async function toggleThinkWindow(bridge: RendererBridge): Promise<void> {
 async function toggleHistoryList(bridge: RendererBridge): Promise<void> {
   if (!chatHistoryEl) return;
   if (chatHistoryEl.hidden) {
+    // 折叠态没有消息区：列表本身没地方显示，选中会话后也看不到内容 → 先展开
+    if (chatCollapsed) setChatCollapsed(bridge, false);
     try {
       const snap = await bridge.chatLogGet?.();
       chatSessions = Array.isArray(snap?.sessions) ? snap.sessions : chatSessions;
@@ -4118,6 +4442,7 @@ async function toggleHistoryList(bridge: RendererBridge): Promise<void> {
       /* 拿不到最新摘要就用已有列表兜底 */
     }
     renderChatHistoryList();
+    chatScrollToEnd();
   }
   chatHistoryEl.hidden = !chatHistoryEl.hidden;
 }
@@ -4180,6 +4505,7 @@ async function initChatPanel(): Promise<void> {
   }
   void loadChatLog(bridge);
   showChatBar(); // 常驻展开 + 聚焦输入框
+  setChatCollapsed(bridge, true); // 打开时默认折叠：只显示输入条
 }
 
 /* ---------- 10.2 思考浮窗模式（?panel=think）----------
@@ -4205,6 +4531,7 @@ async function initThinkPanelWindow(): Promise<void> {
     return hideThinkPanel;
   });
   bridge.onPlan?.((payload) => renderPlan(payload?.items));
+  installAskBox(bridge); // AI 的提问/确认框就弹在这个页面里（"思考到一半停下来问你"）
   elementById<HTMLButtonElement>('think-close')?.addEventListener('click', () => {
     void bridge.thinkWindowHide?.();
   });
