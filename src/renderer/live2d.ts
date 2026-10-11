@@ -1540,6 +1540,20 @@
         if (idleMotionAvailable) startMocMotion('Idle', 0);
         const breathOK = !!(model && model.internalModel && model.internalModel.breath);
         log(`追踪来源: 引擎focus=${focusOK ? '有' : '无(退回手动)'} 引擎呼吸=${breathOK ? '有' : '无'} 头部参数=${headTrackOK ? '有' : '无'}`);
+        {
+          const raw = (k: ParamKey): string => {
+            try {
+              const v = paramLimit(paramIds[k]);
+              return Number.isFinite(v) ? String(Math.round(v * 100) / 100) : '?';
+            } catch {
+              return '?';
+            }
+          };
+          log(
+            `追踪参数上限: ${paramIds.angleX}=${raw('angleX')} ${paramIds.angleY}=${raw('angleY')} ${paramIds.angleZ}=${raw('angleZ')} ` +
+              `${paramIds.eyeBallX}=${raw('eyeBallX')} ${paramIds.bodyX}=${raw('bodyX')} ${paramIds.breath}=${raw('breath')}`
+          );
+        }
         if (headTrackOK) log('头部跟踪参数:', { headTrackX, headTrackY, headTrackZ, ids: paramIds });
         else log('头部跟踪: 当前模型没有头部角度参数', paramIds.angleX, paramIds.angleY, paramIds.angleZ);
         log('moc3 就绪:', modelUrl);
