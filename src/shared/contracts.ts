@@ -653,6 +653,8 @@ export interface AppSettings {
   permissionMode?: 'ask' | 'auto-edit' | 'plan-only';
   /** 角色取景：full=全身（默认，缩放到窗口里）；half=半身（放大取头与上半身，脚裁掉）。 */
   displayMode?: 'full' | 'half';
+  /** 上次用的模型名：启动时接着用它（不在列表里就退回第一项） */
+  modelName?: string;
   /**
    * 前台是全屏应用（游戏/视频/全屏文档）时自动收起桌宠，退出全屏后自动回来。
    * 默认开启：桌宠是 alwaysOnTop，全屏时压在别人画面会很碍事。经托盘手动隐藏过则不再自动弹出。

@@ -131,6 +131,7 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
   // ---- IPC_LOAD_MODEL / IPC_MODEL_LIST -------------------------------------
   ipcMain.handle(IPC_LOAD_MODEL, (_event, name?: unknown): ModelManifest => {
     const manifest = buildModelManifest(deps, typeof name === 'string' ? name : undefined);
+    if (manifest.name) rememberModelName(manifest.name); // 下次启动接着用它
     // 同步当前宠物到 chat：切换模型 → 注入对应人设语料（knowledge/<模型名>.md）并清空旧上下文
     deps.chat.setActiveModel(manifest.name || null);
     deps.onModelChanged?.(manifest.name || 'character');
@@ -1018,11 +1019,45 @@ function resolveVoiceConfig(): {
   };
 }
 
-/** 组装 ModelManifest：默认取模型列表第一项（main 启动即加载默认模型的语义出口） */function buildModelManifest(deps: IpcDeps, requested?: string): ModelManifest {
+/** settings.json 里记住的模型名；读不到/读坏了都返回空（不影响启动） */
+function readSavedModelName(): string {
+  try {
+    const file = path.join(app.getPath('userData'), 'settings.json');
+    if (!fs.existsSync(file)) return '';
+    const root = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')) as Record<string, unknown>;
+    const ai = (root && typeof root.ai === 'object' && root.ai ? root.ai : root) as Record<string, unknown>;
+    const v = ai && ai.modelName;
+    return typeof v === 'string' ? v.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+/** 记住当前模型；**读改写**整个文件，不碰其它键 */
+function rememberModelName(name: string): void {
+  try {
+    const file = path.join(app.getPath('userData'), 'settings.json');
+    let root: Record<string, unknown> = {};
+    if (fs.existsSync(file)) {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')) as unknown;
+      if (parsed && typeof parsed === 'object') root = parsed as Record<string, unknown>;
+    }
+    const ai = (root.ai && typeof root.ai === 'object' ? root.ai : (root.ai = {})) as Record<string, unknown>;
+    if (ai.modelName === name) return;
+    ai.modelName = name;
+    fs.writeFileSync(file, `${JSON.stringify(root, null, 2)}\n`, 'utf8');
+  } catch (err) {
+    console.warn('[ipc] 记住当前模型失败（不影响本次切换）：', err);
+  }
+}
+
+/** 组装 ModelManifest：默认取"上次用的模型"，没有才取列表第一项 */function buildModelManifest(deps: IpcDeps, requested?: string): ModelManifest {
   const resolver = deps.pathResolver;
-  // renderer 可能传空字符串表示"取默认第一项"：空串/空白必须走默认兜底（不能用 ??，它不兜底 ''）
+  // renderer 可能传空字符串表示"取默认"：空串/空白必须走默认兜底（不能用 ??，它不兜底 ''）
   const requestedName = typeof requested === 'string' && requested.trim() ? requested.trim() : '';
-  const name = requestedName || resolver.modelList()[0] || '';
+  const list = resolver.modelList();
+  const saved = readSavedModelName();
+  const name = requestedName || (saved && list.indexOf(saved) >= 0 ? saved : '') || list[0] || '';
   if (!name) {
     console.warn('[ipc] IPC_LOAD_MODEL 无可加载模型（assets/models.json 与目录扫描均为空）');
     return { name: '', url: '', type: 'moc3', model3Path: '' };

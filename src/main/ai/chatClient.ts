@@ -557,6 +557,7 @@ export function loadAppSettings(): AppSettings {
       // 取景（全身/半身）也必须在这里读回来：只加在 sanitizeSettings（写入侧）就会出现
       // "能存进去、重启读不回来"的老坑（confirmTools 当年就是这么失效的）。
       displayMode: ((): 'full' | 'half' => (str('displayMode') === 'half' ? 'half' : 'full'))(),
+    modelName: str('modelName') ?? '',
       // 全屏自动收起：同样必须读回来，否则设置页关了、重启又自动生效
       hideOnFullscreen: bool(true, 'hideOnFullscreen'),
       // 点击穿透：默认关闭（默认开启一旦命中判定有偏差，用户会觉得"桌宠点不动"）
