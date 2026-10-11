@@ -461,45 +461,92 @@
      * 只在 refit 时重测并缓存：取景锚点必须**稳定**，跟着动作每帧变会让画面自己抖。
      */
     let contentRect: { x: number; y: number; w: number; h: number } | null = null;
+    /**
+     * 测量时机：**必须等模型真的画过一帧再量**。
+     * 挂载瞬间 `internalModel.localTransform` 还是单位阵，顶点又还没算过，量出来会是一个
+     * 小得离谱的框；按它适配缩放会把模型放大几百倍、整窗糊成一片（实测踩到）。
+     */
+    let contentRectStale = true;
+    let contentRectTries = 0;
+    const CONTENT_RECT_MAX_TRIES = 40;
+    /** 标定期间临时切到全身（半身会把角色裁出窗口，量不准） */
+    let calibratingInFull = false;
+    let calibrateLogged = false;
 
-    /** 测一次真实内容包围盒；拿不到就返回 null（上层退回画布包围盒，这是第一层预案） */
-    function measureContentRect(): { x: number; y: number; w: number; h: number } | null {
-      try {
-        const im = model && model.internalModel;
-        const core = im && im.coreModel;
-        const lt = im && im.localTransform;
-        if (!core || !lt || typeof core.getDrawableCount !== 'function') return null;
-        if (typeof core.getDrawableVertexPositions !== 'function') return null;
-        const count = core.getDrawableCount() || 0;
-        let minX = Infinity;
-        let minY = Infinity;
-        let maxX = -Infinity;
-        let maxY = -Infinity;
-        let used = 0;
-        for (let d = 0; d < count; d++) {
-          let pos: Any;
-          try { pos = core.getDrawableVertexPositions(d); } catch { continue; }
-          if (!pos || pos.length < 2) continue;
-          used++;
-          for (let i = 0; i + 1 < pos.length; i += 2) {
-            // 模型坐标(y 向上) → 容器局部坐标(y 向下)：用引擎自己的 localTransform，不猜
-            const x = lt.a * pos[i] + lt.c * pos[i + 1] + lt.tx;
-            const y = lt.b * pos[i] + lt.d * pos[i + 1] + lt.ty;
+    /**
+     * 遮罩里不透明像素的归一化包围盒（[x0,y0,x1,y1]，0..1）与像素数；没有遮罩返回 null。
+     * 命中遮罩本来就是"按实际绘制结果取样"，所以它就是**所见即所得**的内容范围。
+     */
+    function maskOpaqueBBox(): { bbox: [number, number, number, number]; opaque: number } | null {
+      const d = maskData as Uint8ClampedArray | null;
+      if (!d) return null;
+      let opaque = 0;
+      let minX = MASK_W;
+      let minY = MASK_H;
+      let maxX = -1;
+      let maxY = -1;
+      for (let y = 0; y < MASK_H; y++) {
+        for (let x = 0; x < MASK_W; x++) {
+          if (d[(y * MASK_W + x) * 4 + 3] > 24) {
+            opaque++;
             if (x < minX) minX = x;
             if (x > maxX) maxX = x;
             if (y < minY) minY = y;
             if (y > maxY) maxY = y;
           }
         }
-        if (!used || !(maxX > minX) || !(maxY > minY)) return null;
-        return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
-      } catch {
-        return null;
       }
+      if (maxX < 0) return null;
+      return { bbox: [minX / MASK_W, minY / MASK_H, (maxX + 1) / MASK_W, (maxY + 1) / MASK_H], opaque };
     }
 
     /**
-     * 取景：缩放 + 定位。**锚在真实内容的中心/顶部**，而不是画布包围盒。
+     * 用**已渲染像素**标定内容锚点（每个模型只做一次）。
+     *
+     * 为什么不用顶点：这台引擎里 `localTransform` 与顶点不同尺 —— 挂载后直接拿它换算，
+     * 内容会量成一个 1x2 的点（实测日志：画布 4206x9802 / 内容 1x2@(0,-1)），
+     * 按它适配缩放会把模型放大几百倍、整窗糊成一片。遮罩是真实绘制结果，不依赖任何内部矩阵。
+     *
+     * 返回的矩形与 `model.position` 同一坐标系（容器局部，y 向下），可直接当取景锚点。
+     */
+    function calibrateAnchorFromMask(): { x: number; y: number; w: number; h: number } | null {
+      const stats = maskOpaqueBBox();
+      if (!stats) return null;
+      const [bx0, by0, bx1, by1] = stats.bbox;
+      // 横向被窗口裁掉（占满整宽）就量不准；纵向被裁是半身的正常现象，不拦
+      if (bx1 - bx0 >= 0.98) return null;
+      const vw = window.innerWidth || 1;
+      const vh = window.innerHeight || 1;
+      const s = model && model.scale ? model.scale.x : 0;
+      const pos = model && model.position;
+      if (!(s > 0) || !pos) return null;
+      return {
+        x: (bx0 * vw - pos.x) / s,
+        y: (by0 * vh - pos.y) / s,
+        w: ((bx1 - bx0) * vw) / s,
+        h: ((by1 - by0) * vh) / s,
+      };
+    }
+
+    /** 量到的内容框是否可信；不可信就继续用画布包围盒兜底 */
+    function isSaneContentRect(r: { x: number; y: number; w: number; h: number } | null): boolean {
+      if (!r) return false;
+      if (![r.x, r.y, r.w, r.h].every((v) => Number.isFinite(v))) return false;
+      if (!(r.w > 0) || !(r.h > 0)) return false;
+      const rw = r.w / natW;
+      const rh = r.h / natH;
+      if (rw < 0.05 || rh < 0.05) return false; // 比画布小两个数量级 → 量歪了
+      if (rw > 1.5 || rh > 1.5) return false; // 比画布还大 → 不可能
+      if (r.x < -natW || r.y < -natH || r.x > natW * 2 || r.y > natH * 2) return false; // 跑得没边
+      return true;
+    }
+
+    /**
+     * 取景：定位 + 缩放。
+     *
+     * **缩放沿用画布包围盒**（与改动前逐字一致）——缩放的基准绝不能换成量出来的内容框：
+     * 内容框一旦量歪，缩放会整档跑飞，模型不是糊满整窗就是缩成一个点（实测踩到过）。
+     * 这里只把**居中的基准**换成真实内容。
      * @param extra 额外缩放（滚轮档位、呼吸）
      * @param bobY  纵向浮动（呼吸上下）
      */
@@ -507,19 +554,27 @@
       if (!model || !natW || !natH) return;
       const vw = window.innerWidth || 1;
       const vh = window.innerHeight || 1;
-      // 参考框：优先真实内容；测不到就退回画布包围盒（第一层预案）
-      const ref = contentRect ?? { x: 0, y: 0, w: natW, h: natH };
-      const s = Math.min((vw * FIT_MARGIN) / ref.w, (vh * FIT_MARGIN) / ref.h) * framingZoom() * extra;
-      model.scale.set(s);
-      const cx = (ref.x + ref.w / 2) * s; // 内容中心相对容器原点的偏移
-      const top = ref.y * s;              // 内容顶部相对容器原点的偏移
-      if (framingMode === 'half') {
-        // 半身：横向居中对准内容中心；纵向把**头顶**顶到窗口上沿附近（脚被裁掉是对的）
-        model.position.set(vw / 2 - cx, vh * HALF_TOP_PAD_RATIO - top + bobY);
-      } else {
+      const s = Math.min((vw * FIT_MARGIN) / natW, (vh * FIT_MARGIN) / natH) * framingZoom() * extra;
+      if (!Number.isFinite(s) || s <= 0) return;
+      const bbox = { x: 0, y: 0, w: natW, h: natH };
+      /** 按给定锚点算容器位置 */
+      const placeWith = (a: { x: number; y: number; w: number; h: number }) => {
+        const cx = (a.x + a.w / 2) * s; // 锚点中心相对容器原点的偏移
+        if (framingMode === 'half') {
+          // 半身：横向对准内容中心；纵向把**头顶**顶到窗口上沿附近（脚被裁掉是对的）
+          return { x: vw / 2 - cx, y: vh * HALF_TOP_PAD_RATIO - a.y * s + bobY };
+        }
         // 全身：整个内容居中（不再被画布留白带偏）
-        model.position.set(vw / 2 - cx, vh / 2 - (ref.y + ref.h / 2) * s + bobY);
-      }
+        return { x: vw / 2 - cx, y: vh / 2 - (a.y + a.h / 2) * s + bobY };
+      };
+      /** 位置必须让角色还落在窗口附近，否则说明锚点不可信 */
+      const nearWindow = (p: { x: number; y: number }) =>
+        Number.isFinite(p.x) && Number.isFinite(p.y) && Math.abs(p.x) <= vw * 3 && Math.abs(p.y) <= vh * 3;
+      let pos = placeWith(contentRect ?? bbox);
+      if (!nearWindow(pos) && contentRect) pos = placeWith(bbox); // 锚点不可信 → 退回画布包围盒
+      if (!nearWindow(pos)) return; // 两个都不行就别动，保持上一帧（宁可不动也不能把模型甩出去）
+      model.scale.set(s);
+      model.position.set(pos.x, pos.y);
     }
     /**
      * 命中遮罩（点击穿透用）：把画布**降采样**成一张小位图缓存起来，
@@ -620,7 +675,7 @@
         natW = model.width || 0;
         natH = model.height || 0;
         if (!natW || !natH) return;
-        contentRect = measureContentRect(); // 重测真实内容（refit 很少发生，开销可接受）
+        // 内容锚点的标定推迟到"画过一帧、拿到遮罩之后"（见 update）；这里只负责摆位
         frameModel(1, 0);
       } catch (err) {
         console.warn('[live2d] moc3 refit 失败', err);
@@ -1328,6 +1383,51 @@
               if (breathParamOK) {
                 setBaseParam(paramIds.breath, (Math.sin(nowSec * 1.22 + phase * 2.1) * 0.5 + 0.5) * 0.8 + 0.1);
               }
+              // 内容锚点标定（每个模型只做一次）：
+              // ① 半身会把角色裁出窗口、量不准 → 先临时切全身摆一帧（肉眼看不到这一帧）
+              // ② 用命中遮罩（真实绘制结果）量内容范围，量到就换成内容锚点
+              // ③ 一直量不到就老实退回画布包围盒（=改动前的行为）
+              if (contentRectStale && renderedThisFrame) {
+                contentRectTries += 1;
+                if (framingMode === 'half') {
+                  framingMode = 'full';
+                  calibratingInFull = true;
+                  frameModel(breathe * Math.pow(1.08, zoomSteps), bob);
+                  refreshHitMask(); // 让这一帧的绘制被取样，下一帧再量
+                } else {
+                  const measured = calibrateAnchorFromMask();
+                  const ok = isSaneContentRect(measured);
+                  if (!calibrateLogged) {
+                    calibrateLogged = true;
+                    // 只打一次：取景异常时必须能从这里看出"量到了什么"
+                    console.log(
+                      `[live2d] 内容锚点: 画布=${Math.round(natW)}x${Math.round(natH)} ` +
+                        `内容=${measured ? `${Math.round(measured.w)}x${Math.round(measured.h)}@(${Math.round(measured.x)},${Math.round(measured.y)})` : 'null'} ` +
+                        `→ ${ok ? '采用' : '退回包围盒'}`
+                    );
+                  }
+                  if (ok && measured) {
+                    contentRect = measured;
+                    contentRectStale = false;
+                    if (calibratingInFull) {
+                      framingMode = 'half'; // 量完了，恢复用户选的取景
+                      calibratingInFull = false;
+                    }
+                    frameModel(breathe * Math.pow(1.08, zoomSteps), bob); // 立刻按新锚点重排
+                  } else {
+                    refreshHitMask(); // 遮罩可能还是空的/过期的：刷新后下一帧再试
+                    if (contentRectTries >= CONTENT_RECT_MAX_TRIES) {
+                      contentRectStale = false;
+                      if (calibratingInFull) {
+                        framingMode = 'half';
+                        calibratingInFull = false;
+                        frameModel(breathe * Math.pow(1.08, zoomSteps), bob);
+                      }
+                      console.warn('[live2d] 内容锚点标定失败，取景退回画布包围盒');
+                    }
+                  }
+                }
+              }
               // 追踪 / 语音层：按权重在基座值上混合；层过期后自动衰减，回到鼠标跟随（无设备时零副作用）
               const tracked = mixer.sample();
               if (tracked.size) {
@@ -1360,25 +1460,13 @@
            * 而不是靠几个采样点猜。data 为 null 时返回 available:false。
            */
           hitMaskStats(): { available: boolean; opaque: number; bbox: [number, number, number, number] | null; ageMs: number | null } {
-            const d = maskData as Uint8ClampedArray | null;
-            if (!d) return { available: false, opaque: 0, bbox: null, ageMs: null };
-            let opaque = 0;
-            let minX = MASK_W, minY = MASK_H, maxX = -1, maxY = -1;
-            for (let y = 0; y < MASK_H; y++) {
-              for (let x = 0; x < MASK_W; x++) {
-                if (d[(y * MASK_W + x) * 4 + 3] > 24) {
-                  opaque++;
-                  if (x < minX) minX = x;
-                  if (x > maxX) maxX = x;
-                  if (y < minY) minY = y;
-                  if (y > maxY) maxY = y;
-                }
-              }
-            }
-            const bbox: [number, number, number, number] | null = maxX < 0
-              ? null
-              : [minX / MASK_W, minY / MASK_H, (maxX + 1) / MASK_W, (maxY + 1) / MASK_H];
-            return { available: true, opaque, bbox, ageMs: maskAt ? Math.round(performance.now() - maskAt) : null };
+            const s = maskOpaqueBBox();
+            return {
+              available: true,
+              opaque: s ? s.opaque : 0,
+              bbox: s ? s.bbox : null,
+              ageMs: maskAt ? Math.round(performance.now() - maskAt) : null,
+            };
           },
           /**
            * 模型内容包围盒实测：遍历可绘制网格的顶点，算出**真实内容**的范围，
