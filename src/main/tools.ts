@@ -1,6 +1,6 @@
 // src/main/tools.ts —— 聊天→本地工具（待办清单 / 提醒闹钟）
 // 数据存 app.getPath('userData')/pet-tools.json（个人配置留在本机，不随项目迁移）。
-// 未识别的意图返回 null，交给原 AI 聊天流程。
+// 未识别的意图返回 null，交给聊天流程。
 import * as fs from 'fs';
 import * as path from 'path';
 import { app } from 'electron';

@@ -772,7 +772,7 @@ export class ChatClient {
   private toolExecutor: ToolExecutor | null = null; // 由 main 注入（本地工具执行）
   /** 技能清单提示（main 注入，附加到 system prompt） */
   private skillCatalog = '';
-  /** 用量统计（参考 cost-tracker 精简版） */
+  /** 用量统计 */
   private usageStats = { requests: 0, promptTokens: 0, completionTokens: 0, lastModel: '', lastAt: 0 };
   /** 服务端不支持 enable_thinking 时置位，后续不再携带该参数 */
   private thinkingDisabled = false;
