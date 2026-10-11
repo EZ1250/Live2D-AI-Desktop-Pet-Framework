@@ -469,8 +469,6 @@
     let contentRectStale = true;
     let contentRectTries = 0;
     const CONTENT_RECT_MAX_TRIES = 40;
-    /** 头部参数没接线时的整体横移兜底（像素）：frameModel 读它，moc3 分支每帧写它 */
-    let fallbackSlideX = 0;
     /** 标定期间临时切到全身（半身会把角色裁出窗口，量不准） */
     let calibratingInFull = false;
     let calibrateLogged = false;
@@ -575,8 +573,6 @@
       let pos = placeWith(contentRect ?? bbox);
       if (!nearWindow(pos) && contentRect) pos = placeWith(bbox); // 锚点不可信 → 退回画布包围盒
       if (!nearWindow(pos)) return; // 两个都不行就别动，保持上一帧（宁可不动也不能把模型甩出去）
-      pos.x += fallbackSlideX; // 头部参数没接线时的兜底跟随（正常情况下恒为 0）
-      if (!nearWindow(pos)) return;
       model.scale.set(s);
       model.position.set(pos.x, pos.y);
     }
@@ -718,7 +714,6 @@
         }
         model = m;
         model.autoUpdate = false; // 由本层 update 手动驱动（与统一 RAF 同步）
-        try { model.autoFocus = false; } catch { /* ignore */ }
         // 交互：Pixi 8 用 eventMode（旧的 interactive 已移除）；两者都设，兼容新旧运行库。
         model.eventMode = 'static';
         model.interactive = true;
@@ -918,12 +913,12 @@
         let headTrackZ = 0;
         const idleMotionAvailable = hasMotionGroup('Idle');
         let headTrackOK = false;
+        /** 身体摆动参数是否可用（不可用就走"整体倾斜"兜底） */
         let bodyTrackOK = false;
         let bodyTrackX = 0;
         let bodyTrackZ = 0;
+        /** 呼吸参数是否可用（可用就交给它，不可用只靠整体缩放呼吸） */
         let breathParamOK = false;
-        const focusCtl = (model && model.internalModel && model.internalModel.focusController) || null;
-        const focusOK = !!(focusCtl && typeof focusCtl.focus === 'function');
         // 追踪层要用到的参数是否存在（缺哪个就只驱动存在的那些，不报错）
         let eyeLOK = false;
         let eyeROK = false;
@@ -948,56 +943,6 @@
           mouthOpenOK = paramLimit(paramIds.mouthOpenY) > 0;
           mouthFormOK = paramLimit(paramIds.mouthForm) > 0;
         };
-        /**
-         * 顶点校验和：参数一动，顶点必动。
-         *
-         * 为什么不用"参数存不存在"判断：cdi3.json 里的标准参数名是导出工具**照抄的一份名表**，
-         * 模型完全可以有这个参数却没把它接到变形器上（实测有模型自己的动作只驱动
-         * Param12/13/14/65 这类自定义编号，ParamAngleX/Y/Z 只有名字没有接线）。这种参数
-         * addParameterValueById 写了也毫无反应，靠名字根本分辨不出来 —— 只能看顶点。
-         */
-        const vertexChecksum = (core: Any): number => {
-          let sum = 0;
-          const n = core.getDrawableCount() || 0;
-          for (let d = 0; d < n; d++) {
-            let pos: Any;
-            try { pos = core.getDrawableVertexPositions(d); } catch { continue; }
-            if (!pos) continue;
-            for (let i = 0; i + 1 < pos.length; i += 2) sum += pos[i] * 1.37 + pos[i + 1] * 2.71;
-          }
-          return sum;
-        };
-        /**
-         * 参数是否真的接在模型上：推到 min / max 各算一次，比顶点有没有变。
-         * 同步完成（不占帧），完事把原值写回去，不给引擎留脏状态。
-         */
-        const paramIsWired = (core: Any, key: ParamKey): boolean => {
-          try {
-            const id = paramIds[key];
-            const lim = paramLimit(id);
-            if (!(lim > 0)) return false;
-            if (typeof core.setParameterValueById !== 'function' || typeof core.update !== 'function') return false;
-            const original = typeof core.getParameterValueById === 'function' ? core.getParameterValueById(id) : 0;
-            core.setParameterValueById(id, -lim);
-            core.update();
-            const a = vertexChecksum(core);
-            core.setParameterValueById(id, lim);
-            core.update();
-            const b = vertexChecksum(core);
-            core.setParameterValueById(id, original);
-            core.update();
-            return Math.abs(a - b) > 1e-4;
-          } catch {
-            return false;
-          }
-        };
-        /** 各追踪参数的"接线"体检结果 */
-        const WIRED_KEYS: ParamKey[] = ['angleX', 'angleY', 'angleZ', 'eyeBallX', 'eyeBallY', 'bodyX', 'breath', 'mouthOpenY', 'eyeLOpen'];
-        /** 对照参数：嘴/眼一定会形变。它们都测不到变化 → 探针本身不可信，结论作废 */
-        const CONTROL_KEYS: ParamKey[] = ['mouthOpenY', 'eyeLOpen'];
-        const wired: Partial<Record<ParamKey, boolean>> = {};
-        let headWired = true;
-        let probeTrustworthy = false;
         resolveParams();
         // 新框架（Cubism 5 / untitled-engine）在挂载瞬间 `_parameterValues` 可能还是空的，
         // 那一刻解析会得出"全部参数都不存在"；前若干帧再解析几次补上（幂等，最多 12 次）。
@@ -1398,8 +1343,8 @@
             try {
               // 取景：fit × 取景 × 呼吸 × 滚轮档位，锚在真实可见内容上（见 frameModel）
               frameModel(breathe * Math.pow(1.08, zoomSteps), bob);
-              model.rotation = ((waveDeg + (focusOK || bodyTrackOK ? 0 : eSway)) * Math.PI) / 180;
-              if (focusOK) focusCtl.focus(gazeTX, gazeTY);
+              // 身体摆动·第二层预案：模型没有身体参数时，靠整体倾斜补偿，保证"一定在动"
+              if (!bodyTrackOK) model.rotation = (swayDeg * Math.PI) / 180;
               if (typeof model.update === 'function') model.update(deltaSec * 1000);
 
               // —— 视线跟踪（moc3，明显跟随）：写在 model.update 之后（避免被 Idle 动作帧覆盖）；
@@ -1415,30 +1360,28 @@
               headCX += (gazeCX - headCX) * hk;
               headCY += (gazeCY - headCY) * hk;
               const bodyCX = headCX * 0.55; // 身体比头更滞后、幅度更小
-              // 头部没接线时，参数怎么驱动都不动 —— 只能用整体横移做出"看着鼠标"的感觉。
-              // 探针不可信时一律不兜底（宁可什么都不做，也不能给本来正常的模型加一层假动作）。
-              fallbackSlideX = !probeTrustworthy || headWired ? 0 : headCX * 14;
-              if (!focusOK) {
-                if (gazeCX !== 0 || gazeCY !== 0) {
-                  // AngleX=左右，AngleY=上下；使用较慢的 headC* 保持自然滞后。
-                  if (headTrackX > 0) setBaseParam(paramIds.angleX, headCX * headTrackX);
-                  if (headTrackY > 0) setBaseParam(paramIds.angleY, headCY * headTrackY);
-                  if (headTrackZ > 0) setBaseParam(paramIds.angleZ, headCX * headTrackZ);
-                  if (eyeBallXOK) setBaseParam(paramIds.eyeBallX, gazeCX);
-                  if (eyeBallYOK) setBaseParam(paramIds.eyeBallY, gazeCY);
-                } else if (headTrackOK && !idleMotionAvailable) {
-                  // 没有原生 Idle 时才补充幅度很小的头部游移。
-                  if (headTrackX > 0) setBaseParam(paramIds.angleX, Math.sin(nowSec * 0.45 + phase * 0.7) * Math.min(headTrackX, 2.2));
-                  if (headTrackY > 0) setBaseParam(paramIds.angleY, Math.sin(nowSec * 0.33 + phase * 1.1) * Math.min(headTrackY, 2.0));
-                  if (headTrackZ > 0) setBaseParam(paramIds.angleZ, Math.sin(nowSec * 0.27 + phase * 0.9) * Math.min(headTrackZ, 2.4));
-                }
-                if (bodyTrackOK) {
-                  if (bodyTrackX > 0) setBaseParam(paramIds.bodyX, bodyCX * bodyTrackX);
-                  if (bodyTrackZ > 0) setBaseParam(paramIds.bodyZ, swayDeg);
-                }
-                if (breathParamOK) {
-                  setBaseParam(paramIds.breath, (Math.sin(nowSec * 1.22 + phase * 2.1) * 0.5 + 0.5) * 0.8 + 0.1);
-                }
+              if (gazeCX !== 0 || gazeCY !== 0) {
+                // AngleX=左右，AngleY=上下；使用较慢的 headC* 保持自然滞后。
+                if (headTrackX > 0) setBaseParam(paramIds.angleX, headCX * headTrackX);
+                if (headTrackY > 0) setBaseParam(paramIds.angleY, headCY * headTrackY);
+                if (headTrackZ > 0) setBaseParam(paramIds.angleZ, headCX * headTrackZ);
+                // 眼球也跟着鼠标动（有该参数才驱动）：只转头不动眼会显得呆
+                if (eyeBallXOK) setBaseParam(paramIds.eyeBallX, gazeCX);
+                if (eyeBallYOK) setBaseParam(paramIds.eyeBallY, gazeCY);
+              } else if (headTrackOK && !idleMotionAvailable) {
+                // 没有原生 Idle 时才补充幅度很小的头部游移。
+                if (headTrackX > 0) setBaseParam(paramIds.angleX, Math.sin(nowSec * 0.45 + phase * 0.7) * Math.min(headTrackX, 2.2));
+                if (headTrackY > 0) setBaseParam(paramIds.angleY, Math.sin(nowSec * 0.33 + phase * 1.1) * Math.min(headTrackY, 2.0));
+                if (headTrackZ > 0) setBaseParam(paramIds.angleZ, Math.sin(nowSec * 0.27 + phase * 0.9) * Math.min(headTrackZ, 2.4));
+              }
+              // 身体摆动·第一层预案：模型有 ParamBodyAngle* → 参数级跟随（跟着物理走，最自然）
+              if (bodyTrackOK) {
+                if (bodyTrackX > 0) setBaseParam(paramIds.bodyX, bodyCX * bodyTrackX);
+                if (bodyTrackZ > 0) setBaseParam(paramIds.bodyZ, swayDeg);
+              }
+              // 呼吸·有 ParamBreath 就交给它，没有则只靠整体缩放呼吸（frameModel 的 breathe）
+              if (breathParamOK) {
+                setBaseParam(paramIds.breath, (Math.sin(nowSec * 1.22 + phase * 2.1) * 0.5 + 0.5) * 0.8 + 0.1);
               }
               // 内容锚点标定（每个模型只做一次）：
               // ① 半身会把角色裁出窗口、量不准 → 先临时切全身摆一帧（肉眼看不到这一帧）
@@ -1595,46 +1538,6 @@
         // 自动进入 Idle 组（若模型有）：让 moc3 自带动画（呼吸/身体微摆）真正动起来，
         // 而不是静止贴图观感；视线参数在 update() 末尾写入，不会被动作帧覆盖。
         if (idleMotionAvailable) startMocMotion('Idle', 0);
-        const breathOK = !!(model && model.internalModel && model.internalModel.breath);
-        log(`追踪来源: 引擎focus=${focusOK ? '有' : '无(退回手动)'} 引擎呼吸=${breathOK ? '有' : '无'} 头部参数=${headTrackOK ? '有' : '无'}`);
-        {
-          const raw = (k: ParamKey): string => {
-            try {
-              const v = paramLimit(paramIds[k]);
-              return Number.isFinite(v) ? String(Math.round(v * 100) / 100) : '?';
-            } catch {
-              return '?';
-            }
-          };
-          log(
-            `追踪参数上限: ${paramIds.angleX}=${raw('angleX')} ${paramIds.angleY}=${raw('angleY')} ${paramIds.angleZ}=${raw('angleZ')} ` +
-              `${paramIds.eyeBallX}=${raw('eyeBallX')} ${paramIds.bodyX}=${raw('bodyX')} ${paramIds.breath}=${raw('breath')}`
-          );
-        }
-        // 接线体检：跑一次就知道这个模型能不能真的跟随（不用逐个翻模型文件）
-        {
-          const core0 = model && model.internalModel && model.internalModel.coreModel;
-          if (core0) {
-            for (const k of WIRED_KEYS) wired[k] = paramIsWired(core0, k);
-            // 先看对照：嘴/眼都测不到变化说明探针在这个时序下拿不到形变，任何结论都不能用
-            probeTrustworthy = CONTROL_KEYS.some((k) => wired[k] === true);
-            headWired = wired.angleX === true || wired.angleY === true;
-            const mark = (k: ParamKey): string => (wired[k] ? '活' : '死');
-            log(
-              `参数活力: 头X=${mark('angleX')} 头Y=${mark('angleY')} 头Z=${mark('angleZ')} ` +
-                `眼球X=${mark('eyeBallX')} 眼球Y=${mark('eyeBallY')} 身体X=${mark('bodyX')} 呼吸=${mark('breath')} ` +
-                `对照(嘴/眼)=${mark('mouthOpenY')}/${mark('eyeLOpen')}`
-            );
-            if (!probeTrustworthy) {
-              console.warn('[live2d] 参数活力探针不可信（对照参数也测不到形变），本次结论作废、不启用兜底跟随');
-            } else if (!headWired) {
-              console.warn(
-                '[live2d] 这个模型的头部参数存在但**没有接线**（名字在 cdi3 里、变形器没接），' +
-                  '引擎 focus 与手动驱动都不会有效果；已退回"整体横移"兜底跟随。'
-              );
-            }
-          }
-        }
         if (headTrackOK) log('头部跟踪参数:', { headTrackX, headTrackY, headTrackZ, ids: paramIds });
         else log('头部跟踪: 当前模型没有头部角度参数', paramIds.angleX, paramIds.angleY, paramIds.angleZ);
         log('moc3 就绪:', modelUrl);
