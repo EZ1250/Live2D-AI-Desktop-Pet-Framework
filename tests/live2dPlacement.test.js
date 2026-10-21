@@ -40,13 +40,14 @@ test('内容框可信：按真实内容居中，缩放仍按画布包围盒算',
 
 test('内容框不可信：退回画布包围盒（角色绝不被摆出窗口）', () => {
   const { __computeMoc3Placement: place } = loadLive2d();
-  // 覆盖越界、过大、过小和非有限值。
+  // 无效情形：小得离谱 / 大得离谱 / 非有限值 / 偏移得没边。
+  // 注意：**不能**再拿"内容超出画布包围盒"当无效 —— 真机上 Hiyori 的正确内容框就在画布
+  // 包围盒之外（见下面那条用例），那是引擎坐标系的原点问题，不是量歪。
   const bogus = [
-    { name: '整体跑到画布右侧外', rect: { x: 800, y: 50, w: 200, h: 400 } },
-    { name: '超出画布下沿', rect: { x: 100, y: 480, w: 200, h: 400 } },
-    { name: '比画布大得多', rect: { x: -900, y: -900, w: 2000, h: 2000 } },
     { name: '小得离谱（挂载瞬间量出来的点）', rect: { x: 0, y: -1, w: 1, h: 2 } },
+    { name: '比画布大得多', rect: { x: -900, y: -900, w: 2000, h: 2000 } },
     { name: '非有限值', rect: { x: Number.NaN, y: 0, w: 200, h: 400 } },
+    { name: '偏移得没边', rect: { x: 5000, y: 50, w: 200, h: 400 } },
   ];
   for (const { name, rect } of bogus) {
     const r = place({ ...VIEW, ...CANVAS, framing: 'full', content: rect });
@@ -61,6 +62,36 @@ test('内容框不可信：退回画布包围盒（角色绝不被摆出窗口�
     const right = r.x + CANVAS.natW * r.scale;
     assert.ok(left > -VIEW.vw * 0.05 && right < VIEW.vw * 1.05, `${name}：画布应基本落在窗口里（${left}..${right}）`);
   }
+});
+
+test('局部原点不在内容左上角（Hiyori 实测形状）：内容框必须被接受并按内容居中', () => {
+  // 真机数值（2026-10-21，Hiyori 在 pixi-live2d 引擎上实测）：
+  //   画布 1211×3778，但真实内容在局部坐标 x≈932..2102 —— **原点并不在内容左上角**，
+  //   `model.width/height` 只给尺寸、不给偏移。
+  // 旧规则"内容必须落在 [0,natW] 内"会把这条**正确**的测量否掉；退回画布包围盒后
+  // 角色只剩右边缘一条（用户看到的"只显示一部分 + 严重偏移"）。这里把它锁死。
+  const { __computeMoc3Placement: place } = loadLive2d();
+  const HIYORI = { natW: 1211.22, natH: 3777.86 };
+  const CONTENT = { x: 932, y: 328, w: 1170, h: 3745 };
+  const vw = 364;
+  const vh = 522;
+
+  const full = place({ vw, vh, ...HIYORI, framing: 'full', content: CONTENT });
+  assert.ok(full);
+  assert.equal(full.used, 'content', '偏移原点的模型必须接受内容框，否则会被摆到窗口外');
+  assert.equal(full.contentRejected, false);
+  const cx = full.x + (CONTENT.x + CONTENT.w / 2) * full.scale;
+  const cy = full.y + (CONTENT.y + CONTENT.h / 2) * full.scale;
+  assert.ok(Math.abs(cx - vw / 2) < 0.5, `全身：内容中心应在窗口水平中间（${cx}）`);
+  assert.ok(Math.abs(cy - vh / 2) < 0.5, `全身：内容中心应在窗口垂直中间（${cy}）`);
+
+  const half = place({ vw, vh, ...HIYORI, framing: 'half', content: CONTENT });
+  assert.ok(half);
+  assert.equal(half.used, 'content');
+  const hcx = half.x + (CONTENT.x + CONTENT.w / 2) * half.scale;
+  assert.ok(Math.abs(hcx - vw / 2) < 0.5, `半身：横向仍应居中（${hcx}）`);
+  const topY = half.y + CONTENT.y * half.scale;
+  assert.ok(Math.abs(topY - vh * 0.04) < 1, `半身：内容顶部应贴窗口上沿附近（${topY}）`);
 });
 
 test('半身取景：缩放 ×2.5、横向仍居中、纵向头顶贴上沿附近', () => {

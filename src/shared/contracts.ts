@@ -693,6 +693,14 @@ export interface AppSettings {
   mailImapPass?: string;
   /** 行为触发映射：行为键 → 触发目标；缺失等价 'auto'，目标不存在则不触发。 */
   motionTriggers?: Partial<Record<BehaviorKey, MotionTriggerValue>>;
+  /**
+   * 行为触发映射（**按模型分开存**）。
+   *
+   * 为什么需要：不同模型的动作组/表情完全不同（白子的「猫咪滤镜」在 Hiyori 上根本不存在）。
+   * 只存一份全局映射时，换个模型这些绑定就全部失效 —— 用户看到的就是"设置没被记住/不生效"。
+   * 现在按模型名分桶保存；`motionTriggers` 保留为旧版兼容的全局回退。
+   */
+  motionTriggersByModel?: Record<string, Partial<Record<BehaviorKey, MotionTriggerValue>>>;
 }
 
 /** 渲染进程类型增强：window.electron 在全局可用。 */

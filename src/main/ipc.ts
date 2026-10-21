@@ -979,15 +979,31 @@ function sanitizeSettings(raw: unknown): AppSettings | null {
     settings.mailImapPass = input.mailImapPass.trim();
   }
   // 行为触发映射：只收合法行为键的字符串值，坏项丢弃（不整体拒绝保存）
-  if (input.motionTriggers !== undefined) {
-    if (input.motionTriggers !== null && typeof input.motionTriggers !== 'object') return null;
-    const raw = (input.motionTriggers ?? {}) as Record<string, unknown>;
+  const cleanTriggerMap = (raw: unknown): Record<string, string> => {
     const cleaned: Record<string, string> = {};
+    if (!raw || typeof raw !== 'object') return cleaned;
+    const src = raw as Record<string, unknown>;
     for (const key of BEHAVIOR_KEYS) {
-      const value = raw[key];
+      const value = src[key];
       if (typeof value === 'string' && value.length <= 120) cleaned[key] = value;
     }
-    settings.motionTriggers = cleaned;
+    return cleaned;
+  };
+  if (input.motionTriggers !== undefined) {
+    if (input.motionTriggers !== null && typeof input.motionTriggers !== 'object') return null;
+    settings.motionTriggers = cleanTriggerMap(input.motionTriggers);
+  }
+  // 行为触发映射（按模型分桶）：换模型不互相覆盖；坏项丢弃
+  if (input.motionTriggersByModel !== undefined) {
+    if (input.motionTriggersByModel !== null && typeof input.motionTriggersByModel !== 'object') return null;
+    const byModel: Record<string, Record<string, string>> = {};
+    for (const [model, map] of Object.entries((input.motionTriggersByModel ?? {}) as Record<string, unknown>)) {
+      const name = String(model).trim();
+      if (!name || name.length > 120) continue;
+      const cleaned = cleanTriggerMap(map);
+      if (Object.keys(cleaned).length) byModel[name] = cleaned;
+    }
+    settings.motionTriggersByModel = byModel;
   }
   // 桌宠窗口位置/尺寸：整数、范围宽松夹取（不合法就整体拒绝保存，与其它字段一致）。
   // 范围只防明显的脏值；"是否在可见显示器内"由 mainImpl 在恢复时判断。

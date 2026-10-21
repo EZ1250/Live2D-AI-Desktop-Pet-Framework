@@ -453,7 +453,11 @@ async function mountManifest(manifest: ModelManifest): Promise<void> {
   // 模型级预设（pet-model.json）：情绪→表情映射 / 取景建议。缺失即 null，行为与从前一致。
   activeModelPreset = manifest.preset ?? null;
   activeModelCapabilities = manifest.preset?.capabilities ?? null;
-  refreshMotionTriggerOptions(); // 模型换了 → 行为下拉里的动作组/表情清单跟着换
+  // ⚠️ 这里**不要**刷新"行为触发"下拉：此时 currentHandle 还是 null（模型正在挂载），
+  // listMotions/listExpressions 只能拿到空清单 → 已保存的绑定会被全部标成
+  // 「（当前模型没有）」，而挂载完成后又没人再刷新，用户会以为"换模型绑定丢了/设置没记住"。
+  // 正确的刷新点在挂载完成之后：调用方 `switchModel` / init 的启动设置块
+  // 都会调 `loadBehaviorTriggers`（内部会 refreshMotionTriggerOptions + populateMotionTriggerSelects）。
   // 体检结果（能渲染 / 有警告 / 不能渲染）：不能渲染时直接用它的文案提示，不再硬加载
   activeModelCompat = manifest.compat ?? null;
   if (manifest.compat && manifest.compat.verdict !== 'ok') {
@@ -1282,12 +1286,59 @@ const COMMAND_TOOLS = new Set(['shell_run', 'shell_bg', 'shell_output', 'shell_k
 /** 行为触发表情后恢复默认的时长 */
 const BEHAVIOR_EXPRESSION_HOLD_MS = 2600;
 
-/** 设置里的行为触发映射 */
+/** 设置里的行为触发映射（当前模型生效的那一份） */
 let motionTriggers: Record<string, string> = {};
+/** 行为触发映射（按模型分桶，保存时合并回去；见 AppSettings.motionTriggersByModel） */
+let motionTriggersByModel: Record<string, Record<string, string>> = {};
 /** 各行为上次触发时刻 */
 const behaviorLastAt: Partial<Record<BehaviorKey, number>> = {};
+/** 已经提醒过"目标在当前模型上不存在"的行为（每种只警告一次，避免刷屏） */
+const behaviorWarned = new Set<BehaviorKey>();
 /** 本轮回复是否已触发过「开始回答」 */
 let aiStartEmitted = false;
+
+/**
+ * 把设置里的触发映射落到"当前模型"上。
+ *
+ * 优先取**按模型分桶**的那一份（`motionTriggersByModel[当前模型]`），没有才退回旧版的全局
+ * `motionTriggers`。这样换模型时各用各的绑定，不会出现"白子的表情在 Hiyori 上全部失效"。
+ */
+function applyBehaviorTriggersFromSettings(settings: AppSettings): void {
+  const byModel = (settings.motionTriggersByModel as Record<string, Record<string, string>> | undefined) ?? {};
+  motionTriggersByModel = byModel;
+  const legacy = (settings.motionTriggers as Record<string, string> | undefined) ?? {};
+  const perModel = activeModelName ? byModel[activeModelName] : undefined;
+  // 没有这个模型自己的桶时，才退回旧版全局映射；且**只在它的目标确实存在于当前模型上**时沿用。
+  // 否则换个模型（例如白子的「猫咪滤镜」在 Hiyori 上不存在）整块都会被标成
+  // 「（当前模型没有）」，看起来就像"设置没被记住"。那种情况当作没配（= 自动）更诚实。
+  let effective = perModel;
+  if (!effective && Object.keys(legacy).length) {
+    const usable = Object.values(legacy).some((value) => resolveTriggerCandidate(String(value ?? '')) !== null);
+    effective = usable ? legacy : {};
+  }
+  motionTriggers = effective ?? {};
+  behaviorWarned.clear(); // 配置变了，允许再警告一次
+  // 设置面板若已经渲染过，下拉的候选与选中值也跟着刷新（没渲染时是空操作）
+  refreshMotionTriggerOptions();
+  populateMotionTriggerSelects();
+}
+
+/**
+ * 载入「行为触发」映射（设置 → 行为触发）。
+ *
+ * ⚠️ 必须**随应用启动就载入**。以前这份映射只在打开设置面板时（populateSettings）才赋值，
+ * 于是"配好之后不打开设置/重启应用"时 `motionTriggers` 一直是空对象 → 每个行为都退回
+ * 'auto' 猜一个目标（多数是 `motion:Idle`，几乎看不出变化），用户配的表情/动作永远不播
+ * —— 表现就是"设置里配了，但实际不触发"。保存设置时也会立刻刷新（见 saveSettings）。
+ */
+async function loadBehaviorTriggers(bridge: RendererBridge | null): Promise<void> {
+  if (!bridge || typeof bridge.getSettings !== 'function') return;
+  try {
+    applyBehaviorTriggersFromSettings(await bridge.getSettings());
+  } catch (err) {
+    console.warn('[renderer] 行为触发映射载入失败（先用自动模式）', err);
+  }
+}
 
 function listCurrentMotions(): string[] {
   return currentHandle && typeof currentHandle.listMotions === 'function' ? currentHandle.listMotions() : [];
@@ -1366,7 +1417,18 @@ function emitBehavior(behavior: BehaviorKey): void {
   if (now - (behaviorLastAt[behavior] ?? 0) < BEHAVIOR_DEBOUNCE_MS[behavior]) return;
   behaviorLastAt[behavior] = now;
   const target = resolveBehaviorTarget(behavior);
-  if (!target) return;
+  if (!target) {
+    // 明确配了目标却解析不出来（换了模型 / 名字写错）：提醒一次，否则就是"配了完全没反应"
+    const raw = (motionTriggers[behavior] ?? 'auto').trim();
+    if (raw && raw !== 'auto' && !behaviorWarned.has(behavior)) {
+      behaviorWarned.add(behavior);
+      console.warn(
+        `[renderer] 行为触发「${BEHAVIOR_LABELS[behavior]}」配的目标 ${raw} 在当前模型上不存在（` +
+          `动作组：${listCurrentMotions().join('/') || '无'}；表情：${listCurrentExpressions().join('/') || '无'}），已跳过`
+      );
+    }
+    return;
+  }
   if (target.kind === 'motion') currentHandle.playMotion?.(target.name);
   else playBehaviorExpression(target.name);
 }
@@ -2672,7 +2734,7 @@ async function toggleFraming(bridge: RendererBridge): Promise<void> {
 
 async function populateSettings(bridge: RendererBridge): Promise<void> {
   const [settings, models] = await Promise.all([bridge.getSettings(), bridge.modelList()]);
-  motionTriggers = (settings.motionTriggers as Record<string, string> | undefined) ?? {};
+  applyBehaviorTriggersFromSettings(settings); // 取"当前模型"那一份绑定并刷新下拉
   renderMotionTriggerRows();
   refreshMotionTriggerOptions();
   populateMotionTriggerSelects();
@@ -2684,6 +2746,19 @@ async function populateSettings(bridge: RendererBridge): Promise<void> {
       option.value = name;
       option.textContent = name;
       modelSelect.appendChild(option);
+    }
+    // ★ 必须把下拉选中值设成"当前真正在用的模型"：
+    //   不设的话它停在列表第一个（例如「神宫白子」），而实际可能在用 Hiyori ——
+    //   用户打开设置就会以为"模型选择没被保存"，这是最容易被当成"设置不持久"的地方。
+    const currentModel = settings.modelName || activeModelName || '';
+    if (currentModel) {
+      if (!Array.from(modelSelect.options).some((o) => o.value === currentModel)) {
+        const option = document.createElement('option');
+        option.value = currentModel;
+        option.textContent = `${currentModel}（当前，不在列表里）`;
+        modelSelect.appendChild(option);
+      }
+      modelSelect.value = currentModel;
     }
   }
   const values: Array<[string, string | number | undefined]> = [
@@ -2929,6 +3004,13 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
     voiceBaseUrl: value('setting-voice-base-url'),
     voiceApiKey: value('setting-voice-api-key'),
     motionTriggers: collectMotionTriggers(),
+    // 行为触发按模型分桶：只更新"当前模型"这一桶，其它模型的绑定原样保留
+    motionTriggersByModel: (() => {
+      const next = { ...motionTriggersByModel };
+      const name = activeModelName || '';
+      if (name) next[name] = collectMotionTriggers();
+      return next;
+    })(),
   };
   setSettingsStatus('保存中…');
   const result = await bridge.setSettings(settings);
@@ -2937,6 +3019,8 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
     return;
   }
   motionTriggers = (settings.motionTriggers as Record<string, string> | undefined) ?? {}; // 行为触发立刻生效
+  motionTriggersByModel = (settings.motionTriggersByModel as Record<string, Record<string, string>> | undefined) ?? motionTriggersByModel;
+  behaviorWarned.clear();
   applySfxSettings(settings); // 音效开关/音量立刻生效（无需重启）
   applyFraming(settings.displayMode === 'half' ? 'half' : 'full'); // 取景立刻生效
   void refreshVoiceStatus(bridge); // 语音状态行跟着更新
@@ -2952,6 +3036,9 @@ async function switchModel(bridge: RendererBridge, modelName: string): Promise<v
     const manifest = await bridge.loadModel(modelName);
     await mountManifest(manifest);
     applyPresetParameterMap(); // 新模型的 parameterMap 立刻生效
+    // 挂载完成后再刷新行为触发：换成新模型自己的绑定 + 新模型的动作组/表情候选
+    // （早于挂载会被标成"当前模型没有"，见 mountManifest 里的注释）
+    await loadBehaviorTriggers(bridge);
     setSettingsStatus(`${modelName} 已切换`);
   } catch (err) {
     setSettingsStatus(`模型切换失败：${(err as Error).message ?? String(err)}`, true);
@@ -4799,6 +4886,30 @@ function installDebugHooks(bridge: RendererBridge): void {
     /** 对话消息区展开/收起（自动化验证状态条几何与窗口高度用） */
     expandChat: (): Any => { setChatCollapsed(bridge, false); return voiceStripDebug(); },
     collapseChat: (): Any => { setChatCollapsed(bridge, true); return voiceStripDebug(); },
+    /**
+     * 行为触发自查（排查"设置里配了但不触发"用）：
+     * 当前映射、模型可用的动作组/表情、每个行为**实际解析出**的目标。
+     * 解析结果是 null 就说明这个绑定在当前模型上没有对应目标。
+     */
+    behaviors: (): Any => ({
+      triggers: { ...motionTriggers },
+      motions: listCurrentMotions(),
+      expressions: listCurrentExpressions(),
+      debounceMs: { ...BEHAVIOR_DEBOUNCE_MS },
+      resolved: Object.fromEntries(BEHAVIOR_KEYS.map((k) => [k, resolveBehaviorTarget(k)])),
+    }),
+    /** 立刻触发一次行为（跳过去抖），用于验证绑定是否生效 */
+    fireBehavior: (name: string): Any => {
+      if (!(BEHAVIOR_KEYS as string[]).includes(name)) return { ok: false, error: `未知行为：${name}` };
+      behaviorLastAt[name as BehaviorKey] = 0;
+      emitBehavior(name as BehaviorKey);
+      return { ok: true, state: { triggers: { ...motionTriggers }, resolved: resolveBehaviorTarget(name as BehaviorKey) } };
+    },
+    /**
+     * 把一个触发值解析成实际目标（排查"这个值在当前模型上到底指什么"用）。
+     * 支持 'motion:<动作组>' / 'expr:<表情>' / 'emotion:<标签>' / 'click' / 'costume'。
+     */
+    resolveTrigger: (candidate: string): Any => resolveTriggerCandidate(String(candidate ?? '')),
     voiceCancel: () => finishVoiceCapture(true),
     /**
      * 只用于视觉验证：往对话里插几条"演示行"（user / pet / tool / failed 各一条）+ 驱动声纹。
@@ -4879,6 +4990,9 @@ async function init(): Promise<void> {
 
   subscribeWindowChanges(bridge);
   chatBridge = bridge; // 聊天记录持久化用
+  // 行为触发映射：**必须在这里载入**（不能只在打开设置面板时）——否则不打开设置/重启后，
+  // 设置里配好的"动作或表情"永远不会播（退回 'auto' 时多数是看不出变化的 Idle）。
+  await loadBehaviorTriggers(bridge);
   installTrackingHub(); // 追踪参数中枢（语音口型 + 文本情感；骨骼/外部追踪预留入口）
   subscribeOptionalPushes(bridge);
   void loadChatLog(bridge); // 渲染历史对话（重启后还能回看）
@@ -4912,6 +5026,8 @@ async function init(): Promise<void> {
       const chosen = bootSettings.displayMode === 'half' ? 'half' : bootSettings.displayMode === 'full' ? 'full' : null;
       applyFraming(chosen ?? (activeModelPreset?.framing === 'half' ? 'half' : 'full'));
       applySfxSettings(bootSettings);
+      // 模型已挂载完成 → 现在才知道它有哪些动作组/表情：把该模型自己的行为触发绑定套上
+      applyBehaviorTriggersFromSettings(bootSettings);
       bootRecord('设置应用完成（角色可见）');
     } catch (err) {
       console.warn('[renderer] 启动时应用设置失败（用默认值）', err);

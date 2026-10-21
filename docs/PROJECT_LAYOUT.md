@@ -422,6 +422,25 @@ API Key 丢了 / 设置改了不生效"——两套配置各改各的，排查�
 `forward: true` 不能省：穿透状态下仍需把鼠标移动事件转给本窗口，否则渲染层收不到探测、
 移回角色身上时永远无法恢复可交互。
 
+## 6.7 取景标定（内容锚点）——"角色只显示一条边/严重偏移"的病根
+
+moc3 取景的居中基准不是画布包围盒，而是从**命中遮罩**量出来的真实内容框（画布留白大的模型
+按包围盒居中会偏）。两条真机教训（2026-10-21，Hiyori 实测）：
+
+1. **遮罩只包含窗口可见部分**。角色一旦被裁掉一块，量出来的内容框就缺一块、中心必然偏；
+   按它摆位就是"启动时角色偏出窗口"。所以标定**必须只在内容完整可见时**采信测量值 ——
+   代码里的做法是 `measure` 阶段强制全身并逐步缩小（`calibExtra ×= 0.55`），
+   直到遮罩四边都不贴窗口边（`CALIB_EDGE_MARGIN`），才把这一帧的量测当作内容框。
+2. **局部原点不一定在内容左上角**：这台引擎里 `model.position` 参照的原点与
+   `model.width/height`（只给尺寸、不给偏移）不是同一个角。Hiyori 画布 1211×3778，
+   真实内容却在局部坐标 `x≈932..2102`。所以**不能**要求"内容框落在 `[0,natW]×[0,natH]` 内"
+   —— 那会把正确测量否掉，退回包围盒后角色只剩右边缘一条（用户看到的"只显示一部分"）。
+
+标定流程（`live2d.ts` 的 `calibPhase`）：`measure`（缩小到完整可见 → 量内容框）→
+`verify`（按内容锚点 fit 摆一帧，复核内容完整可见且居中，偏差 ≤12%）→ `done`（套用户取景）。
+三步都过不去才退回画布包围盒。自查：控制台 `[live2d] 内容锚点标定（measure）…完整可见=true`
+与 `内容锚点复核通过：偏离中心 N×Mpx` 两行就是标定成功的证据。
+
 ## 7. 开发专用代码的边界
 
 - `PET_*` 调试钩子集中在 `src/main/devDebug.js`。入口只有一句条件 require，没设 `PET_*` 时该文件
@@ -517,12 +536,44 @@ API Key 丢了 / 设置改了不生效"——两套配置各改各的，排查�
 > 换网关/换模型前**先点「🎙 自检语音识别」**：它用内置合成音频实测两条路由，是唯一权威结论；
 > `/models` 索引只当参考。相关单测：`tests/voiceModelRanking.test.js`（假 fetch，不联网）。
 
+## 7.4 行为触发（设置里的「行为 → 动作/表情」绑定）
+
+设置页把 6 种行为（用户发消息 / 调用工具 / 执行命令 / 开始回答 / 待机搭话 / 出错）各绑一个
+目标，值形如 `motion:<动作组>` / `expr:<表情>` / `emotion:<标签>` / `click` / `costume`。
+三条铁律：
+
+1. **映射必须随启动载入**（`init()` → `loadBehaviorTriggers`，模型挂载后还会按新模型再载一次）。
+   曾经只在打开设置面板时（`populateSettings`）才赋值，于是"配好之后不打开设置 / 重启应用"时
+   映射是空的，每个行为退回 `'auto'` 猜一个目标（多数是 `motion:Idle`，几乎看不出变化）——
+   用户看到的就是"设置里配了，实际一点都不触发"。
+2. **绑定按模型分桶**（`motionTriggersByModel[模型名]`，旧版全局 `motionTriggers` 只作回退）。
+   不同模型的动作组/表情完全不同（白子的「猫咪滤镜」在 Hiyori 上不存在），只存一份全局映射时
+   换个模型绑定就全失效 —— 那也是"设置没被记住"的典型观感。保存时只更新当前模型这一桶。
+3. **可绑定目标只认模型真实声明的动作组/表情**（`model3.json` 的 `Motions` / `Expressions`
+   经引擎暴露，见 `live2d.ts` 的 `listMotions/listExpressions`）。模型的"能力归类"
+   （`pet-model.json` 的 `capabilities`）只是**建议清单**，不等于可播放。
+4. **解析不到目标不能静默**：`emitBehavior` 对"明确配了但当前模型没有"的绑定只 `console.warn`
+   一次（附上该模型可用的动作组/表情清单），避免"完全没反应又查不出原因"。
+5. **设置页的「模型」下拉必须显示当前模型**（`populateSettings` 里按 `settings.modelName` 设
+   `select.value`；不设就会停在列表第一个，用户以为模型选择没保存）。
+6. **动作组/表情下拉必须在模型挂载完成之后再刷新**。`mountManifest` 里 `currentHandle` 在
+   挂载前还是 null，此时 `refreshMotionTriggerOptions()` 只能拿到空清单，已保存的绑定会被
+   全部标成「（当前模型没有）」；而且挂载完成后没人再刷新 → 用户看到的就是"切回白子仍然
+   显示当前模型没有"。正确时机：`switchModel` 在 `await mountManifest(...)` 之后调
+   `loadBehaviorTriggers`；启动路径在启动设置块里调 `applyBehaviorTriggersFromSettings`。
+   回归测试：`tests/behaviorTriggers.test.js` 的第二条（切模型后标签不得残留）。
+
+自查入口（桌宠窗口控制台）：`__petDebug.behaviors()` 看映射 + 模型可用清单 + 每个行为的解析结果；
+`__petDebug.fireBehavior('user_message')` 立刻触发一次；`__petDebug.resolveTrigger('expr:眼镜')`
+看某个值在当前模型上到底指什么。回归测试：`tests/behaviorTriggers.test.js`（假 DOM + 假 Live2D
+handle 跑真实 `init()`，从推送通道一路断到 `setExpression`）。
+
 ## 8. 自检命令
 
 ```bash
 node scripts/check-model.js "<模型文件夹>"   # 模型能不能渲染
 npm run build:all                            # 类型 + 装配
-npm test                                     # 类型 + 装配 + 单测（IPC 契约 / 声纹 / 语音状态机 / 取景落位 / 转写模型选型）
+npm test                                     # 类型 + 装配 + 单测（IPC 契约 / 声纹 / 语音状态机 / 取景落位 / 转写模型 / 行为触发）
 npm run check:privacy --all                  # 打包前后密钥/隐私闸门
 ```
 

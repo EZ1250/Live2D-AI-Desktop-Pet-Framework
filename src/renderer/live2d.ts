@@ -121,16 +121,20 @@
   const MOC3_FIT_MARGIN = 0.89;
   /** 采用内容锚点的最低要求：内容至少要有这个比例落在窗口里（低于它一律退回画布包围盒） */
   const MIN_VISIBLE_CONTENT_RATIO = 0.25;
-  /** 内容框允许超出画布包围盒的容差（遮罩取样是按 1/128 量化的，边界会有几像素误差） */
-  const CONTENT_IN_CANVAS_SLACK = 0.08;
+  /** 内容框的"别跑得没边"上限（相对画布尺寸的倍数） */
+  const CONTENT_OFFSET_LIMIT = 3;
 
   /**
    * 内容框是否"像真的"（纯函数，可单测）。
    *
-   * 判定依据是**它必须落在画布包围盒里**：内容是从画布上取样的，天然是画布的子集。
-   * 一旦换算用错了帧（遮罩是几帧前抓的、和当时的 position/scale 不一致），算出来的
-   * "局部内容框"就会跑到画布外面去 —— 这正是不该被采用的锚点。放它过去的表现就是
-   * 角色被按错的锚点摆位，直接偏出窗口（实测的"启动时角色向左偏出窗口"）。
+   * ⚠️ 这里**不能**要求"内容框落在 [0, natW]×[0, natH] 内"。
+   * 真机实测（Hiyori，本机 2026-10-21）：画布宽只有 1211，而真实绘制内容在局部坐标
+   * x≈929..2083 —— 也就是说**这个引擎里 model.position 参照的原点并不是画布包围盒的左上角**，
+   * `model.width/height` 只给出尺寸、不给出偏移。按"必须落在画布内"去卡，会把**正确的**
+   * 内容框否掉，退回画布包围盒后角色只剩右边缘一条（用户看到的"只显示一部分 + 严重偏移"）。
+   *
+   * 所以这里只做三件事：数值有限、尺寸量级合理、偏移别跑得没边。
+   * "量得准不准"由**标定流程保证**：只在内容**完整可见（四边不贴窗口边）**时才采信测量值。
    */
   function isContentRectPlausible(
     rect: { x: number; y: number; w: number; h: number } | null | undefined,
@@ -144,13 +148,10 @@
     const rw = rect.w / natW;
     const rh = rect.h / natH;
     if (rw < 0.05 || rh < 0.05) return false; // 比画布小两个数量级 → 量歪了
-    if (rw > 1.5 || rh > 1.5) return false;   // 比画布还大 → 不可能
-    return (
-      rect.x >= -CONTENT_IN_CANVAS_SLACK * natW &&
-      rect.y >= -CONTENT_IN_CANVAS_SLACK * natH &&
-      rect.x + rect.w <= (1 + CONTENT_IN_CANVAS_SLACK) * natW &&
-      rect.y + rect.h <= (1 + CONTENT_IN_CANVAS_SLACK) * natH
-    );
+    if (rw > 2 || rh > 2) return false;       // 比画布大太多 → 不可能
+    if (Math.abs(rect.x) > CONTENT_OFFSET_LIMIT * natW) return false; // 原点偏移得没边
+    if (Math.abs(rect.y) > CONTENT_OFFSET_LIMIT * natH) return false;
+    return true;
   }
 
   interface PlacementInput {
@@ -592,28 +593,36 @@
      * 挂载瞬间 `internalModel.localTransform` 还是单位阵，顶点又还没算过，量出来会是一个
      * 小得离谱的框；按它适配缩放会把模型放大几百倍、整窗糊成一片（实测踩到）。
      */
-    let contentRectStale = true;
-    let contentRectTries = 0;
-    const CONTENT_RECT_MAX_TRIES = 40;
-    /** 标定期间临时切到全身（半身会把角色裁出窗口，量不准） */
-    let calibratingInFull = false;
-    let calibrateLogged = false;
     /**
      * 取样那一帧的模型变换快照（pos/scale + 窗口尺寸）。
      *
-     * 为什么必须存快照：遮罩不是每帧都刷（只有首帧和显式请求时才抓一次），所以"遮罩里的
-     * 内容"和"此刻的 model.position/scale"经常不是同一帧的东西。把两者混着换算，局部坐标
-     * 会算歪 → 内容锚点偏出去 → 角色被摆到窗口外（实测的"启动时角色向左偏出窗口"）。
+     * 为什么必须存快照：遮罩不是每帧都刷（只在首帧/显式请求时抓一次），所以"遮罩里的内容"
+     * 和"此刻的 model.position/scale"经常不是同一帧的东西。混着换算会把局部坐标算歪。
      * 换算一律用**取样当帧**的变换，量出来的锚点才是自洽的。
      */
     let maskFrame: { x: number; y: number; s: number; vw: number; vh: number } | null = null;
     /**
-     * 采用内容锚点后，用**下一帧的真实绘制结果**复核一次：锚点若量歪，角色不会真的落在
-     * 窗口中间，这里能直接看出来并退回画布包围盒（安全的旧行为）。
+     * 内容锚点标定的状态机（每个模型只跑一次）。
+     *
+     * 为什么不能"第一帧直接量"：遮罩里只有**窗口可见部分**。角色一旦被裁掉一块，量出来的
+     * 内容框就缺一块、中心必然偏 —— 按它摆位就是"启动时角色偏出窗口"（最初那条 bug）。
+     * 所以标定分三步：
+     *   measure：强制全身 + 逐步缩小，直到**四边都不贴窗口边**（内容完整可见）才采信测量；
+     *   verify ：用新锚点按 fit 摆一次，复核"内容真的完整可见且居中"；
+     *   done   ：把用户选的取景（全身/半身）套上去，之后正常渲染。
+     * 三步都过不去就退回画布包围盒（改动前的行为，至少不会只剩一条边）。
      */
-    let anchorVerifyPending = false;
-    /** 复核用的偏差上限（占窗口宽的比例）：正常取景下内容中心≈窗口中心 */
-    const ANCHOR_VERIFY_TOLERANCE = 0.14;
+    type CalibPhase = 'measure' | 'verify' | 'done';
+    let calibPhase: CalibPhase = 'measure';
+    /** 标定期间相对 fit 的缩放：内容被裁就乘 0.55 继续缩 */
+    let calibExtra = 0.85;
+    let calibAttempts = 0;
+    const CALIB_MAX_ATTEMPTS = 6;
+    /** 遮罩内容离窗口边至少留这么多（占窗口比例）才算"完整可见" */
+    const CALIB_EDGE_MARGIN = 0.004;
+    /** 复核允许的居中偏差（占窗口尺寸比例） */
+    const CALIB_CENTER_TOLERANCE = 0.12;
+    let calibLogged = false;
 
     /**
      * 遮罩里不透明像素的归一化包围盒（[x0,y0,x1,y1]，0..1）与像素数；没有遮罩返回 null。
@@ -643,27 +652,26 @@
     }
 
     /**
-     * 用**已渲染像素**标定内容锚点（每个模型只做一次）。
+     * 用**已渲染像素**量内容框（每个模型只做一次）。
      *
      * 为什么不用顶点：这台引擎里 `localTransform` 与顶点不同尺 —— 挂载后直接拿它换算，
      * 内容会量成一个 1x2 的点（实测日志：画布 4206x9802 / 内容 1x2@(0,-1)），
      * 按它适配缩放会把模型放大几百倍、整窗糊成一片。遮罩是真实绘制结果，不依赖任何内部矩阵。
      *
      * 换算必须用**取样那一帧**的变换快照（`maskFrame`），不能用此刻的 model.position/scale：
-     * 遮罩可能是好几帧前抓的，混着算会把锚点算歪（见 maskFrame 的注释）。
+     * 遮罩可能是好几帧前抓的，混着算会把锚点算歪。
      *
-     * 返回的矩形与 `model.position` 同一坐标系（容器局部，y 向下），可直接当取景锚点。
+     * 返回 { rect, unclipped }：`unclipped=false` 表示内容贴到了窗口边（被裁），此时 rect 的
+     * 中心**不可信**（缺了一块），只能用来判断"要不要继续缩小"，不能直接采用。
      */
-    function calibrateAnchorFromMask(): { x: number; y: number; w: number; h: number } | null {
+    function measureContentFromMask(): {
+      rect: { x: number; y: number; w: number; h: number };
+      unclipped: boolean;
+      bbox: [number, number, number, number];
+    } | null {
       const stats = maskOpaqueBBox();
       if (!stats) return null;
       const [bx0, by0, bx1, by1] = stats.bbox;
-      // 横向被窗口裁掉（占满整宽）就量不准；纵向被裁是半身的正常现象，不拦
-      if (bx1 - bx0 >= 0.98) return null;
-      // 只有**左右都被窗口切掉**（或一侧贴边另一侧也接近满宽）才会既偏又大：
-      // 单侧被裁时量到的是"可见的那一半"，中心必然偏，采用它就会把角色推出去 → 直接放弃
-      if (bx0 <= 0.005 && bx1 >= 0.9) return null;
-      if (bx1 >= 0.995 && bx0 <= 0.1) return null;
       const f = maskFrame;
       const vw = f ? f.vw : window.innerWidth || 1;
       const vh = f ? f.vh : window.innerHeight || 1;
@@ -671,53 +679,21 @@
       const posX = f ? f.x : (model && model.position ? model.position.x : 0);
       const posY = f ? f.y : (model && model.position ? model.position.y : 0);
       if (!(s > 0)) return null;
+      const m = CALIB_EDGE_MARGIN;
+      const unclipped = bx0 > m && by0 > m && bx1 < 1 - m && by1 < 1 - m;
       return {
-        x: (bx0 * vw - posX) / s,
-        y: (by0 * vh - posY) / s,
-        w: ((bx1 - bx0) * vw) / s,
-        h: ((by1 - by0) * vh) / s,
+        rect: {
+          x: (bx0 * vw - posX) / s,
+          y: (by0 * vh - posY) / s,
+          w: ((bx1 - bx0) * vw) / s,
+          h: ((by1 - by0) * vh) / s,
+        },
+        unclipped,
+        bbox: stats.bbox,
       };
     }
 
-    /**
-     * 内容锚点复核：用**刚取样的那一帧**量内容中心，看它是否真的落在窗口中间。
-     *
-     * 为什么这一步不可省：锚点量歪时，"用它摆位"这件事本身是自洽的 —— 摆完之后角色一定
-     * 不在窗口中间，但代码看着一切正常。只有拿真实绘制结果回头对一次，才能把量歪的锚点抓出来。
-     * 复核不过就退回画布包围盒（改动前的行为，角色一定在窗口里），并停止再标定。
-     */
-    function verifyContentAnchor(): void {
-      if (!anchorVerifyPending) return;
-      anchorVerifyPending = false;
-      const stats = maskOpaqueBBox();
-      if (!stats) return; // 这一帧没数据 → 放弃复核（不冒险改取景）
-      const [bx0, , bx1] = stats.bbox;
-      const vw = window.innerWidth || 1;
-      const center = ((bx0 + bx1) / 2) * vw;
-      const off = Math.abs(center - vw / 2);
-      if (off <= vw * ANCHOR_VERIFY_TOLERANCE) return; // 真的居中 → 锚点可信
-      contentRect = null;
-      contentRectStale = false;
-      console.warn(
-        `[live2d] 内容锚点复核不通过（内容中心偏离窗口中心 ${Math.round(off)}px > ${Math.round(vw * ANCHOR_VERIFY_TOLERANCE)}px）：` +
-          '取景退回画布包围盒，避免角色被摆到窗口外'
-      );
-      refit();
-    }
-
-    /** 量到的内容框是否可信；不可信就继续用画布包围盒兜底（规则与纯函数一致，见 isContentRectPlausible） */
-    function isSaneContentRect(r: { x: number; y: number; w: number; h: number } | null): boolean {
-      if (!isContentRectPlausible(r, natW, natH)) return false;
-      if (!r) return false;
-      if (r.x < -natW || r.y < -natH || r.x > natW * 2 || r.y > natH * 2) return false; // 跑得没边
-      return true;
-    }
-
-    /**
-     * 取景：定位 + 缩放 —— 把决策交给纯函数 computeMoc3Placement（可单测），这里只负责落地。
-     * @param extra 额外缩放（滚轮档位、呼吸）
-     * @param bobY  纵向浮动（呼吸上下）
-     */
+    /** 取景：定位 + 缩放 —— 把决策交给纯函数 computeMoc3Placement（可单测），这里只负责落地。 */
     function frameModel(extra: number, bobY: number): void {
       if (!model || !natW || !natH) return;
       const res = computeMoc3Placement({
@@ -732,9 +708,9 @@
       });
       if (!res) return;
       if (res.contentRejected) {
-        // 内容锚点会把角色摆出窗口：丢掉它并停止再标定（回到画布包围盒 = 改动前的安全行为）
+        // 内容锚点会把角色摆出窗口：丢掉它并回到画布包围盒（安全的旧行为）
         contentRect = null;
-        contentRectStale = false;
+        calibPhase = 'done';
         console.warn('[live2d] 内容锚点会把角色摆出窗口，取景退回画布包围盒');
       }
       model.scale.set(res.scale);
@@ -1510,8 +1486,17 @@
             }
             const swayDeg = eSway + waveDeg;
             try {
-              // 取景：fit × 取景 × 呼吸 × 滚轮档位，锚在真实可见内容上（见 frameModel）
-              frameModel(breathe * Math.pow(1.08, zoomSteps), bob);
+              // 标定期间强制全身（半身会把内容裁出窗口，量不准），并按 calibExtra 逐步缩小
+              const calibrating = calibPhase !== 'done';
+              const savedFraming = framingMode;
+              if (calibrating) framingMode = 'full';
+              try {
+                if (calibrating && calibPhase === 'measure') frameModel(calibExtra, 0);
+                else if (calibrating && calibPhase === 'verify') frameModel(1, 0); // 按 fit 摆，复核是否居中
+                else frameModel(breathe * Math.pow(1.08, zoomSteps), bob);
+              } finally {
+                framingMode = savedFraming;
+              }
               // 身体摆动·第二层预案：模型没有身体参数时，靠整体倾斜补偿，保证"一定在动"
               if (!bodyTrackOK) model.rotation = (swayDeg * Math.PI) / 180;
               if (typeof model.update === 'function') model.update(deltaSec * 1000);
@@ -1552,57 +1537,61 @@
               if (breathParamOK) {
                 setBaseParam(paramIds.breath, (Math.sin(nowSec * 1.22 + phase * 2.1) * 0.5 + 0.5) * 0.8 + 0.1);
               }
-              // 内容锚点标定（每个模型只做一次）：
-              // ① 半身会把角色裁出窗口、量不准 → 先临时切全身摆一帧（肉眼看不到这一帧）
-              // ② 用命中遮罩（真实绘制结果）量内容范围，量到就换成内容锚点
-              // ③ 采用后**用下一帧的真实绘制结果复核一次**（量歪的锚点在这里会被退回画布包围盒）
-              // ④ 一直量不到就老实退回画布包围盒（=改动前的行为）
-              if (contentRectStale && renderedThisFrame) {
-                contentRectTries += 1;
-                if (framingMode === 'half') {
-                  framingMode = 'full';
-                  calibratingInFull = true;
-                  frameModel(breathe * Math.pow(1.08, zoomSteps), bob);
-                  refreshHitMask(); // 让这一帧的绘制被取样，下一帧再量
-                } else {
-                  const measured = calibrateAnchorFromMask();
-                  const ok = isSaneContentRect(measured);
-                  if (!calibrateLogged) {
-                    calibrateLogged = true;
-                    // 只打一次：取景异常时必须能从这里看出"量到了什么"
-                    console.log(
-                      `[live2d] 内容锚点: 画布=${Math.round(natW)}x${Math.round(natH)} ` +
-                        `内容=${measured ? `${Math.round(measured.w)}x${Math.round(measured.h)}@(${Math.round(measured.x)},${Math.round(measured.y)})` : 'null'} ` +
-                        `→ ${ok ? '采用（待复核）' : '退回包围盒'}`
-                    );
-                  }
+              // 内容锚点标定（每个模型只跑一次；状态机见 calibPhase 的注释）
+              if (calibPhase !== 'done' && renderedThisFrame && !maskRefreshQueued) {
+                const measured = measureContentFromMask();
+                if (!calibLogged && measured) {
+                  calibLogged = true;
+                  // 只打一次：取景异常时能从这里看出"量到了什么、在哪个阶段"
+                  console.log(
+                    `[live2d] 内容锚点标定（${calibPhase}）：画布=${Math.round(natW)}x${Math.round(natH)} ` +
+                      `遮罩bbox=${measured.bbox.map((v) => v.toFixed(3)).join(',')} ` +
+                      `内容=${Math.round(measured.rect.w)}x${Math.round(measured.rect.h)}@(${Math.round(measured.rect.x)},${Math.round(measured.rect.y)}) ` +
+                      `完整可见=${measured.unclipped} extra=${calibExtra.toFixed(2)}`
+                  );
+                }
+                if (calibPhase === 'measure') {
+                  const ok = !!measured && measured.unclipped && isContentRectPlausible(measured.rect, natW, natH);
                   if (ok && measured) {
-                    contentRect = measured;
-                    contentRectStale = false;
-                    if (calibratingInFull) {
-                      framingMode = 'half'; // 量完了，恢复用户选的取景
-                      calibratingInFull = false;
-                    }
-                    frameModel(breathe * Math.pow(1.08, zoomSteps), bob); // 立刻按新锚点重排
-                    // 复核：下一帧拿到"按新锚点画出来的结果"，看内容中心是否真的在窗口中间
-                    anchorVerifyPending = true;
+                    contentRect = measured.rect;
+                    calibPhase = 'verify';
+                    refreshHitMask(); // 下一帧按内容锚点 + fit 摆一次，再复核
+                  } else if (calibAttempts < CALIB_MAX_ATTEMPTS) {
+                    calibAttempts += 1;
+                    calibExtra *= 0.55; // 内容被裁 → 缩小再量（缩到足够小必然完整可见）
                     refreshHitMask();
                   } else {
-                    refreshHitMask(); // 遮罩可能还是空的/过期的：刷新后下一帧再试
-                    if (contentRectTries >= CONTENT_RECT_MAX_TRIES) {
-                      contentRectStale = false;
-                      if (calibratingInFull) {
-                        framingMode = 'half';
-                        calibratingInFull = false;
-                        frameModel(breathe * Math.pow(1.08, zoomSteps), bob);
-                      }
-                      console.warn('[live2d] 内容锚点标定失败，取景退回画布包围盒');
-                    }
+                    contentRect = null;
+                    calibPhase = 'done';
+                    console.warn('[live2d] 内容锚点标定失败（内容始终被窗口裁切），取景退回画布包围盒');
+                  }
+                } else if (calibPhase === 'verify') {
+                  // 按内容锚点 + fit 摆过一帧了：内容必须完整可见、且中心落在窗口中间
+                  const vw = window.innerWidth || 1;
+                  const vh = window.innerHeight || 1;
+                  const b = measured && measured.unclipped ? measured.bbox : null;
+                  const offX = b ? Math.abs(((b[0] + b[2]) / 2) * vw - vw / 2) : Infinity;
+                  const offY = b ? Math.abs(((b[1] + b[3]) / 2) * vh - vh / 2) : Infinity;
+                  if (b && offX <= vw * CALIB_CENTER_TOLERANCE && offY <= vh * CALIB_CENTER_TOLERANCE) {
+                    calibPhase = 'done';
+                    console.log(`[live2d] 内容锚点复核通过：偏离中心 ${Math.round(offX)}×${Math.round(offY)}px`);
+                  } else if (calibAttempts < CALIB_MAX_ATTEMPTS) {
+                    // 复核不过：回 measure 换个更小的缩放重来（可能上一轮量的时候还不稳）
+                    calibAttempts += 1;
+                    contentRect = null;
+                    calibPhase = 'measure';
+                    calibExtra = 0.85 * Math.pow(0.55, Math.min(3, calibAttempts));
+                    refreshHitMask();
+                  } else {
+                    contentRect = null;
+                    calibPhase = 'done';
+                    console.warn(
+                      `[live2d] 内容锚点复核不通过（中心偏离 ${Math.round(offX)}×${Math.round(offY)}px），取景退回画布包围盒`
+                    );
                   }
                 }
               }
-              // 复核内容锚点（只用遮罩里的真实绘制结果，不依赖任何内部矩阵）
-              if (anchorVerifyPending && renderedThisFrame && !maskRefreshQueued) verifyContentAnchor();
+
               // 追踪 / 语音层：按权重在基座值上混合；层过期后自动衰减，回到鼠标跟随（无设备时零副作用）
               const tracked = mixer.sample();
               if (tracked.size) {
