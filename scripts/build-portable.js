@@ -174,13 +174,13 @@ for (const [rel, fix] of REQUIRED_DIRS) {
 function runPrivacyCheck(args, label) {
   const cli = path.join(PROJECT_ROOT, 'scripts', 'check-privacy.js');
   if (!fs.existsSync(cli)) {
-    console.warn(`[build-portable] 未找到 scripts/check-privacy.js（跳过${label}隐私检查）`);
-    return true;
+    console.error(`[build-portable] 未找到 scripts/check-privacy.js，无法通过${label}隐私检查`);
+    return false;
   }
   const res = spawnSync(process.execPath, [cli, ...args], { cwd: PROJECT_ROOT, stdio: 'inherit' });
   if (res.error) {
-    console.warn(`[build-portable] 隐私检查启动失败：${res.error.message}`);
-    return true;
+    console.error(`[build-portable] 隐私检查启动失败：${res.error.message}`);
+    return false;
   }
   return res.status === 0;
 }

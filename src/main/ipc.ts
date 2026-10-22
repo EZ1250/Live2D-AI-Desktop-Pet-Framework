@@ -37,6 +37,7 @@ import {
   IPC_LOAD_MODEL,
   IPC_MODEL_LIST,
   IPC_OPEN_PATH,
+  IPC_PET_EVENT,
   IPC_PICK_FOLDER,
   IPC_PLUGIN_REGISTER,
   IPC_SEND_MESSAGE,
@@ -54,6 +55,7 @@ import {
   IPC_VOICE_STATUS,
   IPC_VOICE_TRANSCRIBE,
 } from '../shared/contracts';
+import type { PetEventType } from '../shared/contracts';
 import type { AiModelListResult, AppSettings, AssetImportResult, AssetKind, AssetPresetResult, AssetScanResult, ChatLogEntry, ChatLogSnapshot, ChatWindowResult, ModelManifest, PluginManifest, VoiceCheckResult, VoiceModelIndexResult, VoiceStatusResult, VoiceTranscribeRequest, VoiceTranscribeResult } from '../shared/contracts';
 import type { PathResolver } from './PathResolver';
 import { fetchAvailableModels, loadAppSettings, saveAppSettings, TOOL_DEFS } from './ai/chatClient';
@@ -100,6 +102,8 @@ export interface IpcDeps {
   staticBaseUrl: () => string;
   /** 模型切换成功后的通知（main 侧据此重载离线台词池） */
   onModelChanged?: (modelName: string) => void;
+  /** 宠物交互事件（单击/连点/长拖）→ main 侧触发对应语料分组（带分组冷却） */
+  onPetEvent?: (type: PetEventType) => void;
   /** 聊天→本地工具（待办/提醒闹钟）；route 命中即回执、不调 AI */
   toolbox: ToolBox;
   /**
@@ -142,6 +146,14 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
   });
 
   ipcMain.handle(IPC_MODEL_LIST, (): string[] => deps.pathResolver.modelList());
+
+  // ---- IPC_PET_EVENT：宠物交互事件（单击 / 连点 / 长拖）→ 语料分组 -------------
+  // 冷却与"哪个分组"都放在 main 侧（handleSceneGroup 有分组冷却表），渲染层只管上报动作。
+  ipcMain.on(IPC_PET_EVENT, (_event, type: unknown): void => {
+    if (typeof type !== 'string') return;
+    if (type !== 'click' && type !== 'multiClick' && type !== 'dragLong') return;
+    deps.onPetEvent?.(type);
+  });
 
   // ---- 聊天记录：会话模型（新对话 / 历史查看 / 清空）----
   interface ChatSession {
@@ -992,6 +1004,16 @@ function sanitizeSettings(raw: unknown): AppSettings | null {
   if (input.motionTriggers !== undefined) {
     if (input.motionTriggers !== null && typeof input.motionTriggers !== 'object') return null;
     settings.motionTriggers = cleanTriggerMap(input.motionTriggers);
+  }
+  // 桌宠名字：允许中文/空格，但去掉控制字符并限长（会进 system prompt，不能无限长）
+  if (input.petName !== undefined) {
+    if (input.petName !== null && typeof input.petName !== 'string') return null;
+    const name = String(input.petName ?? '')
+      .replace(/[\u0000-\u001f\u007f]/g, '')
+      .trim()
+      .slice(0, 24);
+    // 空字符串 = 恢复默认叫法（明确清空也要能存进去，所以空值照样写）
+    settings.petName = name;
   }
   // 行为触发映射（按模型分桶）：换模型不互相覆盖；坏项丢弃
   if (input.motionTriggersByModel !== undefined) {

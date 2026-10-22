@@ -59,6 +59,30 @@ test('语音状态条 IPC：契约、preload、主进程、渲染层四处都接
 });
 
 /**
+ * 交互事件通道（单击 / 连点 / 长拖 → 语料分组）：同样必须四处同步。
+ * 这条是 renderer→main 的 fire-and-forget 通道，漏一处不会报错，只会"点了没反应"。
+ */
+test('宠物交互事件 IPC：契约、preload、主进程、渲染层、语料五处都接上了', () => {
+  const name = 'IPC_PET_EVENT';
+  assert.equal(contracts.IPC_PET_EVENT, 'pet:event');
+  for (const file of ['src/shared/contracts.ts', 'src/preload/preload.ts', 'src/main/ipc.ts']) {
+    assert.ok(readSrc(file).includes(name), `${file} 应当引用 ${name}`);
+  }
+  // 渲染层调用方法名；契约/preload 提供
+  for (const file of ['src/shared/contracts.ts', 'src/preload/preload.ts', 'src/renderer/renderer.ts']) {
+    assert.ok(readSrc(file).includes('petEvent'), `${file} 应当提供/调用 petEvent`);
+  }
+  // 主进程：ipc.ts 声明依赖 → mainImpl 注入；三种事件都要映射到语料分组 + 分组冷却
+  assert.ok(readSrc('src/main/ipc.ts').includes('onPetEvent?:'), 'ipc.ts 应声明 onPetEvent 依赖');
+  const main = readSrc('src/main/mainImpl.js');
+  assert.ok(main.includes('onPetEvent:'), 'mainImpl.js 应注入 onPetEvent');
+  for (const group of ['点击宠物', '连续点击', '拖动宠物']) {
+    assert.ok(main.includes(group), `mainImpl.js 应登记语料分组「${group}」`);
+    assert.ok(readSrc('personas/character.offline.txt').includes(`## ${group}`), `语料应包含「## ${group}」小节`);
+  }
+});
+
+/**
  * 状态条的位置与高度是**跨进程约定**：渲染层的 CSS 留出多少，主进程就得把窗口长高多少。
  * 两边数字不一致的表现是"气泡被裁掉/多出一条空白"，很难一眼看出，故在此比一次。
  */

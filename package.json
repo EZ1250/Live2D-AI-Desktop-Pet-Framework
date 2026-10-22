@@ -17,7 +17,7 @@
     "build:all": "npm run build:tsc && npm run assemble",
     "start": "chcp 65001 > nul && electron .",
     "prestart": "npm run build:all",
-    "build": "npm run import && npm run build:tsc && npm run assemble && node scripts/build-portable.js && npm run check:privacy",
+    "build": "npm run import && npm run build:tsc && npm run assemble && node scripts/build-portable.js",
     "dist": "npm run build"
   },
   "dependencies": {

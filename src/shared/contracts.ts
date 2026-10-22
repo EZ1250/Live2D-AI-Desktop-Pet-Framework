@@ -72,6 +72,13 @@ export const IPC_CHAT_WINDOW_OPEN = 'chat:windowOpen';
 export const IPC_CHAT_WINDOW_CLOSE = 'chat:windowClose';
 /** 主进程 push→renderer：独立聊天窗口开/关状态 {open}（桌宠窗口据此收起自己的浮窗与输入条）。 */
 export const IPC_CHAT_WINDOW_STATE = 'chat:windowState';
+/**
+ * renderer→main（fire-and-forget）：宠物交互事件。
+ * 目前用于语料触发：单击 / 连点（>5 次）/ 长拖（>5s）→ 主进程按分组冷却出气泡。
+ */
+export const IPC_PET_EVENT = 'pet:event';
+/** 交互事件类型：单击 / 连点超过 5 次 / 拖动超过 5 秒 */
+export type PetEventType = 'click' | 'multiClick' | 'dragLong';
 /** invoke renderer→main：显示（不存在则创建）思考浮窗——提问时自动打开，也可从 ＋ 菜单手动开。 */
 export const IPC_THINK_WINDOW_SHOW = 'think:windowShow';
 /** invoke renderer→main：收起思考浮窗。 */
@@ -487,10 +494,13 @@ export interface ElectronAPI {
   onBubble?(cb: (payload: { text?: string; ttlMs?: number }) => void): () => void;
   onAction?(cb: (payload: { type?: string; payload?: any }) => void): () => void;
   /**
-   * 订阅主进程轮询推送的全局鼠标屏幕坐标 {x, y}（DIP；鼠标移动才推送），
-   * renderer 用它换算视线目标实现"宠物自动望向鼠标"。
+   * 订阅主进程轮询推送的全局鼠标屏幕坐标 {x, y}（DIP）。
+   * 鼠标移动时推送；鼠标静止时也会每 400ms 心跳推送一次 —— 这样宠物在外面"望着"鼠标时
+   * 不会因为鼠标不动就被判定成"视线过期"而回正（表现为"窗口外不跟踪"）。
    */
   onGlobalCursor?(cb: (pos: { x: number; y: number } | null) => void): () => void;
+  /** 宠物交互事件（单击/连点/长拖）：主进程据此触发对应语料分组；fire-and-forget。 */
+  petEvent?(type: PetEventType): void;
   /** 左键拖拽移动窗口：增量 DIP 坐标（fire-and-forget，拖拽高频用 ipcRenderer.send）。 */
   moveWindow(dx: number, dy: number): void;
   /** 拖拽结束通知（主进程预留收尾）。 */
@@ -693,6 +703,8 @@ export interface AppSettings {
   mailImapPass?: string;
   /** 行为触发映射：行为键 → 触发目标；缺失等价 'auto'，目标不存在则不触发。 */
   motionTriggers?: Partial<Record<BehaviorKey, MotionTriggerValue>>;
+  /** 桌宠名字（用户在设置里可改）：注入人设（AI 自称）、问候语与输入框提示。空 = 用默认。 */
+  petName?: string;
   /**
    * 行为触发映射（**按模型分开存**）。
    *

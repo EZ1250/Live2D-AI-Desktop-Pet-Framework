@@ -457,12 +457,24 @@ body.is-dragover #stage::after {
   justify-content: space-between;
   flex: none; /* 标题常驻面板顶部，不随表单滚动 */
   margin-bottom: 10px;
+  /* 标题栏也作为窗口拖动区（面板几乎铺满窗口，只靠边缘拖动条不好抓） */
+  -webkit-app-region: drag;
+  app-region: drag;
+  cursor: move;
+}
+
+.settings-header .icon-button,
+.settings-header #settings-close {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+  cursor: pointer;
 }
 
 .settings-header h1 {
   font-size: 17px;
   font-weight: 600;
 }
+
 
 .icon-button {
   border: 0;
@@ -489,6 +501,9 @@ body.is-dragover #stage::after {
   /* 外层面板已经是 overflow:hidden，这里再挡住"滚动链"：内嵌模型列表滚到底继续滚时，
      不会把滚动传给外层窗口/看板（外部审查提醒的点，实测手滑多滚一格会带动整页）。 */
   overscroll-behavior: contain;
+  padding-right: 2px;
+}
+
   scrollbar-width: thin;
   padding-right: 2px;
 }

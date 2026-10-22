@@ -46,6 +46,7 @@ import {
   IPC_ON_WINDOW_CHANGE,
   IPC_OPEN_PATH,
   IPC_PET_BOUNDS,
+  IPC_PET_EVENT,
   IPC_PICK_FOLDER,
   IPC_PLAN_PUSH,
   IPC_PLUGIN_REGISTER,
@@ -74,6 +75,7 @@ import type {
   ModelManifest,
   PluginManifest,
   AppSettings,
+  PetEventType,
   ChatLogEntry,
   ChatLogSnapshot,
   ChatWindowResult,
@@ -219,6 +221,11 @@ const api: ElectronAPI = {
   /** 拖拽结束（预留）。 */
   endWindowDrag() {
     ipcRenderer.send(IPC_WINDOW_DRAG_END);
+  },
+
+  /** 宠物交互事件（单击 / 连点 / 长拖）：主进程据此触发对应语料。 */
+  petEvent(type: PetEventType) {
+    if (typeof type === 'string') ipcRenderer.send(IPC_PET_EVENT, type);
   },
 
   /** 待办笔记本：读取列表。 */

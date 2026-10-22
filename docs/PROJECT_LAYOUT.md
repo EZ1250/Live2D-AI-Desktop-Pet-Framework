@@ -67,7 +67,7 @@ src/
 | `import-model.js` | 导入模型/语料/技能到 `public/assets` | ✅ `npm run import` / `npm run build` |
 | `assemble-renderer.js` | 把 `src/renderer` 拼成 `public/renderer` | ✅ `npm run assemble` / `build:all` |
 | `build-portable.js` | 调 electron-builder 出 nsis + portable，并生成 `README_PORTABLE.md` | ✅ `npm run build` |
-| `check-privacy.js` | 扫描源码、生成物和打包产物中的隐私文件与密钥 | ✅ `npm run check:privacy`（`build` 完成打包后自动调用） |
+| `check-privacy.js` | 扫描源码、生成物和打包产物中的隐私文件与密钥 | ✅ `npm run check:privacy`（`build-portable.js` 在打包前后自动调用） |
 | `check-model.js` | 体检单个模型能否被当前运行库渲染 | 手动：`node scripts/check-model.js "<模型目录>"` |
 | `import-bundled-whale.js` | 从内置立绘重生成 `local-assets/大肥鱼/` | 手动（一次性）；**别删**：它是该资产的唯一再生成途径 |
 | `migrate-models-to-userdata.js` | 把随包模型迁到用户数据目录 | `import-model.js` 导入完成后自动调用，也可手动运行 |
@@ -567,6 +567,103 @@ moc3 取景的居中基准不是画布包围盒，而是从**命中遮罩**量�
 `__petDebug.fireBehavior('user_message')` 立刻触发一次；`__petDebug.resolveTrigger('expr:眼镜')`
 看某个值在当前模型上到底指什么。回归测试：`tests/behaviorTriggers.test.js`（假 DOM + 假 Live2D
 handle 跑真实 `init()`，从推送通道一路断到 `setExpression`）。
+
+## 7.5 交互反馈（点击/连点/长拖）、桌宠名字、窗口外视线追踪
+
+**① 交互事件 → 语料**：渲染层在 `installWindowInteractions` 里识别三种交互，经新通道
+`IPC_PET_EVENT`（`pet:event`，fire-and-forget）上报，主进程 `handleSceneGroup` 按分组冷却出气泡：
+
+| 事件 | 判定 | 语料分组 | 组冷却 |
+|---|---|---|---|
+| `click` | 左键单击（未拖动、非 UI 区） | `点击宠物` | 10s |
+| `multiClick` | 2.5s 窗口内第 6 次点击（"超过 5 次"） | `连续点击` | 20s |
+| `dragLong` | 同一次拖动持续 >5s（越过 3px 拖拽阈值后才计时） | `拖动宠物` | 20s |
+
+三条实现约定：
+- 冷却用 `SCENE_GROUP_GAP_OVERRIDE_MS` 覆盖默认 25s；**交互反馈走 `pushBubble(..., {instant:true})`**，
+  否则会被"任意两次气泡间隔 8s"节流吃掉（连点第 6 下通常就在单击气泡后 1~2s）。
+- 分组名要同时登记进 `GROUP_SYNONYMS`（否则 docs §5 说的"触发键漂移"检查会认为没登记）。
+- 语料写在 `personas/character.offline.txt` 的 `## 点击宠物 / ## 连续点击 / ## 拖动宠物` 小节；
+  `tests/contracts.test.js` 会核对通道四处同步 + 这三个分组和语料小节都存在。
+
+**② 桌宠名字**：设置项 `petName`（设置页第一行，≤24 字，留空 = 用模型名）。作用三处：
+注入 AI system prompt（`chatClient.buildSystemPrompt` 的 nameLine，被问"你叫什么"以它为准）、
+启动/切换模型时的问候语、聊天输入框 placeholder。改名保存后立即生效（不需要重启）。
+
+> ⚠️ **新增设置项要补三处**，漏一处就是"能存进去、重启读不回来"（本项第一版就漏了第三处）：
+> ① `contracts.ts` 的 `AppSettings`；② `ipc.ts` 的 `sanitizeSettings`（写入侧）；③
+> **`chatClient.ts` 的 `loadAppSettings`（读取侧白名单，`getSettings()` 就返回它）**。
+> 读取侧是显式列字段的，不加就永远读不回 —— 设置页输入框重开变空、AI 也不认名字，都是这个原因。
+
+**③ 窗口外视线追踪**：视线目标有两条来源 —— 窗口内 `pointermove`，窗口外主进程推送的
+`IPC_GLOBAL_CURSOR`。链路本身是通的，坑有两个：
+1. **推送只在鼠标移动时发**：鼠标停在窗口外不动，渲染层 3s 后按 `GAZE_IDLE_MS` 判定"视线过期"
+   回正 → 看起来就是"出了窗口就不追踪"。修法：主进程按 `CURSOR_HEARTBEAT_MS`(400ms) 心跳补推
+   （`moved || now - lastCursorPushAt >= 心跳`）。
+2. **幅度太小看不出**：原先半身取景增益 0.42、头部上限 12°，屏幕上只有约 5° 的转动，几乎看不出来
+   （实测截图对比都不明显）。现在 `HEAD_TRACK_MAX_X/Y = 30/20`、半身增益 0.8（≈24°），
+   并且**眼球按满量程驱动**（`gazeCX / framingGazeGain()` 再钳到 ±1）。
+自查：`__petDebug.gaze()` 给出渲染层换算值（nx/ny/是否过期/收到多少次全局推送）和模型实际参数
+（`ParamAngleX/Y`、`ParamEyeBallX/Y`），鼠标停在窗口外时应看到 `stale:false` 且参数非 0
+（半身取景：AngleX≈±24°、EyeBallX≈±1）。
+
+**④ 窗口拖动**：拖动靠窗口四周的 CSS `app-region: drag` 条带（`#drag-top/bottom/left/right`，
+左/右 10px、上 12px、下 16px）。两个坑：
+1. 设置面板 `inset: 10px` 几乎铺满窗口，只剩边缘一条能拖 → `.settings-header` 也做成拖动区
+   （关闭按钮保持 `no-drag`），拖标题即可移动窗口。
+
+## 7.6 四层系统提示词 + 情景提示词（AI 上下文架构）
+
+**① 自带提示词库（随包）**：源文件在 `local-assets/prompts/*.md`，`npm run import` 会原样合并到
+`public/assets/prompts/`，打包后是 `resources/assets/prompts/`。七个文件：
+
+| 文件 | 层 | 内容 |
+|---|---|---|
+| `layer1-identity.md` | 第 1 层 | 身份与边界：桌宠定位、服务场景、硬规则（不碰系统目录/凭证、危险命令拒绝、不编造结果、隐私优先） |
+| `layer2-tools.md` | 第 2 层 | 工具说明：一次只输出一个动作、不猜参数、失败如实说、信息不足先问 |
+| `layer3-context.md` | 第 3 层 | 任务上下文的阅读约定（动态内容由代码填充） |
+| `layer4-phase-{think,act,reflect}.md` | 第 4 层 | 思考 / 行动 / 反思三阶段指令，按思考轮循环切换 |
+| `scenario-template.md` | — | 情景提示词文件的初始模板（写进用户数据目录） |
+
+加载/拼接在 `src/main/ai/promptLayers.ts`（**不 import electron**，路径由调用方传入，便于单测）：
+`loadPromptLibrary(dir)` 逐文件读取、缺失时回退内置兜底；`assembleSystemPrompt()` 固定拼三层；
+`buildPhaseInstruction()` 生成第 4 层；`buildRoundSystemPrompt()` 合成整轮 system。
+主进程在 `bootstrap` 里创建 `promptLibrary` 并 `chat.setPromptLibrary()`。
+
+**② 思考轮循环（状态机，不是 while(true)）**：`chatClient.startChatWithTools` 里维护
+`phase: 'think' | 'act' | 'reflect'`，每轮请求前把第 4 层指令拼到 system 末尾（`messages[0]` 每轮重建）：
+
+```
+行动 → 执行 → 反思（按需）→ 思考 → 行动 …
+```
+
+反思**不是每轮都做**，只在四个时机触发（`nextPhase`）：
+工具执行失败（结果以"工具执行失败/错误"开头、或 exit code 非 0）、连续两轮 thought 高度相似
+（字符二元组重合 ≥0.8，说明卡住）、完成子目标（本轮调了 `plan_update`/`plan_propose`）、
+轮数过半（只校准一次）。其余顺利步骤直接从 observation 进下一轮思考，省 token 也省延迟。
+首轮不强制"先思考不调工具"，保持普通闲聊的响应速度。
+
+**③ 情景提示词（只在本机用户数据目录）**：`src/main/ai/scenario.ts` 维护
+`<userData>/prompts/scenario-prompt.md`（首次启动自动创建，带模板头）。记录三类：
+- `screen`：活动窗口监测（`WindowMonitor.onInfo`，应用名 + 标题 + 是否全屏；同一窗口 3 分钟内不重复记）；
+- `action`：AI 每次工具调用 + 结果摘要（`chatClient` 执行完工具后 `recordAction`）；
+- `event`：场景切换、桌宠互动事件（单击/连点/长拖）。
+
+注入（第 3 层）用**时间衰减**：`weight = 0.5^(age/半衰期)`，默认半衰期 30 分钟；`injectText()` 按
+新→旧排序、标注当前权重（两位小数）、低于 0.05 的丢弃、超出字符预算（默认 1000 字）的旧记录截断。
+所以模型看到的是"用户最近在做什么"的加权摘要，不会把历史全塞进 system prompt，也不会被旧记录带偏。
+
+隐私与安全：
+- 情景提示词**只写 userData**；`ScenarioContext` 有 `mustBeUnder` 护栏，路径越界拒绝写入（只告警不崩）。
+- 记录前统一清洗 `sanitizeScenarioText`：折叠控制字符/换行、脱敏 `sk-…`/`Bearer …`/`api_key=…`/长 hex、单条限长。
+- `scripts/check-privacy.js` 把 `scenario-prompt.md` 加入**禁止进包文件名**：万一被误放进 `public/` 直接构建失败。
+- 自带提示词库本身不含任何个人信息（`tests/promptLayers.test.js` 会扫密钥/本机路径/邮箱）。
+- 开发版与打包版用同一套代码：提示词库随包读 `assets/prompts`，情景记录只在 userData；仓库里不落任何用户数据。
+
+自检：`__petDebug` 之外可直接看日志 `[main] 系统提示词库：随包四层提示词；情景提示词：<路径>`；
+设 `PET_LOG_PROMPT=1` 启动后，每次组装 system prompt 会打印
+`[chat] 系统提示词：<字数>（第 1~3 层）| 情景提示词：<字数或"暂无记录"> | 第 4 层阶段指令按轮注入`。
+`tests/promptLayers.test.js` 与 `tests/scenario.test.js` 覆盖层拼接、阶段指令、衰减权重、预算截断、去重与隐私清洗。
 
 ## 8. 自检命令
 

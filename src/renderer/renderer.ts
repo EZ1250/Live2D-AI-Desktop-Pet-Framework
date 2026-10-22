@@ -57,6 +57,8 @@ interface RenderHandle {
   listMotions?(): string[];
   /** 视线目标 nx/ny ∈[-1,1]，向右/向上为正；0 = 归位 */
   setGaze?(nx: number, ny: number): void;
+  /** 视线跟踪自查（目标值 / 平滑值 / 实际写进模型的参数）：排查"不跟鼠标"用 */
+  gaze?(): Any;
   /** 滚轮缩放：dir=+1 放大 / -1 缩小（moc3/portrait 支持；placeholder 不实现） */
   zoom?(dir: number): void;
   /** 角色在窗口中的实际可见范围（相对窗口顶部 px）；主进程用它把气泡贴在头顶上方 */
@@ -473,7 +475,7 @@ async function mountManifest(manifest: ModelManifest): Promise<void> {
   if (manifest.type === 'portrait') {
     if (url) {
       currentHandle = libMountPortrait(url, name);
-      showBubble(`嗨，我是 ${name}！`, { ttlMs: 3000 });
+      showBubble(`嗨，我是 ${petName || name}！`, { ttlMs: 3000 });
     } else {
       currentHandle = libMountPlaceholder(name, 'portrait 模型缺少图片地址');
     }
@@ -513,7 +515,7 @@ async function mountManifest(manifest: ModelManifest): Promise<void> {
       if (handle) {
         currentHandle = handle;
         flashStatus(`${name} 就绪`);
-        showBubble(`嗨，我是 ${name}！`, { ttlMs: 3000 });
+        showBubble(`嗨，我是 ${petName || name}！`, { ttlMs: 3000 });
         return;
       }
       destroyCurrent(); // mountLive2D 内部失败时可能留下空 canvas
@@ -691,6 +693,8 @@ const GAZE_IDLE_MS = 3000;
 let gazeNX = 0;          // 归一化鼠标偏移 [-1,1]，向右为正
 let gazeNY = 0;          // 向上为正
 let lastGazeMoveAt = 0;  // 0 = 尚未移动/已离开窗口
+let globalCursorPushes = 0; // 主进程推来的全局光标更新次数（自查"窗口外是否还在跟"用）
+let lastGlobalCursorAt = 0; // 最近一次全局光标推送时刻（performance.now 基准）
 
 function updateGazeFromPointer(clientX: number, clientY: number): void {
   const cx = window.innerWidth / 2 || 0.5;
@@ -1035,7 +1039,31 @@ function reportPetBoundsSoon(bridge: RendererBridge | null): void {
   });
 }
 
+/** 当前设置里的桌宠名字（空 = 用模型名）：问候语 / 输入框提示 / 控制台都用它 */
+let petName = '';
+/** 把桌宠名字应用到可见交互上（设置保存后立即生效） */
+function applyPetName(next: string | undefined): void {
+  petName = String(next ?? '').trim().slice(0, 24);
+  const input = elementById<HTMLInputElement>('chat-input');
+  if (input) input.placeholder = petName ? `和${petName}说点什么…` : '输入消息';
+}
+
 function installWindowInteractions(bridge: RendererBridge): void {
+  // —— 交互语料事件：单击 / 连点（>5 次）/ 长拖（>5s）→ 主进程按分组冷却出气泡 ——
+  const CLICK_WINDOW_MS = 2500; // 连点统计窗口（超出就算新的一轮）
+  const MULTI_CLICK_COUNT = 6; // "点击超过 5 次" = 第 6 次触发
+  const LONG_DRAG_MS = 5000; // "拖动超过 5 秒"
+  let clickTimes: number[] = [];
+  let dragStartedAt = 0;
+  let dragLongReported = false;
+  /** 上报一次交互事件（主进程决定是否真的有语料/是否过了冷却） */
+  const reportPetEvent = (type: 'click' | 'multiClick' | 'dragLong'): void => {
+    try {
+      bridge.petEvent?.(type);
+    } catch (err) {
+      console.warn('[renderer] 交互事件上报失败', type, err);
+    }
+  };
   // —— 滚轮缩放：档位 ±1（1.08^n），preventDefault 防页面/隐式滚动；拖拽期间忽略 ——
   let dragging = false;
   let moved = false; // 本次按下是否已超过 3px（用于区分"点击"与"拖拽"）
@@ -1085,6 +1113,8 @@ function installWindowInteractions(bridge: RendererBridge): void {
     if (t && t.closest && t.closest(DRAG_IGNORE_SELECTOR)) return; // 输入/菜单/设置区不拖
     dragging = true;
     moved = false;
+    dragStartedAt = performance.now();
+    dragLongReported = false;
     lastDragX = e.screenX;
     lastDragY = e.screenY;
     lastGazeMoveAt = 0; // 拖拽期间暂停视线跟随
@@ -1101,6 +1131,11 @@ function installWindowInteractions(bridge: RendererBridge): void {
       if (!dragFrame) dragFrame = window.requestAnimationFrame(flushDrag);
       lastDragX = e.screenX;
       lastDragY = e.screenY;
+      // 拖动持续超过 5s → 报一次「拖动宠物」（同一次拖动只报一次，主进程还有 20s 冷却）
+      if (!dragLongReported && performance.now() - dragStartedAt >= LONG_DRAG_MS) {
+        dragLongReported = true;
+        reportPetEvent('dragLong');
+      }
     }
   });
   window.addEventListener('pointerup', (e) => {
@@ -1112,6 +1147,15 @@ function installWindowInteractions(bridge: RendererBridge): void {
     if (e.button !== 0) return;
     const t = e.target as Element | null;
     if (t && t.closest && t.closest(DRAG_IGNORE_SELECTOR)) return;
+    // 交互语料：单击一次 + 连点计数（>5 次报到「连续点击」）
+    const nowMs = performance.now();
+    clickTimes = clickTimes.filter((at) => nowMs - at <= CLICK_WINDOW_MS);
+    clickTimes.push(nowMs);
+    reportPetEvent('click');
+    if (clickTimes.length >= MULTI_CLICK_COUNT) {
+      clickTimes = []; // 报完重置，避免持续点数无限刷
+      reportPetEvent('multiClick');
+    }
     triggerPetTap(e.clientX, e.clientY);
   });
   window.addEventListener('pointercancel', endDrag);
@@ -1935,6 +1979,8 @@ function subscribeOptionalPushes(bridge: RendererBridge): void {
   if (typeof bridge.onGlobalCursor === 'function') {
     bridge.onGlobalCursor((pos) => {
       if (pos && typeof pos.x === 'number' && typeof pos.y === 'number') {
+        globalCursorPushes += 1;
+        lastGlobalCursorAt = performance.now();
         updateGazeFromGlobal(pos.x, pos.y);
       }
     });
@@ -2761,6 +2807,9 @@ async function populateSettings(bridge: RendererBridge): Promise<void> {
       modelSelect.value = currentModel;
     }
   }
+  applyPetName(settings.petName);
+  const petNameInput = elementById<HTMLInputElement>('setting-pet-name');
+  if (petNameInput) petNameInput.value = settings.petName ?? '';
   const values: Array<[string, string | number | undefined]> = [
     ['setting-provider', settings.provider],
     ['setting-base-url', settings.aiBaseUrl],
@@ -3005,6 +3054,7 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
     voiceApiKey: value('setting-voice-api-key'),
     motionTriggers: collectMotionTriggers(),
     // 行为触发按模型分桶：只更新"当前模型"这一桶，其它模型的绑定原样保留
+    petName: value('setting-pet-name').slice(0, 24),
     motionTriggersByModel: (() => {
       const next = { ...motionTriggersByModel };
       const name = activeModelName || '';
@@ -3021,6 +3071,7 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
   motionTriggers = (settings.motionTriggers as Record<string, string> | undefined) ?? {}; // 行为触发立刻生效
   motionTriggersByModel = (settings.motionTriggersByModel as Record<string, Record<string, string>> | undefined) ?? motionTriggersByModel;
   behaviorWarned.clear();
+  applyPetName(settings.petName); // 名字立刻生效（输入框提示/问候语）
   applySfxSettings(settings); // 音效开关/音量立刻生效（无需重启）
   applyFraming(settings.displayMode === 'half' ? 'half' : 'full'); // 取景立刻生效
   void refreshVoiceStatus(bridge); // 语音状态行跟着更新
@@ -4062,6 +4113,7 @@ function showAskBox(bridge: RendererBridge, payload: AskQuestionPayload): void {
 }
 
 function installAskBox(bridge: RendererBridge): void {
+  installDragScroll(elementById<HTMLElement>('ask-question'));
   bridge.onAskQuestion?.((payload) => {
     showAskBox(bridge, payload);
     return hideAskBox;
@@ -4347,6 +4399,30 @@ function installThinkPanel(bridge: RendererBridge): void {
   elementById<HTMLButtonElement>('think-close')?.addEventListener('click', hideThinkPanel);
   elementById<HTMLButtonElement>('think-capsule')?.addEventListener('click', expandThinkPanel);
   installThinkDrag();
+}
+
+/** 滚动容器支持"按住空白处拖动滚动"（滚动条较细时，直接拖内容更符合直觉） */
+function installDragScroll(el: HTMLElement | null): void {
+  if (!el) return;
+  let active = false;
+  let startY = 0;
+  let startTop = 0;
+  el.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    const t = e.target as Element | null;
+    if (t && t.closest && t.closest('input, select, textarea, button, a')) return; // 控件上不拖
+    active = true;
+    startY = e.clientY;
+    startTop = el.scrollTop;
+  });
+  el.addEventListener('pointermove', (e) => {
+    if (!active) return;
+    el.scrollTop = startTop - (e.clientY - startY);
+  });
+  const stop = (): void => { active = false; };
+  el.addEventListener('pointerup', stop);
+  el.addEventListener('pointercancel', stop);
+  window.addEventListener('blur', stop);
 }
 
 function installSettingsUi(bridge: RendererBridge): void {
@@ -4747,6 +4823,7 @@ async function initChatPanel(): Promise<void> {
   // 只取聊天相关 DOM（#stage/#bubble 仍在页面上但被 CSS 隐藏，流式打字逻辑照旧可用）
   grabElements();
 
+  installDragScroll(chatLogEl); // 气泡窗：按住对话区拖动可滚动
   const bridge = await waitForElectron();
   if (bridge) void applyPanelTitle(bridge, '对话');
   if (!bridge) {
@@ -4790,6 +4867,7 @@ async function initThinkPanelWindow(): Promise<void> {
   document.title = '思考过程';
   grabElements();
 
+  installDragScroll(elementById<HTMLElement>('think-list')); // 思考浮窗：按住内容拖动可滚动
   const bridge = await waitForElectron();
   if (bridge) void applyPanelTitle(bridge, '思考过程');
   const list = elementById<HTMLElement>('think-list');
@@ -4946,6 +5024,22 @@ function installDebugHooks(bridge: RendererBridge): void {
     // 参数映射（pet-model.json 的 parameterMap）：运行时改一下，验证"命名不标准的模型"这条路
     setParamMap: (map: Record<string, string>) => currentHandle?.setParameterMap?.(map) ?? null,
     paramInfo: () => currentHandle?.parameterInfo?.() ?? null,
+    /**
+     * 视线跟踪自查：鼠标在窗口内用指针事件、窗口外用主进程推的全局光标。
+     * 这里同时给出"渲染层换算结果"和"模型实际参数"，排查"鼠标在窗口外宠物不跟"时直接看这两组值。
+     */
+    gaze: () => ({
+      renderer: {
+        nx: Math.round(gazeNX * 1000) / 1000,
+        ny: Math.round(gazeNY * 1000) / 1000,
+        stale: !lastGazeMoveAt || performance.now() - lastGazeMoveAt > GAZE_IDLE_MS,
+        sinceMoveMs: lastGazeMoveAt ? Math.round(performance.now() - lastGazeMoveAt) : null,
+        globalCursorPushes,
+        sinceGlobalMs: lastGlobalCursorAt ? Math.round(performance.now() - lastGlobalCursorAt) : null,
+        window: { screenX: window.screenX, screenY: window.screenY, w: window.innerWidth, h: window.innerHeight },
+      },
+      handle: currentHandle?.gaze?.() ?? null,
+    }),
     // 模型预设（pet-model.json 的 emotionMap）：运行时改映射，便于验证"情绪→本模型表情"这条路
     emotionMap: (map?: Record<string, string>) => {
       if (map && typeof map === 'object') {
@@ -5007,6 +5101,7 @@ async function init(): Promise<void> {
   installVoiceInput(); // 按住说话 → 转写 → 填入输入框（不自动发送）
   installChatRowRetry(); // 失败行走"点一行重填"（不自动重发）
   installSettingsUi(bridge);
+  installDragScroll(elementById<HTMLElement>('settings-form'));
 
   bootRecord('bridge 就绪');
   const manifest = await loadDefaultModel(bridge);
@@ -5025,6 +5120,7 @@ async function init(): Promise<void> {
       // 取景优先级：用户在设置里选过 → 用它；没选过 → 用模型预设（pet-model.json）；都没有 → full
       const chosen = bootSettings.displayMode === 'half' ? 'half' : bootSettings.displayMode === 'full' ? 'full' : null;
       applyFraming(chosen ?? (activeModelPreset?.framing === 'half' ? 'half' : 'full'));
+      applyPetName(bootSettings.petName); // 设置里的桌宠名字：问候语/输入框提示立刻用上
       applySfxSettings(bootSettings);
       // 模型已挂载完成 → 现在才知道它有哪些动作组/表情：把该模型自己的行为触发绑定套上
       applyBehaviorTriggersFromSettings(bootSettings);

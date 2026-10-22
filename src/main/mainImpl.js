@@ -75,6 +75,8 @@ const meetingTools_1 = require("./ai/meetingTools");
 const translateTools_1 = require("./ai/translateTools");
 const mailTools_1 = require("./ai/mailTools");
 const windowMonitor_1 = require("./monitor/windowMonitor");
+const promptLayers_1 = require("./ai/promptLayers");
+const scenario_1 = require("./ai/scenario");
 const userAssets_1 = require("./assets/userAssets");
 const ipc_1 = require("./ipc");
 // ------------------------------------------------------------------ 数据目录统一
@@ -132,6 +134,8 @@ const CHAT_BUBBLE_TOP_TOLERANCE = 26;
 const MONITOR_INTERVAL_MS = 2000;
 const PLUGIN_TICK_MS = 50;
 const CURSOR_POLL_MS = 80; // 全局光标轮询周期（视线自动跟随的平滑度）
+/** 鼠标静止时的光标心跳间隔：保证窗口外也一直望着鼠标（渲染层 3s 没更新会回正） */
+const CURSOR_HEARTBEAT_MS = 400;
 // ------------------------------------------------------------------ 模块级状态
 let mainWindow = null;
 /** 对话气泡窗（?panel=chat 的同一个渲染页；小气泡，浮在桌宠上方） */
@@ -155,6 +159,8 @@ let chat = null;
 let registry = null;
 let toolbox = null; // 聊天→本地工具（待办/提醒闹钟）
 let skillBox = null; // 技能库（assets/skills + userData/skills）
+let promptLibrary = null; // 随包四层系统提示词库（assets/prompts）
+let scenario = null; // 情景提示词记录器（只写 userData/prompts，绝不进安装包）
 let tickTimer = null;
 /** activate（macOS）重建窗口所需 */
 let bootRef = null;
@@ -163,6 +169,7 @@ let loadDone = false;
 let sendToRenderer = () => { };
 let cursorTimer = null;
 let lastCursorSent = null;
+    let lastCursorPushAt = 0; // 上次推送 IPC_GLOBAL_CURSOR 的时刻（心跳用）
 /** 用户在确认框里选过"本次会话内不再询问写入类操作"后置为 true（仅内存，重启恢复） */
 let devAutoAllowWrites = false;
 /** 用户选过"本次会话内不再询问任何操作（含命令）"后置为 true（仅内存；危险命令仍会被拦） */
@@ -265,6 +272,15 @@ let lastBubblePushAt = 0;
 const sceneCooldownMs = {};
 const SCENE_BUBBLE_MIN_GAP_MS = 8000; // 任意两次气泡最小间隔
 const SCENE_GROUP_GAP_MS = 25000; // 同组气泡最小间隔
+/**
+ * 交互事件（单击/连点/长拖）→ 语料分组名。
+ * 需求：单击冷却 10s；连点（>5 次）与长拖（>5s）冷却 20s。
+ */
+const PET_EVENT_GROUPS = { click: '点击宠物', multiClick: '连续点击', dragLong: '拖动宠物' };
+/** 组级冷却覆盖（未列出的分组走默认 25s） */
+const SCENE_GROUP_GAP_OVERRIDE_MS = { 点击宠物: 10000, 连续点击: 20000, 拖动宠物: 20000 };
+/** 交互反馈要即时显示：不走"任意两次气泡间隔 8s"的全局节流 */
+const INSTANT_FEEDBACK_GROUPS = new Set(['点击宠物', '连续点击', '拖动宠物']);
 /** 同一条语料的最小复用间隔 */
 const LINE_COOLDOWN_MS = 20 * 60 * 1000;
 /** 语料冷却表：分组+文本 → 上次使用时刻（只存内存） */
@@ -313,14 +329,24 @@ const GROUP_SYNONYMS = {
     早安问候: ['早安与开机问候', '开机问候'],
     深夜护眼: [],
     周末放松: [],
+    // 交互事件（渲染层经 IPC_PET_EVENT 上报）
+    点击宠物: [],
+    连续点击: [],
+    拖动宠物: [],
     社交聊天: [],
     设计创作: [],
     终端命令: [],
     邮件处理: [],
     音乐陪伴: [],
 };
-/** 从 knowledge/<模型名>.offline.txt（回退 character.offline.txt）加载台词池；按行 trim，保留 `## 小节` 分组 */
-function loadOfflinePool(knowledgeDir, modelName) {
+/**
+ * 从 knowledge/<模型名>.offline.txt（回退 character.offline.txt）加载台词池；按行 trim，保留 `## 小节` 分组。
+ *
+ * ⚠️ 必须带**随包兜底**：用户模型目录里常有 knowledge/（放人设 .md），但未必有 offline 台词文件。
+ * 只查 userData 的话，这种机器上台词池会是空的 —— 场景气泡、点击反馈全部静默（实测踩过）。
+ * 顺序：模型目录专属台词 → 模型目录通用台词 → 随包 assets/knowledge 的同类文件。
+ */
+function loadOfflinePool(knowledgeDir, modelName, bundledKnowledgeDir) {
     const readFile = (file) => {
         try {
             const content = fs.readFileSync(file, 'utf8');
@@ -349,10 +375,20 @@ function loadOfflinePool(knowledgeDir, modelName) {
         }
     };
     const safe = path.basename(modelName || 'character') || 'character';
-    offlinePool =
-        readFile(path.join(knowledgeDir, `${safe}.offline.txt`)) ??
-            readFile(path.join(knowledgeDir, 'character.offline.txt')) ??
-            [];
+    const candidates = [
+        path.join(knowledgeDir, `${safe}.offline.txt`),
+        path.join(knowledgeDir, 'character.offline.txt'),
+    ];
+    if (bundledKnowledgeDir) {
+        candidates.push(path.join(bundledKnowledgeDir, `${safe}.offline.txt`), path.join(bundledKnowledgeDir, 'character.offline.txt'));
+    }
+    let pool = null;
+    for (const file of candidates) {
+        pool = readFile(file);
+        if (pool)
+            break;
+    }
+    offlinePool = pool ?? [];
     lineCooldownMs.clear(); // 换人设 → 冷却表重来
     return offlinePool.length > 0;
 }
@@ -418,12 +454,13 @@ function pickLineByGroup(group) {
     });
     return fuzzy.length ? pickFresh(fuzzy, now) : null;
 }
-/** 推送气泡（带 8s 最小间隔节流） */
-function pushBubble(text) {
+/** 推送气泡（带 8s 最小间隔节流；交互反馈用 {instant:true} 绕开） */
+function pushBubble(text, opts = {}) {
     if (!text)
         return;
     const now = Date.now();
-    if (now - lastBubblePushAt < SCENE_BUBBLE_MIN_GAP_MS)
+    // instant：交互反馈（点击/连点/长拖）要即时，绕开全局 8s 气泡间隔
+    if (!opts.instant && now - lastBubblePushAt < SCENE_BUBBLE_MIN_GAP_MS)
         return;
     lastBubblePushAt = now;
     sendToRenderer(contracts_1.IPC_UI_BUBBLE, { text });
@@ -435,12 +472,14 @@ function handleSceneGroup(group) {
         return;
     const now = Date.now();
     const last = sceneCooldownMs[group] ?? 0;
-    if (now - last < SCENE_GROUP_GAP_MS)
+    // 交互事件（点击/连点/长拖）用自定义冷却；其余走默认 25s
+    const gap = SCENE_GROUP_GAP_OVERRIDE_MS[group] ?? SCENE_GROUP_GAP_MS;
+    if (now - last < gap)
         return;
     sceneCooldownMs[group] = now;
     const text = pickLineByGroup(group) ?? randomOfflineLine();
     if (text)
-        pushBubble(text);
+        pushBubble(text, { instant: INSTANT_FEEDBACK_GROUPS.has(group) });
 }
 /** 随机冒泡定时器：首次 2–4min，此后每 6–15min 一句（闲时自言自语，去重上一条并遵守 20min 单条冷却） */
 function startOfflineBubbleTimer() {
@@ -461,7 +500,7 @@ function reloadOfflinePoolForModel(modelName) {
     const resolver = bootRef?.resolver;
     if (!resolver)
         return;
-    loadOfflinePool(resolver.knowledgeDirForModel(modelName || 'character'), modelName || 'character');
+    loadOfflinePool(resolver.knowledgeDirForModel(modelName || 'character'), modelName || 'character', path.join(resolver.assetsRoot(), 'knowledge'));
 }
 // —— 鼠标行为侦测（在光标轮询内累积）——
 const MOUSE_IDLE_MS = 90000; // 静止 90s 视为“鼠标静止”事件
@@ -472,7 +511,7 @@ let lastMouseActiveSceneAt = 0;
 let mouseIdleFired = false;
 /**
  * 全局光标轮询 → IPC_GLOBAL_CURSOR 推送（renderer 据此换算视线目标，
- * 实现"宠物望向鼠标"的自动视线跟随；鼠标移动时才推送，静止不发）。
+ * 实现"宠物望向鼠标"的自动视线跟随；移动时实时推，静止时按心跳补推）。
  */
 function startCursorTracking() {
     if (cursorTimer)
@@ -496,37 +535,43 @@ function startCursorTracking() {
                         handleSceneGroup('鼠标活跃');
                     }
                 }
+            }
+            // 光标推送：移动时实时推；鼠标静止时每 CURSOR_HEARTBEAT_MS 也补一次。
+            // 为什么要有心跳：渲染层的视线目标 3s 没更新就会回正，只在"移动"时推的话，
+            // 鼠标停在窗口外不动 → 宠物看一会儿就不看了（用户报的"窗口外不追踪"）。
+            if (moved || now - lastCursorPushAt >= CURSOR_HEARTBEAT_MS) {
+                lastCursorPushAt = now;
                 sendToRenderer(contracts_1.IPC_GLOBAL_CURSOR, { x: p.x, y: p.y });
-                // 点击穿透：把全局光标换算成"相对客户区"坐标交给渲染层做命中判定；
-                // 光标离开窗口时立刻恢复可交互（否则移回来第一下会点不到）。
-                if (clickThroughEnabled) {
-                    try {
-                        const b = win.getBounds();
-                        const inside = p.x >= b.x && p.x < b.x + b.width && p.y >= b.y && p.y < b.y + b.height;
-                        if (inside) {
-                            const [cw, ch] = win.getContentSize();
-                            // 客户区左上角的屏幕坐标 = 窗口左上角 + 边框内缩（无边框窗口通常为 0）
-                            const cb = win.getContentBounds();
-                            const relX = p.x - cb.x;
-                            const relY = p.y - cb.y;
-                            if (relX >= 0 && relY >= 0 && relX < cw && relY < ch) {
-                                sendToRenderer(contracts_1.IPC_HIT_PROBE, { x: relX, y: relY });
-                            }
-                            else {
-                                resetHitIgnore(win);
-                            }
+            }
+            // 点击穿透：把全局光标换算成"相对客户区"坐标交给渲染层做命中判定；
+            // 光标离开窗口时立刻恢复可交互（否则移回来第一下会点不到）。
+            if (clickThroughEnabled && moved) {
+                try {
+                    const b = win.getBounds();
+                    const inside = p.x >= b.x && p.x < b.x + b.width && p.y >= b.y && p.y < b.y + b.height;
+                    if (inside) {
+                        const [cw, ch] = win.getContentSize();
+                        // 客户区左上角的屏幕坐标 = 窗口左上角 + 边框内缩（无边框窗口通常为 0）
+                        const cb = win.getContentBounds();
+                        const relX = p.x - cb.x;
+                        const relY = p.y - cb.y;
+                        if (relX >= 0 && relY >= 0 && relX < cw && relY < ch) {
+                            sendToRenderer(contracts_1.IPC_HIT_PROBE, { x: relX, y: relY });
                         }
                         else {
                             resetHitIgnore(win);
                         }
                     }
-                    catch {
-                        /* 取几何失败时保守恢复可交互 */
+                    else {
                         resetHitIgnore(win);
                     }
                 }
+                catch {
+                    /* 取几何失败时保守恢复可交互 */
+                    resetHitIgnore(win);
+                }
             }
-            else if (!mouseIdleFired && now - lastMouseMovedAt >= MOUSE_IDLE_MS && now - lastMouseIdleSceneAt >= MOUSE_SCENE_GAP_MS) {
+            if (!moved && !mouseIdleFired && now - lastMouseMovedAt >= MOUSE_IDLE_MS && now - lastMouseIdleSceneAt >= MOUSE_SCENE_GAP_MS) {
                 // 静止超过 90s → “鼠标静止”事件
                 mouseIdleFired = true;
                 lastMouseIdleSceneAt = now;
@@ -1636,10 +1681,25 @@ function scheduleThinkAutoHide() {
 }
 // ------------------------------------------------------------------ 窗口拖拽（renderer 左键拖拽 → 整体移动窗口）
 function registerWindowDragHandlers() {
-    const enforceSize = (win) => {
+    // 拖动期间"锁住当前尺寸"：只锁这次拖动开始时的尺寸，不动 360x520 常量。
+    // 这样用户手动缩放过的窗口拖完还是原尺寸；同时避免 150% DPI 下 setPosition 的
+    // 1~2px 舍入误差在连续拖动里累积（实测拖一次宽度能涨 15~20px）。
+    let dragLockedSize = null;
+    const lockSize = (win) => {
+        if (!dragLockedSize)
+            dragLockedSize = win.getSize();
         const [w, h] = win.getSize();
-        if (w !== WINDOW_WIDTH || h !== WINDOW_HEIGHT)
-            win.setSize(WINDOW_WIDTH, WINDOW_HEIGHT);
+        if (w !== dragLockedSize[0] || h !== dragLockedSize[1])
+            win.setSize(dragLockedSize[0], dragLockedSize[1]);
+    };
+    // 只夹病态尺寸（比显示器工作区还大）；用户缩放的大小要保留
+    const clampSize = (win) => {
+        const b = win.getBounds();
+        const area = electron_1.screen.getDisplayMatching(b).workArea;
+        const width = Math.min(b.width, area.width);
+        const height = Math.min(b.height, area.height);
+        if (width !== b.width || height !== b.height)
+            win.setSize(width, height);
     };
     electron_1.ipcMain.on(contracts_1.IPC_WINDOW_DRAG, (event, payload) => {
         const win = electron_1.BrowserWindow.fromWebContents(event.sender);
@@ -1649,9 +1709,10 @@ function registerWindowDragHandlers() {
         const dy = typeof payload?.dy === 'number' ? Math.round(payload.dy) : 0;
         if (!dx && !dy)
             return;
+        lockSize(win);
         const [x, y] = win.getPosition();
         win.setPosition(x + dx, y + dy);
-        enforceSize(win); // 防御任何路径把窗口改大：拖动过程持续回正为 360x520
+        lockSize(win);
         // 气泡必须"同拍"跟着走：在这里直接跟，而不是等窗口 'move' 事件回来再跟（那样会慢半拍）
         if (win === mainWindow) {
             followPetForBubble();
@@ -1664,8 +1725,11 @@ function registerWindowDragHandlers() {
     });
     electron_1.ipcMain.on(contracts_1.IPC_WINDOW_DRAG_END, (event) => {
         const win = electron_1.BrowserWindow.fromWebContents(event.sender);
-        if (win && !win.isDestroyed())
-            enforceSize(win);
+        if (win && !win.isDestroyed()) {
+            lockSize(win);
+            clampSize(win);
+        }
+        dragLockedSize = null;
     });
     // 渲染层报告角色实际可见范围（挂模型后 / 滚轮缩放后）：气泡窗据此贴到头顶上方
     electron_1.ipcMain.on(contracts_1.IPC_PET_BOUNDS, (event, payload) => {
@@ -1674,7 +1738,8 @@ function registerWindowDragHandlers() {
         const top = typeof payload?.top === 'number' && Number.isFinite(payload.top) ? Math.round(payload.top) : null;
         if (top === null)
             return;
-        const next = Math.max(0, Math.min(top, WINDOW_HEIGHT - 40));
+        const winH = mainWindow && !mainWindow.isDestroyed() ? mainWindow.getSize()[1] : WINDOW_HEIGHT;
+        const next = Math.max(0, Math.min(top, winH - 40));
         if (next === petModelTop)
             return;
         petModelTop = next;
@@ -1972,6 +2037,17 @@ async function bootstrap() {
     await srv.start();
     server = srv;
     bootRef = { resolver, server: srv };
+    // 3.5 自带系统提示词库（随包四层文案）+ 情景提示词（用户数据目录，自动维护）
+    promptLibrary = (0, promptLayers_1.loadPromptLibrary)(path.join(resolver.assetsRoot(), 'prompts'));
+    scenario = new scenario_1.ScenarioContext({
+        file: (0, scenario_1.scenarioPromptPath)(electron_1.app.getPath('userData')),
+        template: promptLibrary.scenarioTemplate,
+        mustBeUnder: electron_1.app.getPath('userData'),
+    });
+    scenario.ensureFile();
+    scenario.load();
+    console.log('[main] 系统提示词库：' + (promptLibrary.source === 'bundled' ? '随包四层提示词' : '内置兜底') +
+        '；情景提示词：' + scenario.filePath());
     // 4. AI 对话（回调暂存 sendToRenderer，IPC 注册后生效）
     chat = new chatClient_1.ChatClient(settings, {
         onChunk: (delta) => pushToWindows(contracts_1.IPC_AI_CHUNK, { delta }),
@@ -1987,6 +2063,9 @@ async function bootstrap() {
     }, resolver.knowledgeDir());
     chat.setWorkspaceRoot(settings.devWorkspaceRoot ?? ''); // 让 system prompt 知道产物该放哪
     chat.setUserDataDir(electron_1.app.getPath('userData')); // 读 <userData>/memory.md 用户记忆
+    if (promptLibrary)
+        chat.setPromptLibrary(promptLibrary); // 第 1~3 层固定文案 + 阶段指令
+    chat.setScenarioContext(scenario); // 第 3 层的情景提示词（屏幕活动 + 行动日志，按时间衰减）
     // 5. 插件注册表
     registry = await loadRegistryAdapter();
     // 6. 活动窗口监测（回调推送 WindowInfo 与互动动作；speak 场景经离线台词池出气泡）
@@ -1995,10 +2074,12 @@ async function bootstrap() {
             sendToRenderer(contracts_1.IPC_ON_WINDOW_CHANGE, info);
             registry?.emitWindowChange?.(info);
             applyFullscreenPolicy(info); // 前台全屏 → 收起桌宠；退出全屏 → 自动回来
+            scenario?.recordScreen(info); // 情景提示词：用户正在哪个应用/看什么
         },
         onAction: (action) => {
             if (action.type === 'scene' && typeof action.payload === 'string') {
                 // 新事件引擎：直接按分组名出语料气泡
+                scenario?.record('event', '场景切换：' + action.payload);
                 handleSceneGroup(action.payload);
             }
             else if (action.type === 'speak') {
@@ -2023,6 +2104,13 @@ async function bootstrap() {
         registry,
         staticBaseUrl: () => srv.baseUrl(),
         onModelChanged: (modelName) => reloadOfflinePoolForModel(modelName),
+        onPetEvent: (type) => {
+            const group = PET_EVENT_GROUPS[type];
+            if (group) {
+                scenario?.record('event', '互动：' + group);
+                handleSceneGroup(group);
+            }
+        },
         toolbox,
         openChatWindow: () => openChatWindow(resolver, srv),
         closeChatWindow: () => closeChatWindowWindow(),
@@ -2550,9 +2638,9 @@ async function bootstrap() {
     installClickThrough(); // 11.1 点击穿透：透明区不拦截鼠标（默认关闭，见设置项 clickThrough）
     // 12. 离线台词池 + 随机冒泡定时器（提升互动频率；纯离线）
     const defaultModel = resolver.modelList()[0] || 'character';
-    loadOfflinePool(resolver.knowledgeDirForModel(defaultModel), defaultModel);
+    loadOfflinePool(resolver.knowledgeDirForModel(defaultModel), defaultModel, path.join(resolver.assetsRoot(), 'knowledge'));
     startOfflineBubbleTimer();
-    startTimedEvents(); // 13. 时间型事件（早安/深夜/周末/整点，每天去重）
+    startTimedEvents(); // 13. 时间型事件（早安/深夜/周末，每天去重）
     loadDone = true;
     console.log(`[main][boot] 主进程就绪 +${Date.now() - bootT0}ms（模型/贴图加载在渲染进程继续进行）`);
     console.log(`[main] 就绪  url=${srv.baseUrl()}  packaged=${electron_1.app.isPackaged}`);
@@ -3100,6 +3188,7 @@ electron_1.app.on('activate', () => {
 });
 electron_1.app.on('before-quit', () => {
     appQuitting = true; // 先立旗标，再走 shutdown（shutdown 里的窗口操作需要它）
+    scenario?.flush(); // 情景提示词立即落盘，别丢最后一小段
     shutdown();
 });
 process.on('uncaughtException', (err) => {

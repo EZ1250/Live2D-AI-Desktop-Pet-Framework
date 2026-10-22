@@ -4,7 +4,8 @@
  *
  * 目标：**个人隐私配置绝不进主包**（app.asar / resources/assets / resources/renderer / 便携 exe）。
  * 本机个人数据只允许待在 %APPDATA%\pet-desktop-app\ 下的 userData 里：settings.json（含 API Key）、
- * chat-log.json（聊天记录）、pet-tools.json（待办/笔记）、memory.md（长期偏好）。
+ * chat-log.json（聊天记录）、pet-tools.json（待办/笔记）、memory.md（长期偏好）、
+ * prompts/scenario-prompt.md（情景提示词：屏幕活动 + 行动日志，含本机使用轨迹，绝不进包）。
  *
  * 检查两类东西：
  *   A. 打包输入/产物里**不允许出现的文件名**（配置文件、密钥、证书、数据库、日志…）；
@@ -32,6 +33,8 @@ const FORBIDDEN_NAMES = [
   'chat-log.json',
   'pet-tools.json',
   'memory.md',
+  'scenario-prompt.md',
+  'scenario.md',
   'agents.md',
   'pet.md',
   'claude.md',

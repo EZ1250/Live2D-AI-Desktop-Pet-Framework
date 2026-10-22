@@ -135,7 +135,7 @@ const HIYORI_MANIFEST = {
 function bootPetWindow(triggers = USER_TRIGGERS) {
   const byId = new Map();
   const handlers = {}; // bridge.on* 的回调，测试里直接"推"事件
-  const calls = { setExpression: [], playMotion: [], framed: [] };
+  const calls = { setExpression: [], playMotion: [], framed: [], gaze: [], petEvent: [] };
   const docListeners = new Map();
 
   const dom = {
@@ -159,17 +159,27 @@ function bootPetWindow(triggers = USER_TRIGGERS) {
     dispatchEvent() { return true; },
   };
 
+  const winListeners = new Map();
   const window = {
     location: { search: '', href: 'http://127.0.0.1:1/' }, // 空 search = 桌宠主窗口
     innerWidth: 360,
     innerHeight: 520,
+    screenX: 0,
+    screenY: 0,
     devicePixelRatio: 1,
     setTimeout: (...a) => setTimeout(...a),
     clearTimeout: (...a) => clearTimeout(...a),
     requestAnimationFrame: () => 0, // 不真跑帧循环，测试只要状态
     cancelAnimationFrame: () => {},
-    addEventListener() {},
+    addEventListener(type, fn) { winListeners.set(type, [...(winListeners.get(type) ?? []), fn]); },
     removeEventListener() {},
+  };
+  /** 派发 window / document 上的事件（真实处理链：pointerdown 在 document、pointerup 在 window） */
+  const dispatchWin = (type, event = {}) => {
+    for (const fn of winListeners.get(type) ?? []) fn({ preventDefault() {}, stopPropagation() {}, target: null, button: 0, ...event });
+  };
+  const dispatchDoc = (type, event = {}) => {
+    for (const fn of docListeners.get(type) ?? []) fn({ preventDefault() {}, stopPropagation() {}, target: null, button: 0, ...event });
   };
 
   /** 假的 Live2D handle：只记录"到底播了什么"。表情清单按当前模型变化（Hiyori 没有表情） */
@@ -187,6 +197,7 @@ function bootPetWindow(triggers = USER_TRIGGERS) {
     hitTest: () => ({ ok: true, hit: false }),
     applyEmotionLabel: () => '呆猫',
     setFraming() {},
+    setGaze(nx, ny) { calls.gaze.push([nx, ny]); },
   };
   window.PetLive2d = {
     isLive2DAvailable: () => true,
@@ -226,6 +237,9 @@ function bootPetWindow(triggers = USER_TRIGGERS) {
     voiceTranscribe: async () => ({ ok: true, text: '', ms: 0 }),
     todoList: async () => [],
     pathForFile: () => '',
+    petEvent(type) { calls.petEvent.push(type); },
+    moveWindow() {},
+    endWindowDrag() {},
   };
   for (const ev of ['onChat', 'onAction', 'onThink', 'onBubble', 'onGlobalCursor', 'onHitProbe', 'onAskQuestion', 'onAskCancel', 'onTodoShow', 'onWindowChange', 'onContextMenu', 'onPlan', 'onChatWindowState', 'onThinkWindowState']) {
     // 同一个通道可能有**多个**订阅者（行为触发 / 思考浮窗各订一次），这里全部保留并按序回调
@@ -262,7 +276,7 @@ function bootPetWindow(triggers = USER_TRIGGERS) {
   window.PetVoiceLab = globalThis.PetVoiceLab;
   require(RENDERER);
 
-  return { dom, document, window, handlers, calls, errors, emit };
+  return { dom, document, window, handlers, calls, errors, emit, dispatchWin, dispatchDoc };
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -388,4 +402,58 @@ test('行为触发：随启动载入、6 个绑定都能解析、并且真的播
   assert.equal(dbg.resolveTrigger('expr:不存在的表情'), null, '模型没有的表情必须解析为 null');
   assert.equal(dbg.resolveTrigger('motion:NoSuchMotion'), null);
   assert.equal(dbg.resolveTrigger(''), null);
+});
+
+test('窗口外视线跟随：全局光标推送会更新视线目标（渲染层换算）', async () => {
+  const env = bootPetWindow();
+  assert.equal(await waitFor(() => env.window.__petDebug, 4000), true);
+  const dbg = env.window.__petDebug;
+  assert.equal(await waitFor(() => dbg.behaviors().resolved.user_message, 3000), true);
+
+  // 窗口 360x520 在屏幕 (0,0)，中心 (180,260)；软区 w/2+220=400、h/2+220=480
+  env.emit('onGlobalCursor', { x: 180 + 500, y: 260 });
+  await sleep(50);
+  let g = dbg.gaze();
+  assert.ok(g.renderer.ny !== undefined, '应提供 __petDebug.gaze() 自查入口');
+  assert.ok(g.renderer.nx > 0.99, `鼠标在窗口右侧远处 → nx 应饱和为 1（实际 ${g.renderer.nx}）`);
+  assert.ok(Math.abs(g.renderer.ny) < 0.05, `同一水平线 → ny 应≈0（实际 ${g.renderer.ny}）`);
+  assert.equal(g.renderer.stale, false, '刚收到推送不应判过期');
+
+  env.emit('onGlobalCursor', { x: 180 - 500, y: 260 - 480 });
+  await sleep(50);
+  g = dbg.gaze();
+  assert.ok(g.renderer.nx < -0.99, `鼠标在窗口左侧远处 → nx 应为 -1（实际 ${g.renderer.nx}）`);
+  assert.ok(g.renderer.ny > 0.99, `鼠标在窗口上方远处 → ny 应为 1（向上为正，实际 ${g.renderer.ny}）`);
+  assert.ok(g.renderer.globalCursorPushes >= 2, '应统计到全局光标推送次数（排查"窗口外不跟"用）');
+});
+
+test('交互语料事件：单击/连点/长拖三种事件都会上报给主进程', async () => {
+  const env = bootPetWindow();
+  assert.equal(await waitFor(() => env.window.__petDebug, 4000), true);
+  const dbg = env.window.__petDebug;
+  assert.equal(await waitFor(() => dbg.behaviors().resolved.user_message, 3000), true);
+
+  const pointer = (screenX = 40, screenY = 40) => ({ button: 0, pointerId: 1, pointerType: 'mouse', screenX, screenY, clientX: 40, clientY: 40 });
+  const click = async () => { env.dispatchDoc('pointerdown', pointer()); env.dispatchWin('pointerup', pointer()); };
+
+  // 单击一次 → click
+  await click();
+  await sleep(30);
+  assert.deepEqual(env.calls.petEvent, ['click'], '单击应上报一次 click');
+
+  // 2.5s 窗口内点到第 6 次 → 追加 multiClick
+  for (let i = 0; i < 5; i++) { await click(); await sleep(20); }
+  await sleep(50);
+  assert.equal(env.calls.petEvent.filter((t) => t === 'click').length, 6, '6 次单击都应上报 click');
+  assert.equal(env.calls.petEvent.filter((t) => t === 'multiClick').length, 1, '第 6 次（超过 5 次）应上报 multiClick');
+
+  // 长拖：按下 → 移动（超过 3px 拖拽阈值）→ 等 >5s → 再移动一次触发 dragLong
+  const down = pointer(50, 50);
+  env.dispatchDoc('pointerdown', down);
+  env.dispatchDoc('pointermove', pointer(58, 54));
+  await sleep(5100);
+  env.dispatchDoc('pointermove', pointer(70, 60));
+  env.dispatchWin('pointerup', pointer(70, 60));
+  await sleep(50);
+  assert.equal(env.calls.petEvent.filter((t) => t === 'dragLong').length, 1, '拖动超过 5 秒应上报一次 dragLong');
 });

@@ -47,6 +47,8 @@
     listMotions?(): string[];
     /** 设置视线目标：nx/ny ∈ [-1,1]，向右/向上为正；0 = 归位 */
     setGaze?(nx: number, ny: number): void;
+    /** 视线跟踪自查：目标/平滑值/实际写进模型的参数（排查"不跟鼠标"用） */
+    gaze?(): Any;
     /** 滚轮缩放：dir=+1 放大 / -1 缩小（档位 1.08^n，0=fit 基准） */
     zoom?(dir: number): void;
     /**
@@ -113,8 +115,7 @@
   * （half 预设使用较小的视线幅度）。
    */
   function framingGazeGain(): number {
-    // 半身放大 2.5 倍后，同样的视线偏移在屏幕上被放大 2.5 倍 → 增益降到 0.42，避免"眼珠飞出去"
-    return framingMode === 'half' ? 0.42 : 1;
+    return framingMode === 'half' ? 0.8 : 1;
   }
 
   /** 取景等比缩放留下的边距（给摆动部件预留） */
@@ -911,11 +912,11 @@
             if (!core) return null;
             const legacy = core._model && core._model.parameters;
             if (legacy && typeof legacy.count === 'number') {
-              return { count: legacy.count, min: legacy.minimumValues, max: legacy.maximumValues };
+              return { count: legacy.count, min: legacy.minimumValues, max: legacy.maximumValues, values: legacy.values };
             }
             const values = core._parameterValues;
             if (values && typeof values.length === 'number') {
-              return { count: values.length, min: core._parameterMinimumValues, max: core._parameterMaximumValues };
+              return { count: values.length, min: core._parameterMinimumValues, max: core._parameterMaximumValues, values };
             }
             return null;
           } catch {
@@ -998,6 +999,23 @@
             console.warn('[live2d] 设置参数失败', id, err);
           }
         }
+        /** 读模型参数当前值（排查"视线跟不跟鼠标""参数到底写进去没有"用） */
+        function readParam(id: string): number | null {
+          try {
+            const core = model.internalModel && model.internalModel.coreModel;
+            if (!core) return null;
+            if (typeof core.getParameterValueById === 'function') {
+              const value = core.getParameterValueById(id);
+              if (Number.isFinite(value)) return Math.round(value * 1000) / 1000;
+            }
+            const store = paramStore();
+            const idx = paramIndex(core, id);
+            if (store && store.values && idx >= 0 && idx < store.count) return Math.round(store.values[idx] * 1000) / 1000;
+            return null;
+          } catch {
+            return null;
+          }
+        }
         function hasMotionGroup(group: string): boolean {
           try {
             const mm = model.internalModel && model.internalModel.motionManager;
@@ -1026,11 +1044,11 @@
 
         // 只使用头部参数跟随鼠标，避免眼球参数在不同模型上的表现不一致。
         // 调整这三个上限即可改变跟踪幅度，最终还会受模型自身参数范围限制。
-        const HEAD_TRACK_MAX_X = 12;
-        const HEAD_TRACK_MAX_Y = 8;
-        const HEAD_TRACK_MAX_Z = 2.5;
-        /** 身体摆动上限（度）：比头部小一档，才像"身体跟着轻轻晃"而不是整个人在转 */
-        const BODY_TRACK_MAX_X = 6;
+        const HEAD_TRACK_MAX_X = 15;
+        const HEAD_TRACK_MAX_Y = 10;
+        const HEAD_TRACK_MAX_Z = 4;
+        /** 身体摆动上限（度）：比头部小一档 */
+        const BODY_TRACK_MAX_X = 5;
         const BODY_TRACK_MAX_Z = 3;
         /**
          * 逻辑参数 → 模型实际参数 ID。
@@ -1201,6 +1219,26 @@
           setFraming(mode: 'full' | 'half'): void {
             framingMode = mode === 'half' ? 'half' : 'full';
             refit(); // 立刻按新取景重排（下一帧 update 也会跟上）
+          },
+          /**
+           * 视线跟踪自查：目标/平滑后的值 + **实际写进模型的参数**。
+           * 排查"鼠标在窗口外时宠物不跟"这类问题时，直接看 target 有没有变、params 有没有跟上。
+           */
+          gaze(): Any {
+            return {
+              framing: framingMode,
+              gain: framingGazeGain(),
+              target: { x: Math.round(gazeTX * 1000) / 1000, y: Math.round(gazeTY * 1000) / 1000 },
+              current: { x: Math.round(gazeCX * 1000) / 1000, y: Math.round(gazeCY * 1000) / 1000 },
+              head: { x: Math.round(headCX * 1000) / 1000, y: Math.round(headCY * 1000) / 1000 },
+              headTrack: { x: headTrackX, y: headTrackY, z: headTrackZ, ok: headTrackOK },
+              params: {
+                angleX: readParam(paramIds.angleX),
+                angleY: readParam(paramIds.angleY),
+                eyeballX: readParam(paramIds.eyeBallX),
+                eyeballY: readParam(paramIds.eyeBallY),
+              },
+            };
           },
           /**
            * 推进一帧追踪数据（骨骼 / 眼 / 嘴）。
@@ -1505,12 +1543,12 @@
               //    眼球快（k≈dt*12）、头部慢（dt*4 独立滞后）→ 眼先头后的自然延迟 ——
               const dt = Math.min(0.25, Math.max(0.001, deltaSec || 1 / 60));
               const tracking = gazeTX !== 0 || gazeTY !== 0;
-              const k = tracking ? 1 - Math.exp(-dt * 12) : 1 - Math.exp(-dt * 2.2); // 注视快、归零缓
+              const k = tracking ? 1 - Math.exp(-dt * 8) : 1 - Math.exp(-dt * 2.2); // 注视快、归零缓
               gazeCX += (gazeTX - gazeCX) * k;
               gazeCY += (gazeTY - gazeCY) * k;
               if (gazeCX > -0.004 && gazeCX < 0.004) gazeCX = 0;
               if (gazeCY > -0.004 && gazeCY < 0.004) gazeCY = 0;
-              const hk = Math.min(1, dt * 4);
+              const hk = Math.min(1, dt * 2.6);
               headCX += (gazeCX - headCX) * hk;
               headCY += (gazeCY - headCY) * hk;
               const bodyCX = headCX * 0.55; // 身体比头更滞后、幅度更小
@@ -1519,9 +1557,10 @@
                 if (headTrackX > 0) setBaseParam(paramIds.angleX, headCX * headTrackX);
                 if (headTrackY > 0) setBaseParam(paramIds.angleY, headCY * headTrackY);
                 if (headTrackZ > 0) setBaseParam(paramIds.angleZ, headCX * headTrackZ);
-                // 眼球也跟着鼠标动（有该参数才驱动）：只转头不动眼会显得呆
-                if (eyeBallXOK) setBaseParam(paramIds.eyeBallX, gazeCX);
-                if (eyeBallYOK) setBaseParam(paramIds.eyeBallY, gazeCY);
+                // 眼球按满量程驱动（除掉取景增益），否则半身取景下几乎看不出在动
+                const eyeScale = (framingGazeGain() > 0 ? 1 / framingGazeGain() : 1) * 0.55;
+                if (eyeBallXOK) setBaseParam(paramIds.eyeBallX, Math.max(-1, Math.min(1, gazeCX * eyeScale)));
+                if (eyeBallYOK) setBaseParam(paramIds.eyeBallY, Math.max(-1, Math.min(1, gazeCY * eyeScale)));
               } else if (headTrackOK && !idleMotionAvailable) {
                 // 没有原生 Idle 时才补充幅度很小的头部游移。
                 if (headTrackX > 0) setBaseParam(paramIds.angleX, Math.sin(nowSec * 0.45 + phase * 0.7) * Math.min(headTrackX, 2.2));
