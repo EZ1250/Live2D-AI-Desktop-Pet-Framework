@@ -67,10 +67,10 @@ src/
 | `import-model.js` | 导入模型/语料/技能到 `public/assets` | ✅ `npm run import` / `npm run build` |
 | `assemble-renderer.js` | 把 `src/renderer` 拼成 `public/renderer` | ✅ `npm run assemble` / `build:all` |
 | `build-portable.js` | 调 electron-builder 出 nsis + portable，并生成 `README_PORTABLE.md` | ✅ `npm run build` |
-| `check-privacy.js` | 打包前后扫隐私边界 | ✅ `npm run check:privacy`（也由 build 调用） |
+| `check-privacy.js` | 扫描源码、生成物和打包产物中的隐私文件与密钥 | ✅ `npm run check:privacy`（`build` 完成打包后自动调用） |
 | `check-model.js` | 体检单个模型能否被当前运行库渲染 | 手动：`node scripts/check-model.js "<模型目录>"` |
 | `import-bundled-whale.js` | 从内置立绘重生成 `local-assets/大肥鱼/` | 手动（一次性）；**别删**：它是该资产的唯一再生成途径 |
-| `migrate-models-to-userdata.js` | 把随包模型迁到用户数据目录 | 手动（一次性迁移） |
+| `migrate-models-to-userdata.js` | 把随包模型迁到用户数据目录 | `import-model.js` 导入完成后自动调用，也可手动运行 |
 | `make_launchers.js` | 生成 `release/` 下的双击启动器（`.bat`，纯 ASCII 内容以适配 cmd 的 GBK 解析） | 手动：`node scripts/make_launchers.js` |
 | `fetch-cubism-core.js` / `fetch-live2d-runtime.js` | 升级 Cubism Core / Live2D 运行库 | 手动（升级时才用） |
 
@@ -115,7 +115,7 @@ src/
 **① `## 分组名` 必须使用已登记的触发键或同义键。**
 触发源有两类：`windowMonitor.ts` 的 `evaluateTriggers()` 按前台窗口把 11 类软件映射到分组名
 （会议/音乐/社交/视频/设计/终端/邮件/网页/代码/文档/全屏游戏），
-以及 `mainImpl.js` 的 `handleSceneGroup`（鼠标静止/活跃、长时间工作、健康护眼、早安/深夜/整点/周末）。
+以及 `mainImpl.js` 的 `handleSceneGroup`（鼠标静止/活跃、长时间工作、健康护眼、早安/深夜/周末）。
 健康、摸鱼、早安等合并分类已在 `mainImpl.js` 登记同义键；其他分类改名仍可能导致
 台词无法触发，而界面上看不出任何异常。
 （用 AI 改写语料时尤其危险：模型会把标题当文学文本"润色"成"音乐伴侣""办公闲谈"。
@@ -237,7 +237,7 @@ API Key 丢了 / 设置改了不生效"——两套配置各改各的，排查�
 
 **随包不进去的东西**：模型、`settings.json`（含 API Key）、聊天记录、待办、记忆——
 它们全在 `%APPDATA%/pet-desktop-app/`。`public/assets/` 里只有内置立绘（`大肥鱼`）、
-通用语料、技能与图标。改完用 `verify_no_local_model_info.js` 自查（见 §10）。
+通用语料、技能与图标。改完运行 `npm run check:privacy` 检查是否有本机路径或密钥进入打包内容。
 
 ## 6. 渲染质量的几个关键开关（改动前先读）
 
@@ -301,7 +301,7 @@ API Key 丢了 / 设置改了不生效"——两套配置各改各的，排查�
 | 加载 reject（`.catch`） | `app.destroy(true)` |
 | 正常卸载（`handle.destroy()`） | `model.destroy()` + `app.destroy(true, {children,texture})` |
 
-改这段时请跑 `verify_gl_context_lifecycle.js`（审计脚本目录内）核对，别只看"能不能渲染"。
+改这段时应检查 `mountLive2D` 的所有退出路径都释放 WebGL 资源，并运行 `npm test`。
 
 ## 6.1 托盘的作用（别删）
 
@@ -456,7 +456,7 @@ moc3 取景的居中基准不是画布包围盒，而是从**命中遮罩**量�
 ## 7.1 AI 工具一览（加工具要改哪三处）
 
 工具要生效必须**同时**出现在三个地方，漏一处就是"模型调了但没反应"，而且不报错、很难查
-（`verify_tools.js` 会逐个核对）：
+（修改后应通过相关测试核对）：
 
 | # | 位置 | 作用 |
 |---|---|---|

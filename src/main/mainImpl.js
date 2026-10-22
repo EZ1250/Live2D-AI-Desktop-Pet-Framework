@@ -313,7 +313,6 @@ const GROUP_SYNONYMS = {
     早安问候: ['早安与开机问候', '开机问候'],
     深夜护眼: [],
     周末放松: [],
-    整点报时: [],
     社交聊天: [],
     设计创作: [],
     终端命令: [],
@@ -645,14 +644,12 @@ function installClickThrough() {
         }
     }, 2000);
 }
-// —— 时间型事件（每天去重触发；整点报时默认关闭）——
-const ENABLE_HOURLY_REPORT = false; // 设 true 开启整点报时
+// —— 时间型事件（每天去重触发）——
 const LONG_SESSION_MINUTES = 50; // 连续活跃满 50 分钟 → 起身/护眼提醒（轮流）
 let timedEventTimer = null;
 let lastMorningDate = '';
 let lastNightDate = '';
 let lastWeekendDate = '';
-let lastHourDate = '';
 let activeMinutes = 0; // 非鼠标静止状态下累计的活跃分钟数
 let longSessionToggle = false; // 长时间工作 / 健康护眼 交替
 function startTimedEvents() {
@@ -675,10 +672,6 @@ function startTimedEvents() {
             if ((day === 0 || day === 6) && lastWeekendDate !== dayStr) {
                 lastWeekendDate = dayStr;
                 handleSceneGroup('周末放松');
-            }
-            if (ENABLE_HOURLY_REPORT && now.getMinutes() <= 5 && lastHourDate !== `${dayStr}:${hour}`) {
-                lastHourDate = `${dayStr}:${hour}`;
-                handleSceneGroup('整点报时');
             }
             // 连续活跃计时：鼠标不在静止状态才累计，满 50 分钟提醒一次（长时间工作 / 健康护眼 交替）
             if (mouseIdleFired) {
