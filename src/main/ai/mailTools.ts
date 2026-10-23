@@ -327,7 +327,7 @@ export async function mailCheck(args: CheckArgs, cfg: ImapConfig): Promise<strin
       if (startIdx < 2) return;
 
       const rawHeader = line.substring(startIdx);
-      const headerLines = rawHeader.split('\r\n').filter(l => l.trim());
+      const headerLines = unfoldHeaders(rawHeader); // 展开 RFC 5322 折行
 
       const parsed: { from?: string; subject?: string; date?: string } = {};
       for (const hLine of headerLines) {

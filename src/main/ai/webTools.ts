@@ -109,18 +109,6 @@ export async function webFetch(args: { url?: unknown; max_chars?: unknown }): Pr
 
   // 发起请求
   return new Promise((resolve) => {
-    const options: https.RequestOptions = {
-      hostname: parsedUrl.hostname,
-      port: parsedUrl.port || 443,
-      path: parsedUrl.pathname + parsedUrl.search,
-      method: 'GET',
-      headers: {
-        'User-Agent': 'PetDesktop/1.0',
-        'Accept': 'text/html,application/json,text/plain'
-      },
-      timeout: 20000 // 20秒超时
-    };
-
     let redirectCount = 0;
     const maxRedirects = 5;
     const redirects: string[] = [];

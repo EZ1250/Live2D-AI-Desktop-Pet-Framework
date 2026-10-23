@@ -1,11 +1,5 @@
 'use strict';
-/**
- * promptLayers 测试 —— 四层系统提示词库：
- *  1) 随包提示词库能正常加载（local-assets/prompts 为源，import 后进 assets/prompts）
- *  2) 文件缺失时回退内置文案，功能不依赖文件
- *  3) 三层固定 prompt 按顺序拼接；第 4 层阶段指令（think/act/reflect）单独可拼
- *  4) 隐私：提示词库文件不得出现密钥样式 / 本机用户路径 / 邮箱等个人信息
- */
+/** 验证提示词加载、分层拼接、阶段切换和隐私约束。 */
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -67,6 +61,29 @@ test('第 4 层阶段指令按阶段切换，并带轮次/观察摘要', () => {
   assert.notEqual(think, reflect);
   const round = lib.buildRoundSystemPrompt(promptLib, { contextText: '上下文' }, 'act');
   assert.ok(round.includes('第 3 层') && round.includes('行动'), '整轮 system 应包含固定三层 + 阶段指令');
+});
+
+test('行为准则对齐：权限模式 / 先诊断再重试 / 忠实汇报 / 产物与需求验证', () => {
+  const read = (name) => fs.readFileSync(path.join(SRC_DIR, name), 'utf8');
+  const identity = read('layer1-identity.md');
+  const tools = read('layer2-tools.md');
+  const reflect = read('layer4-phase-reflect.md');
+  const act = read('layer4-phase-act.md');
+  const all = [identity, tools, reflect, act].join('\n');
+  // 权限模式、拒绝处理和确认超时
+  for (const kw of ['每次询问', '自动接受编辑', '只读', '拒绝', '超时']) {
+    assert.ok(tools.includes(kw), `第 2 层缺少权限模式说明：${kw}`);
+  }
+  // 失败先诊断
+  assert.ok(tools.includes('先诊断'), '缺少"先诊断再重试"');
+  assert.ok(/不要原封不动重(发|试)/.test(tools), '缺少"不要原封不动重试"');
+  // 未验证结果必须如实说明
+  assert.ok(identity.includes('报告要忠实'), '第 1 层缺少"报告要忠实"');
+  assert.ok(all.includes('没有验证'), '缺少"没验证要明说"');
+  // 执行后验证产物并对照需求
+  assert.ok(tools.includes('验证产物') && /逐条对照/.test(tools), '第 2 层缺少"验证产物/逐条对照"');
+  assert.ok(/验证产物|对照需求/.test(reflect) && /逐条对照/.test(reflect), '反思阶段缺少产物与需求验证');
+  assert.ok(act.includes('验证产物'), '行动阶段缺少"工具返回后先验证产物"');
 });
 
 test('隐私：自带提示词库不含密钥样式/本机用户路径/邮箱', () => {

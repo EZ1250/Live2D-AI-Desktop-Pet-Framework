@@ -1184,11 +1184,13 @@ let sfxVolumeLevel = 0.6;
 let sfxLastAt = 0;
 const SFX_MIN_GAP_MS = 70; // 狂点时不叠加成一串噪音
 
-/** 应用设置里的音效开关/音量（打开设置与保存设置时调用；同时刷新滑杆与百分比显示） */
+/** 刷新设置页的音效开关、音量和百分比。 */
 function applySfxSettings(settings: AppSettings): void {
   sfxEnabled = settings.sfxEnabled !== false; // 默认开启
   const raw = typeof settings.sfxVolume === 'number' ? settings.sfxVolume : 0.6;
   sfxVolumeLevel = Math.max(0, Math.min(1, raw));
+  const toggle = elementById<HTMLInputElement>('setting-sfx');
+  if (toggle) toggle.checked = sfxEnabled; // 回显开关（漏了这行会导致重开设置时开关显示和实际值不一致）
   const slider = elementById<HTMLInputElement>('setting-sfx-volume');
   if (slider) slider.value = String(sfxVolumeLevel);
   const display = elementById<HTMLElement>('sfx-volume-display');

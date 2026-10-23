@@ -501,9 +501,7 @@ body.is-dragover #stage::after {
   /* 外层面板已经是 overflow:hidden，这里再挡住"滚动链"：内嵌模型列表滚到底继续滚时，
      不会把滚动传给外层窗口/看板（外部审查提醒的点，实测手滑多滚一格会带动整页）。 */
   overscroll-behavior: contain;
-  padding-right: 2px;
-}
-
+  /* 设置页滚动条保持系统细条，不做自定义加粗（用户确认过原样即可） */
   scrollbar-width: thin;
   padding-right: 2px;
 }

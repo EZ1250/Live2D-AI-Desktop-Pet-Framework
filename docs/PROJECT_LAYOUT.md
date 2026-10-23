@@ -625,6 +625,14 @@ handle 跑真实 `init()`，从推送通道一路断到 `setExpression`）。
 | `layer4-phase-{think,act,reflect}.md` | 第 4 层 | 思考 / 行动 / 反思三阶段指令，按思考轮循环切换 |
 | `scenario-template.md` | — | 情景提示词文件的初始模板（写进用户数据目录） |
 
+**行为准则对齐**（对照 Claude Code 等成熟 agent 提示词后补齐；`tests/promptLayers.test.js` 会校验这些关键词不丢）：
+- 权限模式解释（第 2 层）：默认「每次询问」/「自动接受编辑」/「只读·计划」三种模式各自的确认行为，
+  拒绝后不要原封不动重发同一动作，确认框 120s 超时会失败，`confirmTools`/`allowShell` 设置项的作用；
+- 「先诊断再重试」（第 2 层）：失败先看错误（权限/路径/参数/命令输出/超时）定位原因再改，不要盲目重发；
+- 「报告要忠实」（第 1 层 + 反思阶段）：没验证的步骤必须明说「没有验证」，不把没做/没验证说成已完成；
+- 「产物与需求验证」（第 2 层 + 行动/反思阶段）：工具返回后回读文件、确认目录存在、看命令退出码，
+  再与用户原始要求逐条对照（数量/命名/位置/格式/行为），验证不了就说明。
+
 加载/拼接在 `src/main/ai/promptLayers.ts`（**不 import electron**，路径由调用方传入，便于单测）：
 `loadPromptLibrary(dir)` 逐文件读取、缺失时回退内置兜底；`assembleSystemPrompt()` 固定拼三层；
 `buildPhaseInstruction()` 生成第 4 层；`buildRoundSystemPrompt()` 合成整轮 system。

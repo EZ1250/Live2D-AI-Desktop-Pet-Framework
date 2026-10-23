@@ -80,7 +80,6 @@ import type {
   ChatLogSnapshot,
   ChatWindowResult,
   TodoDto,
-  AssetPresetResult,
   VoiceCheckResult,
   VoiceModelIndexResult,
   VoiceStatusResult,
