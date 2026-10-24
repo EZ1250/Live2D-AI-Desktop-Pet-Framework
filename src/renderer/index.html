@@ -275,6 +275,40 @@
 
       <!-- 状态行放在保存行**前面**：保存行是 sticky 钉底的最后一个子节点，
            它下面是空的，钉住时才不会盖住任何东西（保存结果就显示在按钮正上方）。 -->
+      <div class="settings-divider">MCP 与自主任务</div>
+      <div class="settings-mcp-block">
+        <p id="setting-mcp-status" class="settings-status settings-mcp-status" role="status">读取 MCP 状态…</p>
+        <div class="settings-inline">
+          <button id="setting-mcp-refresh" type="button">刷新状态</button>
+          <button id="setting-mcp-reload" type="button" title="重新读取 mcp.json 与 MCP 服务端配置">重载 MCP</button>
+        </div>
+      </div>
+      <label class="settings-checkbox" title="桌宠作为本机 MCP 服务端，供 DSH / QQ bridge 等外部 agent 调用；只监听 127.0.0.1，需要 token"><input id="setting-mcp-server-enabled" type="checkbox" /> 反向接入</label>
+      <label>MCP 服务端口<input id="setting-mcp-server-port" type="number" min="1024" max="65535" step="1" placeholder="37653" /></label>
+      <label>访问 token<input id="setting-mcp-server-token" type="text" maxlength="128" placeholder="留空=首次启动自动生成" autocomplete="off" /></label>
+      <div class="settings-mcp-block">
+        <p id="setting-mcp-server-hint" class="settings-status settings-mcp-note" role="status"></p>
+      </div>
+      <label class="settings-checkbox"><input id="setting-autotask-enabled" type="checkbox" /> 开启定时自主任务（默认关闭；每分钟检查一次，受间隔与每日上限约束）</label>
+      <label>自主任务模式
+        <select id="setting-autotask-mode">
+          <option value="mcp_check">MCP 检查（本地，不调 AI）</option>
+          <option value="scene_brief">看一眼桌面（调 AI 说一句）</option>
+          <option value="custom">自定义提示词（调 AI）</option>
+        </select>
+      </label>
+      <label>自定义提示词<input id="setting-autotask-prompt" type="text" maxlength="200" placeholder="仅自定义模式用，例如：提醒我起来活动一下" autocomplete="off" /></label>
+      <label>间隔（分钟）<input id="setting-autotask-interval" type="number" min="5" max="240" step="1" /></label>
+      <label>每日上限<input id="setting-autotask-limit" type="number" min="1" max="200" step="1" /></label>
+      <label class="settings-checkbox"><input id="setting-autotask-event-enabled" type="checkbox" /> 事件触发（窗口切到匹配应用/标题、提醒到点时）；共用每日上限</label>
+      <label>事件匹配（应用或标题包含）<input id="setting-autotask-event-match" type="text" maxlength="80" placeholder="例如：Visual Studio Code / Edge / 游戏名，留空=不启用" autocomplete="off" /></label>
+      <label>事件冷却（分钟）<input id="setting-autotask-event-cooldown" type="number" min="5" max="120" step="1" /></label>
+      <label class="settings-checkbox" title="只允许调用声明了只读、且服务器已设置 autoApprove 的 MCP 工具；后台不会弹确认"><input id="setting-autotask-allow-mcp" type="checkbox" /> 自主任务可调用只读 MCP 工具</label>
+      <div class="settings-inline">
+        <button id="setting-autotask-run" type="button">立即运行一次</button>
+        <span id="setting-autotask-status" class="settings-status" role="status"></span>
+      </div>
+
       <p id="settings-status" class="settings-status" role="status"></p>
       <div class="settings-actions">
         <button id="settings-save" class="primary-button" type="submit">保存设置</button>

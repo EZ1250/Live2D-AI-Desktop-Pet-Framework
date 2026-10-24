@@ -77,6 +77,9 @@ const mailTools_1 = require("./ai/mailTools");
 const windowMonitor_1 = require("./monitor/windowMonitor");
 const promptLayers_1 = require("./ai/promptLayers");
 const scenario_1 = require("./ai/scenario");
+const mcpClient_1 = require("./ai/mcpClient");
+const mcpServer_1 = require("./ai/mcpServer");
+const autonomy_1 = require("./ai/autonomy");
 const userAssets_1 = require("./assets/userAssets");
 const ipc_1 = require("./ipc");
 // ------------------------------------------------------------------ 数据目录统一
@@ -161,6 +164,28 @@ let toolbox = null; // 聊天→本地工具（待办/提醒闹钟）
 let skillBox = null; // 技能库（assets/skills + userData/skills）
 let promptLibrary = null; // 随包四层系统提示词库（assets/prompts）
 let scenario = null; // 情景提示词记录器（只写 userData/prompts，绝不进安装包）
+let appResolver = null; // 模块级只读引用（供状态文本等辅助函数取模型列表）
+let settingsPanelOpen = false; // 设置面板是否展开（展开时桌宠主窗要压在对话/思考浮窗之上）
+let mcpClient = null; // MCP 外部工具客户端（可选：userData/mcp.json 存在才连接）
+let petMcpServer = null; // MCP 服务端（可选：设置页开启「反向接入」才启动）
+// 定时自主任务（设置页驱动；默认关闭，规则见 ai/autonomy.ts）
+let autoTaskChat = null;
+let autoTaskTimer = null;
+let autoTaskCfg = null;
+let autoTaskState = { dayKey: "", countToday: 0, lastRunAt: 0, lastEventAt: 0 };
+let autoTaskRunning = false;
+let autoTaskLastResult = "";
+let autoTaskResolve = null;
+let autoTaskReject = null;
+// 外部 MCP 客户端桥接用的静默聊天（与自主任务分开，避免互相抢单飞）
+let externalChat = null;
+let externalChatResolve = null;
+let externalChatReject = null;
+let externalChatBusy = false;
+let lastExternalChatAt = 0;
+// 后台自主任务的工具调用预算（防失控/死循环；参考 DSH 的有界工具循环与重复调用保护）
+let autoTaskToolCount = 0;
+const autoTaskToolRepeat = new Map();
 let tickTimer = null;
 /** activate（macOS）重建窗口所需 */
 let bootRef = null;
@@ -898,6 +923,10 @@ function createWindow(resolver, srv) {
     mainWindow = win;
     // 位置记忆：移动或缩放后落盘（防抖）
     win.on('move', () => savePetBoundsSoon(win));
+    // 点桌宠/设置栏会激活主窗：设置未开时把浮窗再提回上面，避免"点一下桌宠，气泡窗被盖住"
+    win.on('focus', () => {
+        setTimeout(restackOwnWindows, 0);
+    });
     win.on('resize', () => savePetBoundsSoon(win));
     win.on('closed', () => {
         if (mainWindow === win)
@@ -959,6 +988,35 @@ function sendToWindow(win, channel, payload) {
         return false;
     }
 }
+/**
+ * 窗口相对层级（从高到低）：设置面板 > 思考/回答浮窗 > 对话气泡窗 > 桌宠模型。
+ * 全部窗口 alwaysOnTop（高于其他应用）；同一置顶层级内用 moveTop 定顺序，
+ * 设置打开时把桌宠主窗提到最上，否则把浮窗按优先级依次提到桌宠之上。
+ */
+function restackOwnWindows() {
+    const raise = (win) => {
+        if (!win || win.isDestroyed() || !win.isVisible())
+            return;
+        try {
+            // 重新申明置顶：窗口创建后 applyFullscreenPolicy/显隐切换可能改过状态，
+            // 不重设会出现"桌宠在顶层、气泡窗反而掉到普通窗口层"的情况。
+            win.setAlwaysOnTop(true);
+            win.moveTop();
+        }
+        catch {
+            /* 窗口正在销毁等边界情况忽略 */
+        }
+    };
+    const pet = mainWindow;
+    if (settingsPanelOpen) {
+        raise(pet); // 设置面板在桌宠主窗里 → 主窗最高
+        return;
+    }
+    raise(pet); // 最低：桌宠模型
+    raise(chatWindow); // 其次：对话气泡窗
+    raise(thinkWindow); // 最高：思考/回答浮窗
+}
+
 function isChatWindowOpen() {
     return !!chatWindow && !chatWindow.isDestroyed();
 }
@@ -1256,6 +1314,9 @@ function createChatWindow(resolver, srv) {
     chatVoiceStripOpen = false; // 新窗口从"没有语音状态条"开始（否则会凭空高一条）
     const win = new electron_1.BrowserWindow(panelWindowOptions(CHAT_WINDOW_WIDTH, chatWindowHeight(), '对话气泡'));
     chatWindow = win;
+    win.on('focus', () => {
+        setTimeout(restackOwnWindows, 0);
+    });
     // 记住这次的尾巴朝向，等页面加载完再作为查询参数传给渲染层（决定 CSS 画朝上还是朝下的尾巴）
     chatBubbleTail = placeChatBubble(win);
     // 用户自己拖动气泡（顶栏 app-region 拖动）→ 更新"相对桌宠的偏移"，之后照旧跟随平移。
@@ -1320,6 +1381,7 @@ async function openChatWindow(resolver, srv) {
         win.show();
         win.focus();
         notifyChatWindowState(true);
+        restackOwnWindows();
         return { ok: true };
     }
     let win;
@@ -1347,6 +1409,7 @@ async function openChatWindow(resolver, srv) {
     win.show();
     win.focus();
     notifyChatWindowState(true);
+    restackOwnWindows();
     console.log(`[main] 对话气泡窗已打开（尾巴=${chatBubbleTail}，不遮挡桌宠）`);
     return { ok: true };
 }
@@ -1492,6 +1555,9 @@ function closeChatWindowWindow() {
 function createThinkWindow(resolver, srv) {
     const win = new electron_1.BrowserWindow(panelWindowOptions(THINK_WINDOW_WIDTH, THINK_WINDOW_HEIGHT, '思考过程'));
     thinkWindow = win;
+    win.on('focus', () => {
+        setTimeout(restackOwnWindows, 0);
+    });
     placeThinkPanel(win);
     win.on('close', (event) => {
         if (appQuitting || win.isDestroyed())
@@ -1523,6 +1589,7 @@ function showThinkWindowWindow(resolver, srv) {
             win.showInactive();
         }
         notifyThinkWindowState(true);
+        restackOwnWindows();
         followPetForBubble(); // 思考浮窗出现/归位 → 气泡重新避让
         return;
     }
@@ -1548,6 +1615,7 @@ function showThinkWindowWindow(resolver, srv) {
         }
         win.showInactive(); // 思考浮窗不抢焦点：用户可能正接着打字
         notifyThinkWindowState(true);
+        restackOwnWindows();
         followPetForBubble(); // 思考浮窗出现 → 气泡重新避让
     });
 }
@@ -1685,6 +1753,9 @@ function registerWindowDragHandlers() {
     // 这样用户手动缩放过的窗口拖完还是原尺寸；同时避免 150% DPI 下 setPosition 的
     // 1~2px 舍入误差在连续拖动里累积（实测拖一次宽度能涨 15~20px）。
     let dragLockedSize = null;
+    // 拖拽期间窗口位置的浮点累计：每帧只把"本帧增量"加上去再取整，
+    // 不再每帧 getPosition + 取整（150% DPI 下逐帧舍入会累积，表现为鼠标越拖越滑开）。
+    let dragFloatPos = null;
     const lockSize = (win) => {
         if (!dragLockedSize)
             dragLockedSize = win.getSize();
@@ -1710,8 +1781,19 @@ function registerWindowDragHandlers() {
         if (!dx && !dy)
             return;
         lockSize(win);
-        const [x, y] = win.getPosition();
-        win.setPosition(x + dx, y + dy);
+        if (!dragFloatPos) {
+            const [sx, sy] = win.getPosition();
+            dragFloatPos = { x: sx, y: sy };
+        }
+        dragFloatPos.x += payload?.dx ?? 0;
+        dragFloatPos.y += payload?.dy ?? 0;
+        const tx = Math.round(dragFloatPos.x);
+        const ty = Math.round(dragFloatPos.y);
+        win.setPosition(tx, ty);
+        // 被系统贴边夹住时以实际位置为准（否则累计值会与真实位置越差越远）
+        const [ax, ay] = win.getPosition();
+        if (Math.abs(ax - tx) > 2 || Math.abs(ay - ty) > 2)
+            dragFloatPos = { x: ax, y: ay };
         lockSize(win);
         // 气泡必须"同拍"跟着走：在这里直接跟，而不是等窗口 'move' 事件回来再跟（那样会慢半拍）
         if (win === mainWindow) {
@@ -1730,6 +1812,7 @@ function registerWindowDragHandlers() {
             clampSize(win);
         }
         dragLockedSize = null;
+        dragFloatPos = null;
     });
     // 渲染层报告角色实际可见范围（挂模型后 / 滚轮缩放后）：气泡窗据此贴到头顶上方
     electron_1.ipcMain.on(contracts_1.IPC_PET_BOUNDS, (event, payload) => {
@@ -2066,6 +2149,17 @@ async function bootstrap() {
     if (promptLibrary)
         chat.setPromptLibrary(promptLibrary); // 第 1~3 层固定文案 + 阶段指令
     chat.setScenarioContext(scenario); // 第 3 层的情景提示词（屏幕活动 + 行动日志，按时间衰减）
+    // 4.1 MCP 外部工具（可选）：<userData>/mcp.json；未配置则完全跳过，原有行为不变
+    mcpClient = new mcpClient_1.McpClient({
+        configPath: path.join(electron_1.app.getPath('userData'), 'mcp.json'),
+        clientVersion: electron_1.app.getVersion(),
+        log: (msg) => console.log(`[main] ${msg}`),
+        onToolsChanged: () => {
+          chat?.setExternalToolDefs(mcpClient ? mcpClient.toolDefs() : []);
+          configureAutoTaskTools();
+      },
+    });
+    void mcpClient.connectAll();
     // 5. 插件注册表
     registry = await loadRegistryAdapter();
     // 6. 活动窗口监测（回调推送 WindowInfo 与互动动作；speak 场景经离线台词池出气泡）
@@ -2075,6 +2169,7 @@ async function bootstrap() {
             registry?.emitWindowChange?.(info);
             applyFullscreenPolicy(info); // 前台全屏 → 收起桌宠；退出全屏 → 自动回来
             scenario?.recordScreen(info); // 情景提示词：用户正在哪个应用/看什么
+            maybeTriggerAutoTaskByWindow(info); // 事件触发自主任务（命中匹配串时）
         },
         onAction: (action) => {
             if (action.type === 'scene' && typeof action.payload === 'string') {
@@ -2097,6 +2192,7 @@ async function bootstrap() {
     }, { intervalMs: MONITOR_INTERVAL_MS });
     // 7. IPC 注册；注册后回填推送桥
     toolbox = new tools_1.ToolBox();
+    appResolver = resolver;
     const bridge = (0, ipc_1.registerIpc)({
         getWindow: () => mainWindow,
         pathResolver: resolver,
@@ -2119,6 +2215,37 @@ async function bootstrap() {
         showThinkWindow: () => showThinkWindowWindow(resolver, srv),
         hideThinkWindow: () => hideThinkWindowWindow(),
         onChatStarted: () => onChatRoundStarted(resolver, srv),
+        mcpStatus: () => [mcpClient ? mcpClient.statusText() : '', petMcpServer ? petMcpServer.statusText() : ''].filter(Boolean).join('\n\n'),
+        onSettingsPanelOpen: (open) => {
+            settingsPanelOpen = open === true;
+            restackOwnWindows();
+        },
+        mcpReload: async () => {
+            await mcpClient?.reload();
+            await petMcpServer?.reload();
+            const parts = [mcpClient ? mcpClient.statusText() : '', petMcpServer ? petMcpServer.statusText() : ''].filter(Boolean);
+            return 'MCP 已重载。\n' + parts.join('\n\n');
+        },
+        mcpPanelStatus: () => mcpPanelStatusNow(),
+        mcpAction: async () => {
+            await mcpClient?.reload();
+            await petMcpServer?.reload();
+            return 'MCP 已重载。';
+        },
+        autoRunNow: () => runAutoTask('manual'),
+        onSettingsSaved: (next) => {
+            applyAutoTaskSettings(next);
+            configureAutoTaskTools();
+            if (!autoTaskRunning) {
+                try {
+                    autoTaskChat?.updateSettings(next);
+                }
+                catch {
+                    /* 更新失败不影响下次运行 */
+                }
+            }
+            void petMcpServer?.reload();
+        },
     });
     sendToRenderer = bridge.pushToRenderer;
     // 7.1 工具盒（待办/提醒闹钟）就绪：恢复持久化提醒并接管“到点提醒”气泡
@@ -2131,9 +2258,14 @@ async function bootstrap() {
                 /* ignore */
             }
         }
+        scenario?.record('event', `提醒到点：${text.slice(0, 40)}`);
+        maybeRunEventAutoTask(true); // 提醒到点也触发一次（开关与上限由 autonomy 规则把关）
     });
     // 7.2 AI 自主调用本地工具（function-calling）：模型按需执行待办/提醒/打开面板
     const toolExecutor = async (name, rawArgs) => {
+        // MCP 外部工具：默认逐次确认（autoApprove 的服务器除外）
+        if (mcpClient && mcpClient.isMcpTool(name))
+            return execMcpTool(name, rawArgs);
         const box = toolbox;
         if (!box)
             return '工具尚未就绪';
@@ -2608,6 +2740,89 @@ async function bootstrap() {
         }
     };
     chat?.setToolExecutor(toolExecutor);
+    // 7.2 MCP 服务端（可选）：把桌宠能力暴露成本机 MCP，供 DSH / QQ bridge 等外部 agent 调用
+    petMcpServer = new mcpServer_1.PetMcpServer({
+        configPath: path.join(electron_1.app.getPath('userData'), 'mcp-server.json'),
+        version: electron_1.app.getVersion(),
+        log: (msg) => console.log(`[main] ${msg}`),
+        readInitial: () => {
+            const cur = (0, chatClient_1.loadAppSettings)();
+            return { enabled: cur.mcpServerEnabled === true, port: cur.mcpServerPort ?? 37653, token: cur.mcpServerToken ?? '' };
+        },
+        persist: (cfg) => {
+            try {
+                (0, chatClient_1.saveAppSettings)({ ...(0, chatClient_1.loadAppSettings)(), mcpServerEnabled: cfg.enabled, mcpServerPort: cfg.port, mcpServerToken: cfg.token });
+            }
+            catch (err) {
+                console.error('[main] MCP 服务端配置保存失败：', err);
+            }
+        },
+        deps: {
+            say: (text) => {
+                sendToRenderer(contracts_1.IPC_UI_BUBBLE, { text });
+                scenario?.record('event', `外部自动化：气泡「${text.slice(0, 40)}」`);
+                return `已让桌宠说：${text.slice(0, 80)}`;
+            },
+            emotion: (name) => {
+                sendToRenderer(contracts_1.IPC_ACTION, { type: 'expression', payload: { name } });
+                scenario?.record('event', `外部自动化：表情 ${name || '默认'}`);
+                return name ? `已切换到「${name}」表情。` : '已恢复默认表情。';
+            },
+            motion: (group) => {
+                sendToRenderer(contracts_1.IPC_ACTION, { type: 'motion', payload: { group } });
+                scenario?.record('event', `外部自动化：动作 ${group}`);
+                return group === 'wave' ? '已播放挥手动作。' : '已切换到待机动作。';
+            },
+            status: () => petStatusText(),
+            todoAdd: (text) => {
+                const list = toolbox ? toolbox.addTodoRaw(text) : [];
+                scenario?.record('event', `外部自动化：添加待办「${text.slice(0, 40)}」`);
+                return `已添加待办，共 ${list.length} 条。`;
+            },
+            todoList: () => {
+                const list = toolbox ? toolbox.getTodos() : [];
+                if (!list.length) return '当前没有待办。';
+                return list.map((t) => `${t.done ? '[x]' : '[ ]'} ${t.id}. ${t.text}`).join('\n');
+            },
+            screenshot: async () => {
+                scenario?.record('event', '外部自动化：截屏');
+                const dir = path.join(electron_1.app.getPath('userData'), 'shots');
+                fs.mkdirSync(dir, { recursive: true });
+                const file = path.join(dir, `mcp-${Date.now()}.png`);
+                const msg = await (0, screenTools_1.captureScreen)({ save_path: file });
+                if (!fs.existsSync(file)) throw new Error(msg || '截屏失败');
+                return { base64: fs.readFileSync(file).toString('base64'), savedPath: file };
+            },
+            chat: (prompt) => askPetChat(prompt),
+            ask: async (question, options) => {
+                scenario?.record('event', '外部自动化：向用户提问');
+                return await askUser(question, options.map((label) => ({ label })));
+            },
+            noteAdd: (text) => {
+                const result = toolbox ? toolbox.addNote(text) : '工具尚未就绪';
+                scenario?.record('event', '外部自动化：记笔记');
+                return result;
+            },
+            reminderAdd: (text, afterMinutes) => {
+                if (!toolbox)
+                    throw new Error('工具尚未就绪');
+                const at = Date.now() + afterMinutes * 60_000;
+                toolbox.addReminderRaw(text, at, 'once');
+                scenario?.record('event', '外部自动化：加提醒');
+                const hhmm = new Date(at).toLocaleString('zh-CN', { hour12: false });
+                return '已添加提醒：' + hhmm + ' — ' + text;
+            },
+            resourceList: () => [
+                { uri: 'pet://status', name: '桌宠状态', description: '模型/活动窗口/待办/连接情况' },
+                { uri: 'pet://todos', name: '待办列表' },
+                { uri: 'pet://scenario', name: '情景提示词', description: '最近屏幕活动与行动日志（含权重）' },
+                { uri: 'pet://skills', name: '技能库' },
+            ],
+            resourceRead: (uri) => readPetResource(uri),
+        },
+    });
+    void petMcpServer.start();
+    initAutoTask(settings, resolver);
     // 7.3 技能库：userData/skills（用户自定义，优先）→ <assetsRoot>/skills（随包）
     skillBox = new skills_1.SkillBox([path.join(electron_1.app.getPath('userData'), 'skills'), path.join(resolver.assetsRoot(), 'skills')]);
     skillBox.load();
@@ -3125,6 +3340,389 @@ async function captureDebugScreenshots(dir, round = 0) {
         }
     }
 }
+/** MCP 工具：权限模式检查 → 用户确认（autoApprove 跳过）→ 调用外部服务 */
+async function execMcpTool(name, rawArgs) {
+    const client = mcpClient;
+    if (!client)
+        return 'MCP 未启用。';
+    const cfg = (0, chatClient_1.loadAppSettings)();
+    if ((cfg.permissionMode ?? 'ask') === 'plan-only')
+        return '当前是「只读/计划」权限模式，不会调用外部 MCP 工具。需要时请把权限模式改成「每次询问」或「自动接受编辑」。';
+    const target = client.describeTool(name);
+    if (!target)
+        return `未知 MCP 工具：${name}`;
+    if (!client.isAutoApprove(name)) {
+        let argsPreview = '';
+        try {
+            argsPreview = JSON.stringify(rawArgs ?? {});
+        }
+        catch {
+            argsPreview = String(rawArgs);
+        }
+        if (argsPreview.length > 300)
+            argsPreview = `${argsPreview.slice(0, 300)}…`;
+        const verdict = await askUser(`是否允许调用 MCP 工具「${target.server}/${target.tool}」？\n参数：${argsPreview}`, [
+            { label: '允许', description: '执行这一次外部工具调用' },
+            { label: '拒绝', description: '不执行，让模型如实说明' },
+        ]);
+        if (verdict !== '允许')
+            return '用户已拒绝该 MCP 工具调用，未执行。';
+    }
+    try {
+        return await client.callTool(name, rawArgs);
+    }
+    catch (err) {
+        return `MCP 工具执行失败：${err instanceof Error ? err.message : String(err)}`;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 定时自主任务（设置页驱动）与 MCP 设置页状态
+// ---------------------------------------------------------------------------
+function autoTaskStatePath() {
+    return path.join(electron_1.app.getPath('userData'), 'autonomy-state.json');
+}
+
+function loadAutoTaskState() {
+    try {
+        const raw = JSON.parse(fs.readFileSync(autoTaskStatePath(), 'utf8'));
+        return {
+            dayKey: typeof raw.dayKey === 'string' ? raw.dayKey : '',
+            countToday: typeof raw.countToday === 'number' && Number.isFinite(raw.countToday) ? Math.max(0, Math.round(raw.countToday)) : 0,
+            lastRunAt: typeof raw.lastRunAt === 'number' && Number.isFinite(raw.lastRunAt) ? raw.lastRunAt : 0,
+            lastEventAt: typeof raw.lastEventAt === 'number' && Number.isFinite(raw.lastEventAt) ? raw.lastEventAt : 0,
+        };
+    }
+    catch {
+        return { dayKey: '', countToday: 0, lastRunAt: 0, lastEventAt: 0 };
+    }
+}
+
+function persistAutoTaskState() {
+    try {
+        fs.writeFileSync(autoTaskStatePath(), JSON.stringify(autoTaskState), 'utf8');
+    }
+    catch {
+        /* 计数落盘失败不影响下次运行 */
+    }
+}
+
+/** 按设置重新排程：关闭就清掉定时器；间隔最小 5 分钟由 autonomy 归一化保证 */
+function autoTaskSettingsNormalized(settings) {
+    return autonomy_1.normalizeAutoTaskSettings({
+        enabled: settings.autoTaskEnabled,
+        mode: settings.autoTaskMode,
+        prompt: settings.autoTaskPrompt,
+        intervalMin: settings.autoTaskIntervalMin,
+        dailyLimit: settings.autoTaskDailyLimit,
+        eventEnabled: settings.autoTaskEventEnabled,
+        eventMatch: settings.autoTaskEventMatch,
+        eventCooldownMin: settings.autoTaskEventCooldownMin,
+    });
+}
+
+function applyAutoTaskSettings(settings) {
+    autoTaskCfg = autoTaskSettingsNormalized(settings);
+    if (autoTaskTimer) {
+        clearInterval(autoTaskTimer);
+        autoTaskTimer = null;
+    }
+    if (!autoTaskCfg.enabled)
+        return;
+    // 每分钟醒一次，由 shouldRunAutoTask 按间隔/每日上限/忙碌状态决定跑不跑
+    autoTaskTimer = setInterval(() => { void runAutoTask('schedule'); }, 60_000);
+}
+
+function initAutoTask(settings, resolver) {
+    autoTaskState = loadAutoTaskState();
+    autoTaskChat = new chatClient_1.ChatClient(settings, {
+        onChunk: () => undefined,
+        onDone: (full) => {
+            const resolve = autoTaskResolve;
+            autoTaskResolve = null;
+            autoTaskReject = null;
+            if (resolve) resolve(full);
+        },
+        onError: (message) => {
+            const reject = autoTaskReject;
+            autoTaskResolve = null;
+            autoTaskReject = null;
+            if (reject) reject(new Error(message));
+        },
+    }, resolver.knowledgeDir());
+    autoTaskChat.setUserDataDir(electron_1.app.getPath('userData'));
+    if (promptLibrary)
+        autoTaskChat.setPromptLibrary(promptLibrary);
+    externalChat = new chatClient_1.ChatClient(settings, {
+        onChunk: () => undefined,
+        onDone: (full) => {
+            const resolve = externalChatResolve;
+            externalChatResolve = null;
+            externalChatReject = null;
+            if (resolve)
+                resolve(full);
+        },
+        onError: (message) => {
+            const reject = externalChatReject;
+            externalChatResolve = null;
+            externalChatReject = null;
+            if (reject)
+                reject(new Error(message));
+        },
+    }, resolver.knowledgeDir());
+    externalChat.setUserDataDir(electron_1.app.getPath('userData'));
+    if (promptLibrary)
+        externalChat.setPromptLibrary(promptLibrary);
+    applyAutoTaskSettings(settings);
+    configureAutoTaskTools();
+}
+
+/** 用静默 ChatClient 问一次（无工具、不弹窗，结果只进气泡） */
+async function askAutoTask(promptText) {
+    if (!autoTaskChat)
+        throw new Error('自主任务未初始化');
+    autoTaskChat.updateSettings((0, chatClient_1.loadAppSettings)());
+    return await new Promise((resolve, reject) => {
+        autoTaskResolve = resolve;
+        autoTaskReject = reject;
+        autoTaskChat.startChat(promptText).catch((err) => {
+            autoTaskResolve = null;
+            autoTaskReject = null;
+            reject(err instanceof Error ? err : new Error(String(err)));
+        });
+    });
+}
+
+/** 事件触发的统一判断：开关、是否匹配由调用方决定，这里只管跑 */
+function maybeRunEventAutoTask(eventMatched) {
+    // 开关/冷却/每日上限统一由 autonomy.shouldRunAutoTask 判断，这里不重复一套条件
+    void runAutoTask('event', eventMatched);
+}
+
+/** 活动窗口变化：命中设置里的匹配串才触发（应用名或标题包含，不区分大小写） */
+function maybeTriggerAutoTaskByWindow(info) {
+    const settings = (0, chatClient_1.loadAppSettings)();
+    if (!settings.autoTaskEnabled || settings.autoTaskEventEnabled !== true)
+        return;
+    const cfg = autoTaskSettingsNormalized(settings);
+    if (!cfg.eventMatch || !autonomy_1.matchesAutoTaskEvent(cfg, info?.app || '', info?.title || ''))
+        return;
+    maybeRunEventAutoTask(true);
+}
+
+/** 外部 MCP 客户端让桌宠 AI 回一句话：串行 + 3 秒最小间隔，避免被频繁调用烧钱 */
+async function askPetChat(promptText) {
+    if (!externalChat)
+        throw new Error('AI 未就绪');
+    if (externalChatBusy)
+        throw new Error('桌宠正在回复其他外部请求，请稍后再试');
+    const now = Date.now();
+    if (now - lastExternalChatAt < 3000)
+        throw new Error('调用太频繁（最小间隔 3 秒）');
+    lastExternalChatAt = now;
+    externalChatBusy = true;
+    try {
+        externalChat.updateSettings((0, chatClient_1.loadAppSettings)());
+        const reply = await new Promise((resolve, reject) => {
+            externalChatResolve = resolve;
+            externalChatReject = reject;
+            externalChat.startChat(promptText.slice(0, 2000)).catch((err) => {
+                externalChatResolve = null;
+                externalChatReject = null;
+                reject(err instanceof Error ? err : new Error(String(err)));
+            });
+        });
+        const text = String(reply).trim().slice(0, 2000);
+        scenario?.record('event', `外部自动化：AI 回复「${text.slice(0, 40)}」`);
+        return text || '（AI 没有返回内容）';
+    }
+    finally {
+        externalChatBusy = false;
+    }
+}
+
+/** 只读 pet:// 资源（外部 MCP 客户端读取桌宠上下文用） */
+/** 桌宠运行状态文本：工具 pet_status 与 pet://status 资源共用一份实现 */
+function petStatusText() {
+    const settings = (0, chatClient_1.loadAppSettings)();
+    const info = monitor?.getCurrentInfo() ?? null;
+    const todos = toolbox?.getTodos() ?? [];
+    const model = settings.modelName || (appResolver ? appResolver.modelList()[0] : '') || '未设置';
+    const mcpIn = mcpClient ? mcpClient.statusText().split('\n')[0] : 'MCP 工具：未配置';
+    return [
+        `桌宠：${settings.petName || model}`,
+        `模型：${model}`,
+        `活动窗口：${info ? `${info.app || '未知应用'} — ${info.title || '无标题'}` : '无法获取'}`,
+        `待办：${todos.length} 条（${todos.filter((t) => !t.done).length} 条未完成）`,
+        mcpIn,
+    ].join('\n');
+}
+
+function readPetResource(uri) {
+    switch (uri) {
+        case 'pet://status': {
+            const panel = mcpPanelStatusNow();
+            return [petStatusText(), panel.clientText, panel.serverText].filter(Boolean).join('\n\n');
+        }
+        case 'pet://todos': {
+            const todos = toolbox ? toolbox.getTodos() : [];
+            return todos.length ? todos.map((t) => `${t.done ? '[x]' : '[ ]'} ${t.id}. ${t.text}`).join('\n') : '当前没有待办。';
+        }
+        case 'pet://scenario':
+            return scenario ? scenario.injectText() : '情景提示词不可用。';
+        case 'pet://skills':
+            return skillBox ? skillBox.catalogText() : '技能库不可用。';
+        default:
+            return null;
+    }
+}
+
+/** 后台允许的 MCP 工具：服务器 autoApprove + 工具只读声明（策略在 mcpClient，避免两处判断） */
+function autoTaskApprovedToolDefs() {
+    if (!mcpClient)
+        return [];
+    return mcpClient.toolDefs().filter((d) => {
+        const name = String((d.function && d.function.name) || '');
+        return name && mcpClient.isAutoApprovedReadOnly(name);
+    });
+}
+
+/** 设置开启且存在允许工具时，才给静默 ChatClient 挂执行器（未开启时保持"无工具"原行为） */
+function configureAutoTaskTools(settings) {
+    if (!autoTaskChat)
+        return;
+    const cfg = settings ?? (0, chatClient_1.loadAppSettings)();
+    const defs = cfg.autoTaskAllowMcp === true ? autoTaskApprovedToolDefs() : [];
+    autoTaskChat.setExternalToolDefs(defs);
+    autoTaskChat.setToolExecutor(defs.length ? autoTaskToolExecutor : null);
+}
+
+/** 后台工具执行器：不弹确认、只读白名单、每次最多 6 次、同一工具+参数最多 2 次 */
+async function autoTaskToolExecutor(name, args) {
+    if (!mcpClient)
+        return 'MCP 客户端未就绪。';
+    if (!mcpClient.isAutoApprovedReadOnly(name))
+        return '该工具不允许后台调用（需要服务器 autoApprove 且工具声明只读）。';
+    if (autoTaskToolCount >= 6)
+        return '后台任务工具调用次数已达上限（6 次）。';
+    const key = `${name}:${JSON.stringify(args ?? {})}`;
+    const repeat = (autoTaskToolRepeat.get(key) || 0) + 1;
+    autoTaskToolRepeat.set(key, repeat);
+    if (repeat > 2)
+        return '同一工具与参数重复调用过多，已拒绝（防止死循环）。';
+    autoTaskToolCount += 1;
+    scenario?.record('event', `自主任务调用工具：${name}`);
+    return await mcpClient.callTool(name, args);
+}
+
+/** 给后台 AI 的可用工具提示（没有允许工具时为空串，保持原提示词不变） */
+function autoTaskToolHint() {
+    const defs = autoTaskApprovedToolDefs();
+    if (!defs.length)
+        return '';
+    const names = defs.map((d) => String((d.function && d.function.name) || '')).filter(Boolean).slice(0, 8);
+    return `\n你还可以调用只读 MCP 工具（用户已授权）：${names.join(', ')}。需要时用工具核实事实；不要执行有副作用的操作。`;
+}
+
+function autoTaskContext() {
+    const info = monitor?.getCurrentInfo() ?? null;
+    const todos = toolbox?.getTodos() ?? [];
+    return {
+        activeWindow: info ? `${info.app || '未知应用'} — ${info.title || '无标题'}` : '未知',
+        todoText: todos.filter((t) => !t.done).map((t) => t.text).slice(0, 5).join('；'),
+        mcpText: mcpClient ? mcpClient.statusText().split('\n').slice(0, 2).join(' | ') : '未配置',
+    };
+}
+
+/** 返回给设置页/日志的结果文本；schedule 触发时静默跳过 */
+async function runAutoTask(trigger, eventMatched = false) {
+    const settings = (0, chatClient_1.loadAppSettings)();
+    autoTaskCfg = autoTaskSettingsNormalized(settings);
+    const gate = {
+        busy: chat?.isBusy?.() === true,
+        pendingAsk: pendingAsks.size > 0,
+        running: autoTaskRunning,
+        trigger: trigger === 'manual' ? 'manual' : trigger === 'event' ? 'event' : 'schedule',
+        eventMatched,
+    };
+    const decision = autonomy_1.shouldRunAutoTask(Date.now(), autoTaskCfg, autoTaskState, gate);
+    autoTaskState = decision.state;
+    if (!decision.run) {
+        autoTaskLastResult = `跳过：${decision.reason}`;
+        return autoTaskLastResult;
+    }
+    autoTaskRunning = true;
+    autoTaskToolCount = 0;
+    autoTaskToolRepeat.clear();
+    configureAutoTaskTools(settings);
+    try {
+        if (autoTaskCfg.mode === 'mcp_check') {
+            const serverText = petMcpServer ? petMcpServer.statusText() : 'MCP 服务端：不可用';
+            const summary = autonomy_1.buildMcpCheckSummary(mcpClient ? mcpClient.statusText() : '未配置 MCP 服务。', serverText);
+            autoTaskLastResult = summary.text;
+            if (!summary.ok) {
+                const warn = summary.text.split('\n').slice(0, 2).join('；');
+                sendToRenderer(contracts_1.IPC_UI_BUBBLE, { text: `⚠️ MCP 检查：${warn}`, ttlMs: 12000 });
+            }
+        }
+        else {
+            const ctx = autoTaskContext();
+            const prompt = autonomy_1.buildAutoTaskPrompt(Date.now(), {
+                mode: autoTaskCfg.mode,
+                prompt: autoTaskCfg.prompt,
+                petName: settings.petName || '',
+                model: settings.aiModel || '',
+                ...ctx,
+            });
+            const reply = (await askAutoTask(prompt + autoTaskToolHint())).trim().replace(/^["「]|["」]$/g, '');
+            autoTaskLastResult = reply;
+            if (reply && !reply.includes('无需提醒'))
+                sendToRenderer(contracts_1.IPC_UI_BUBBLE, { text: reply.slice(0, 120), ttlMs: 12000 });
+        }
+        scenario?.record('event', `自主任务（${autoTaskCfg.mode}）：${String(autoTaskLastResult).slice(0, 80)}`);
+        const now = Date.now();
+        autoTaskState = {
+            ...autoTaskState,
+            countToday: autoTaskState.countToday + 1,
+            lastRunAt: now,
+            ...(trigger === 'event' ? { lastEventAt: now } : {}),
+        };
+        persistAutoTaskState();
+        return autoTaskLastResult;
+    }
+    catch (err) {
+        autoTaskLastResult = `失败：${err instanceof Error ? err.message : String(err)}`;
+        return autoTaskLastResult;
+    }
+    finally {
+        autoTaskRunning = false;
+    }
+}
+
+/** 设置页状态：两个方向 + 自主任务计数 */
+function mcpPanelStatusNow() {
+    const settings = (0, chatClient_1.loadAppSettings)();
+    const serverText = petMcpServer ? petMcpServer.statusText() : 'MCP 服务端：不可用';
+    const urlMatch = serverText.match(/http:\/\/127\.0\.0\.1:\d+\/mcp/);
+    const cfg = autoTaskCfg ?? autoTaskSettingsNormalized(settings);
+    return {
+        clientText: mcpClient ? mcpClient.statusText() : 'MCP 外部工具：未初始化',
+        serverText,
+        serverEnabled: settings.mcpServerEnabled === true,
+        serverUrl: urlMatch ? urlMatch[0] : '',
+        autoTask: {
+            enabled: cfg.enabled,
+            mode: cfg.mode,
+            intervalMin: cfg.intervalMin,
+            dailyLimit: cfg.dailyLimit,
+            countToday: autoTaskState.countToday,
+            lastRunAt: autoTaskState.lastRunAt,
+            running: autoTaskRunning,
+            lastResult: autoTaskLastResult,
+        },
+    };
+}
+
 function shutdown() {
     if (tickTimer !== null) {
         clearInterval(tickTimer);
@@ -3155,6 +3753,13 @@ function shutdown() {
     chat?.cancel();
     toolbox?.stop(); // 停止所有提醒定时器（数据已持久化，下次启动恢复）
     (0, devTools_1.clearBgTasks)(); // 杀掉仍在跑的后台命令，避免窗口关了进程还在（Electron 退出不会自动收子进程）
+    if (autoTaskTimer) {
+        clearInterval(autoTaskTimer);
+        autoTaskTimer = null;
+    }
+    autoTaskChat?.cancel();
+    mcpClient?.dispose(); // 关闭 MCP 子进程/挂起请求
+    petMcpServer?.dispose(); // 关闭 MCP 服务端监听
     clearPendingAsks('应用正在关闭');
     if (server) {
         const srv = server;

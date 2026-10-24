@@ -25,6 +25,7 @@
  * 当前使用轻量启发式估算，避免引入额外的原生依赖。
  */
 import * as fs from 'fs';
+import { createToolLoopGuard, nextToolLoopGuard, type ToolLoopGuardState } from './toolLoopGuard';
 import * as http from 'http';
 import * as https from 'https';
 import * as path from 'path';
@@ -68,393 +69,8 @@ interface ChatMessage {
 export type ToolExecutor = (name: string, args: unknown) => Promise<string>;
 
 /** 暴露给模型的功能清单（OpenAI tools 格式） */
-export const TOOL_DEFS: Array<{ type: string; function: Record<string, unknown> }> = [
-  { type: 'function', function: { name: 'get_time', description: '获取当前本地日期和时间。用户询问现在几点、今天日期时使用。', parameters: { type: 'object', properties: {} } } },
-  { type: 'function', function: { name: 'active_window_get', description: '查看当前活动窗口的应用、标题和是否全屏，用于了解用户正在做什么。只在用户询问当前工作状态时使用。', parameters: { type: 'object', properties: {} } } },
-  { type: 'function', function: { name: 'workspace_file_read', description: '读取工作区内文本文件的一小段。仅接受相对路径。', parameters: { type: 'object', properties: { path: { type: 'string', description: '工作区内的相对路径，如 src/main/ai/chatClient.ts' }, startLine: { type: 'number', description: '起始行，从 1 开始（可省略）' }, endLine: { type: 'number', description: '结束行，含该行（可省略）' } }, required: ['path'] } } },
-  { type: 'function', function: { name: 'workspace_search', description: '在工作区文本和代码中搜索：默认返回「文件:行号: 片段」；可用 mode 切换 files（只给命中的文件）/ count（每个文件的命中数），regex 用正则，glob 过滤文件名。', parameters: { type: 'object', properties: { query: { type: 'string', description: '关键词或正则（≤200 字符）' }, glob: { type: 'string', description: '可选文件名过滤，支持 * 与 **，例如 *.ts、src/**/*.ts' }, mode: { type: 'string', enum: ['content', 'files', 'count'], description: '输出模式：content=命中行（默认）；files=只列文件；count=每个文件命中数' }, regex: { type: 'boolean', description: '是否把 query 当正则（默认 false=普通文本）' }, ignore_case: { type: 'boolean', description: '是否忽略大小写（默认 true）' }, maxResults: { type: 'number', description: '最多返回条数，默认 20（上限 50）' } }, required: ['query'] } } },
-  {
-    type: 'function',
-    function: {
-      name: 'workspace_glob',
-      description: '按 glob 模式列出工作区里的文件（按最近修改排序，默认最多 100 个），用来先摸清项目里有哪些文件。例：**/*.ts、src/**、package.json。',
-      parameters: {
-        type: 'object',
-        properties: {
-          pattern: { type: 'string', description: 'glob 模式，如 **/*.ts（省略则列出全部文本文件）' },
-          maxResults: { type: 'number', description: '最多返回多少个（默认 100，上限 500）' },
-        },
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'open_path',
-      description:
-        '用系统默认程序打开工作区里的一个文件或文件夹（做完 PPT/文档后给用户看，或打开项目目录时用）。只允许工作区内的相对路径；为了安全，只放行文档/图片/网页类扩展名与目录，不会启动 .exe/.bat 之类可执行文件。',
-      parameters: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: '工作区内的相对路径，如 sleep.pptx 或 dist/' },
-        },
-        required: ['path'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'plan_update',
-      description:
-        '维护一份用户可见的任务进度清单：多步任务开工时先列清单（全部 pending），之后每完成一步就更新一次（做完的标 done、正在做的标 doing）。单步任务不要用；清单最多 20 项。',
-      parameters: {
-        type: 'object',
-        properties: {
-          items: {
-            type: 'array',
-            description: '完整清单（每次都要把全部项一起传，不是增量）',
-            items: {
-              type: 'object',
-              properties: {
-                text: { type: 'string', description: '这一步要做什么（≤120 字）' },
-                status: { type: 'string', enum: ['pending', 'doing', 'done'], description: 'pending=待办、doing=进行中、done=已完成' },
-              },
-              required: ['text'],
-            },
-          },
-        },
-        required: ['items'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'web_fetch',
-      description:
-        '抓取一个网页并转成纯文本阅读（查在线文档、看报错页面、核对 API 用法时用）。只支持 http/https 公网地址，不能访问本机/内网；单次正文最多约 6000 字符。只读，不会改文件；每次抓取前会请用户确认。',
-      parameters: {
-        type: 'object',
-        properties: {
-          url: { type: 'string', description: '完整网址，例如 https://nodejs.org/api/fs.html' },
-          max_chars: { type: 'number', description: '正文最多取多少字符（默认 6000，范围 500~20000）' },
-        },
-        required: ['url'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'weather_get',
-      description:
-        '查某个城市的实时天气与未来几天预报（数据来自 Open-Meteo，免费无需密钥）。用户问"今天天气怎么样""明天要带伞吗"时用。city 必填——你不知道用户在哪个城市就先问一句，别猜、也别拿模型训练数据里的旧天气糊弄。只读，不联网抓页面，不需要用户确认。',
-      parameters: {
-        type: 'object',
-        properties: {
-          city: { type: 'string', description: '城市名，例如 杭州 / 北京 / 上海（中文名即可，≤40 字）' },
-          days: { type: 'number', description: '预报天数（默认 3，范围 1~7）' },
-        },
-        required: ['city'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'media_control',
-      description:
-        '控制当前正在播放的音乐/视频：播放暂停、上一首下一首、停止、音量增减、静音。发的是**系统媒体键**，所以对任意播放器都有效（含浏览器里的视频），你不需要知道用户在用什么软件。只在用户明确要求控制播放时用（"暂停一下""下一首""声音小一点"），不要主动调音量。',
-      parameters: {
-        type: 'object',
-        properties: {
-          action: {
-            type: 'string',
-            description: 'play_pause（播放/暂停）/ next（下一首）/ prev（上一首）/ stop / volume_up / volume_down / mute',
-          },
-        },
-        required: ['action'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'screen_capture',
-      description:
-        '截取整个屏幕并保存成 PNG（用户说"截个图""把屏幕拍下来"时用）。默认存到图片文件夹下的「Pet截图」。多显示器可以用 display 指定第几块屏。截的是屏幕，不是应用自己的窗口。',
-      parameters: {
-        type: 'object',
-        properties: {
-          display: { type: 'number', description: '第几块屏幕，从 1 开始（默认 1）' },
-          save_path: { type: 'string', description: '可选：绝对路径。给目录则自动命名，给 .png 结尾的完整路径则用它' },
-        },
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'meeting_create',
-      description:
-        '把一件日程写进用户日历（用户说"记个会""明天三点开会"时用）。生成标准 .ics 文件并交给系统默认日历程序导入——不需要任何账号授权。时间要问清楚，不要自己编。',
-      parameters: {
-        type: 'object',
-        properties: {
-          title: { type: 'string', description: '日程标题，≤120 字' },
-          start: { type: 'string', description: '开始时间，写成 2026-09-30 15:00（本地时间）或完整 ISO8601' },
-          duration_minutes: { type: 'number', description: '时长（分钟），默认 60，范围 5~480' },
-          location: { type: 'string', description: '可选：地点，≤500 字' },
-          description: { type: 'string', description: '可选：说明，≤500 字' },
-        },
-        required: ['title', 'start'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'translate_text',
-      description:
-        '把一段文本翻译成指定语言。长文用它比直接在对话里翻译更省上下文，术语也更统一。只输出译文，不含解释。',
-      parameters: {
-        type: 'object',
-        properties: {
-          text: { type: 'string', description: '要翻译的文本，≤8000 字' },
-          to: { type: 'string', description: '目标语言，例如 英文 / 日语 / English' },
-          from: { type: 'string', description: '可选：源语言；不填则自动识别' },
-        },
-        required: ['text', 'to'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'mail_compose',
-      description:
-        '起草一封邮件并打开用户的默认邮件客户端（不需要任何邮箱配置）。只负责把收件人/主题/正文填进去，发送由用户在客户端里自己确认——你不会替用户发信。',
-      parameters: {
-        type: 'object',
-        properties: {
-          to: { type: 'string', description: '可选：收件人，多个用逗号分隔；不填则打开空白草稿' },
-          subject: { type: 'string', description: '可选：主题，≤200 字' },
-          body: { type: 'string', description: '可选：正文，≤4000 字' },
-        },
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'mail_check',
-      description:
-        '查看收件箱里最近的未读邮件（标题/发件人/时间）。需要用户先在设置里配好 IMAP 服务器与授权码；没配就如实说明，不要假装看过。只读，而且用 BODY.PEEK 取信头，不会把邮件标记成已读。',
-      parameters: {
-        type: 'object',
-        properties: {
-          limit: { type: 'number', description: '最多列几封，默认 10，范围 1~30' },
-          unseen_only: { type: 'boolean', description: '只看未读（默认 true）' },
-        },
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'agent_task',
-      description:
-        '把「开放式探查/研究」交给一个独立上下文的子代理去做：它自己多轮读文件/搜代码，最后只回一段结论摘要（省上下文）。适合"摸清陌生项目结构""找出某功能实现在哪""多文件交叉验证"；一步能查完的不要用。默认只给只读工具，不会改文件。',
-      parameters: {
-        type: 'object',
-        properties: {
-          prompt: { type: 'string', description: '交给子代理的任务，写清楚要查清什么、输出什么（≤2000 字）' },
-          tools: {
-            type: 'array',
-            items: { type: 'string' },
-            description: '可选：允许子代理使用的工具名子集（默认只读：workspace_file_read/workspace_search/workspace_glob）',
-          },
-          max_rounds: { type: 'number', description: '子代理最多几轮工具调用（默认 4，范围 1~6）' },
-        },
-        required: ['prompt'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'plan_propose',
-      description: '多步任务（建项目、改多个文件、装依赖、跑构建）动手前，先用它把计划交给用户批准。用户批准后再执行；被拒绝就问清楚要改什么。简单一步操作不要用。',
-      parameters: {
-        type: 'object',
-        properties: { plan: { type: 'string', description: '实施计划：要创建/修改哪些文件、执行哪些命令、如何验证（分行写）' } },
-        required: ['plan'],
-      },
-    },
-  },
-  { type: 'function', function: { name: 'note_add', description: '保存用户明确要求记住的工作想法或个人笔记。', parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } } },
-  { type: 'function', function: { name: 'note_list', description: '列出已保存的个人工作笔记。', parameters: { type: 'object', properties: {} } } },
-  { type: 'function', function: { name: 'open_settings', description: '打开 Pet 设置面板。仅在用户明确要求打开设置时使用。', parameters: { type: 'object', properties: {} } } },
-  { type: 'function', function: { name: 'set_emotion', description: '切换桌宠表情。仅在用户明确要求时使用。', parameters: { type: 'object', properties: { name: { type: 'string', description: '表情名称；空字符串表示恢复默认' } }, required: ['name'] } } },
-  { type: 'function', function: { name: 'play_motion', description: '播放桌宠动作。仅在用户明确要求时使用。', parameters: { type: 'object', properties: { group: { type: 'string', enum: ['Idle', 'wave'], description: '动作组' } }, required: ['group'] } } },
-  { type: 'function', function: { name: 'open_todo_panel', description: '打开“待办笔记本”面板（用户说 打开待办/笔记本/清单 时用）', parameters: { type: 'object', properties: {} } } },
-  { type: 'function', function: { name: 'todo_add', description: '添加一条待办事项', parameters: { type: 'object', properties: { text: { type: 'string', description: '待办内容' } }, required: ['text'] } } },
-  { type: 'function', function: { name: 'todo_list', description: '列出当前待办事项', parameters: { type: 'object', properties: {} } } },
-  { type: 'function', function: { name: 'todo_toggle', description: '把某条待办标记完成/取消（按 id）', parameters: { type: 'object', properties: { id: { type: 'number' } }, required: ['id'] } } },
-  { type: 'function', function: { name: 'todo_remove', description: '删除某条待办（按 id）', parameters: { type: 'object', properties: { id: { type: 'number' } }, required: ['id'] } } },
-  { type: 'function', function: { name: 'todo_update', description: '修改某条待办的文字（保留完成状态）', parameters: { type: 'object', properties: { id: { type: 'number' }, text: { type: 'string' } }, required: ['id', 'text'] } } },
-  { type: 'function', function: { name: 'todo_clear_done', description: '清除所有已完成的待办', parameters: { type: 'object', properties: {} } } },
-  { type: 'function', function: { name: 'todo_add_many', description: '一次添加多条待办（2~20 条，自动过滤空串与重复）', parameters: { type: 'object', properties: { texts: { type: 'array', items: { type: 'string' } } }, required: ['texts'] } } },
-  {
-    type: 'function',
-    function: {
-      name: 'set_reminder',
-      description: '设置提醒/闹钟。可相对时间(after_minutes)或定点(at_hhmm 如 "20:30")，daily=true 表示每天重复',
-      parameters: {
-        type: 'object',
-        properties: {
-          text: { type: 'string', description: '提醒内容' },
-          after_minutes: { type: 'number', description: '多少分钟后提醒' },
-          at_hhmm: { type: 'string', description: '今日该时刻提醒（HH:MM），已过则次日' },
-          daily: { type: 'boolean', description: '每天重复' },
-        },
-        required: ['text'],
-      },
-    },
-  },
-  { type: 'function', function: { name: 'reminder_list', description: '列出已设置的提醒/闹钟', parameters: { type: 'object', properties: {} } } },
-  { type: 'function', function: { name: 'reminder_cancel', description: '取消提醒（id 或 all）', parameters: { type: 'object', properties: { id: { type: 'number' }, all: { type: 'boolean' } } } } },
-  {
-    type: 'function',
-    function: {
-      name: 'ask_user',
-      description: '向用户提一个问题并等待回答：信息不足、需要在若干方案中选择，或执行前征询许可时使用。',
-      parameters: {
-        type: 'object',
-        properties: {
-          question: { type: 'string', description: '完整问题，清晰具体，以问号结尾' },
-          options: {
-            type: 'array',
-            description: '2~4 个互斥选项',
-            items: { type: 'object', properties: { label: { type: 'string' }, description: { type: 'string' } }, required: ['label'] },
-          },
-        },
-        required: ['question', 'options'],
-      },
-    },
-  },
-  { type: 'function', function: { name: 'skill_list', description: '列出本机可用技能（名称+描述）', parameters: { type: 'object', properties: {} } } },
-  { type: 'function', function: { name: 'skill_use', description: '按名称获取某个技能的完整操作步骤，随后严格按其执行', parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } } },
-  {
-    type: 'function',
-    function: {
-      name: 'workspace_set_root',
-      description:
-        '把某个绝对路径目录设为「开发工作区」（会弹一次确认框并保存到设置）。当用户明确说出要在哪个目录里建项目/文件夹时，先调用它；不要要求用户自己去设置面板填写。',
-      parameters: {
-        type: 'object',
-        properties: { path: { type: 'string', description: '完整的绝对路径，例如 C:\\Users\\you\\Desktop\\我的项目' } },
-        required: ['path'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'workspace_mkdir',
-      description: '在开发工作区内创建目录（自动递归创建父目录）。仅在用户明确要求新建文件夹/项目目录时使用。每次执行都会先请用户确认。',
-      parameters: { type: 'object', properties: { path: { type: 'string', description: '相对开发工作区的路径，如 my-app/src' } }, required: ['path'] },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'workspace_write',
-      description: '在开发工作区内创建或覆盖一个文本文件（自动创建父目录；会覆盖同名文件；内容上限 2MB；每次执行都会先请用户确认）。',
-      parameters: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: '相对开发工作区的路径，如 my-app/package.json' },
-          content: { type: 'string', description: '完整文件内容（会原样写入，最多 2MB）' },
-        },
-        required: ['path', 'content'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'workspace_edit',
-      description: '对开发工作区内已有文件做精确字符串替换。old_string 必须在文件中唯一，否则请补足上下文或设置 replace_all。改文件前应先用 workspace_file_read 读过它。',
-      parameters: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: '相对开发工作区的文件路径' },
-          old_string: { type: 'string', description: '要被替换的原文（含缩进，必须与文件内容完全一致）' },
-          new_string: { type: 'string', description: '替换成的新内容' },
-          replace_all: { type: 'boolean', description: '是否替换所有匹配项（默认 false，只替换唯一的一处）' },
-        },
-        required: ['path', 'old_string', 'new_string'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'shell_run',
-      description:
-        '在开发工作区内执行一条 PowerShell 命令（如 mkdir、npm install、npm run build、git status、node script.js）。默认 60 秒超时（可调，上限 300 秒；装依赖这类慢命令请显式给 timeout_ms: 300000），危险命令会被拒绝，每次执行都会先请用户确认，输出会截断。命令之间会记住上次的工作目录（也可用 cwd 显式指定）。',
-      parameters: {
-        type: 'object',
-        properties: {
-          command: { type: 'string', description: '完整 PowerShell 命令' },
-          cwd: { type: 'string', description: '工作目录（相对开发工作区，默认即工作区根目录）' },
-          timeout_ms: { type: 'number', description: '超时毫秒数（默认 60000，最大 120000）' },
-        },
-        required: ['command'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'shell_bg',
-      description:
-        '把命令放到后台跑（装依赖、跑构建这类慢命令用），立刻返回任务 id，不阻塞对话；随后用 shell_output 查看进度/结果、shell_kill 终止。危险命令同样会被拒绝。',
-      parameters: {
-        type: 'object',
-        properties: {
-          command: { type: 'string', description: '完整 PowerShell 命令（必须非交互）' },
-          cwd: { type: 'string', description: '工作目录（相对开发工作区，默认继承上一条命令的目录）' },
-        },
-        required: ['command'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'shell_output',
-      description: '查看后台任务：不传 id 列出全部任务，传 id 看该任务的 stdout/stderr 末尾与状态（running/done/failed/killed）。',
-      parameters: {
-        type: 'object',
-        properties: {
-          id: { type: 'string', description: 'shell_bg 返回的任务 id，如 bg-1' },
-          maxChars: { type: 'number', description: '最多回显多少字符（默认 2000，范围 200~4000）' },
-        },
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'shell_kill',
-      description: '终止一个还在运行的后台任务。',
-      parameters: { type: 'object', properties: { id: { type: 'string', description: '任务 id，如 bg-1' } }, required: ['id'] },
-    },
-  },
-];
+import { TOOL_DEFS } from './tools/catalog';
+export { TOOL_DEFS };
 
 /** 已解析且合并环境变量的运行配置 */
 interface ResolvedConfig {
@@ -492,10 +108,14 @@ const CONFIRM_TOOLS = new Set([
 const SHELL_TOOLS = new Set(['shell_run', 'shell_bg', 'shell_output', 'shell_kill']);
 /** 按工具类型取执行超时（等待用户确认的时间不能被算成执行超时） */
 function toolTimeoutMs(name: string): number {
+  if (name.startsWith(TOOL_PREFIX_MCP)) return TOOL_TIMEOUT_CONFIRM_MS; // MCP：确认等待 + 远端执行
   if (SHELL_TOOLS.has(name)) return TOOL_TIMEOUT_SHELL_MS;
   if (CONFIRM_TOOLS.has(name)) return TOOL_TIMEOUT_CONFIRM_MS;
   return TOOL_TIMEOUT_MS;
 }
+/** MCP 工具名前缀（与 ai/mcpClient.ts 的 makePublicToolName 保持一致） */
+const TOOL_PREFIX_MCP = 'mcp__';
+
 /** 单轮最多几次工具调用（多步任务：读→查环境→写→跑→验证→修，8 次根本不够） */
 const MAX_TOOL_CALLS = 40;
 /** 单轮最多几个"模型↔工具"往返 */
@@ -624,6 +244,22 @@ export function loadAppSettings(): AppSettings {
       })(),
       // 桌宠名字同样**必须读回来**，否则"改完名字、重开设置又空了"（写入侧支持、读取侧漏了）。
       petName: str('petName') ?? '',
+      // MCP 服务端 + 定时自主任务：新设置项一律在这里补读，否则"能存不能读"
+      mcpServerEnabled: bool(false, 'mcpServerEnabled'),
+      mcpServerPort: Math.round(Math.min(65535, Math.max(1024, num(37653, 'mcpServerPort')))),
+      mcpServerToken: (str('mcpServerToken') ?? '').slice(0, 128),
+      autoTaskEnabled: bool(false, 'autoTaskEnabled'),
+      autoTaskMode: ((): 'mcp_check' | 'scene_brief' | 'custom' => {
+        const rawMode = str('autoTaskMode');
+        return rawMode === 'scene_brief' || rawMode === 'custom' ? rawMode : 'mcp_check';
+      })(),
+      autoTaskPrompt: (str('autoTaskPrompt') ?? '').slice(0, 200),
+      autoTaskIntervalMin: Math.round(Math.min(240, Math.max(5, num(30, 'autoTaskIntervalMin')))),
+      autoTaskDailyLimit: Math.round(Math.min(200, Math.max(1, num(20, 'autoTaskDailyLimit')))),
+      autoTaskEventEnabled: bool(false, 'autoTaskEventEnabled'),
+      autoTaskEventMatch: (str('autoTaskEventMatch') ?? '').slice(0, 80),
+      autoTaskEventCooldownMin: Math.round(Math.min(120, Math.max(5, num(15, 'autoTaskEventCooldownMin')))),
+      autoTaskAllowMcp: bool(false, 'autoTaskAllowMcp'),
     };
   } catch (err) {
     console.warn('[chatClient] settings.json 解析失败，回退环境变量：', (err as Error).message);
@@ -816,6 +452,8 @@ export class ChatClient {
   private cancelled = false;
   private chatGeneration = 0;
   private toolExecutor: ToolExecutor | null = null; // 由 main 注入（本地工具执行）
+  /** 是否正在回复（自主任务/后台检查据此避让，避免打断对话） */
+  private busy = false;
   /** 技能清单提示（main 注入，附加到 system prompt） */
   private skillCatalog = '';
   /** 用量统计 */
@@ -832,6 +470,8 @@ export class ChatClient {
   private promptLibrary: PromptLibrary = loadPromptLibrary(null);
   /** 情景提示词（屏幕活动 + 行动日志；main 注入） */
   private scenario: ScenarioContext | null = null;
+  /** 外部工具定义（MCP 等；main 注入，默认空 → 行为与原来一致） */
+  private externalToolDefs: Array<{ type: string; function: Record<string, unknown> }> = [];
 
   /** 更新开发工作区根目录（设置变化时由 main/ipc 调用） */
   setWorkspaceRoot(root: string): void {
@@ -851,6 +491,20 @@ export class ChatClient {
   /** 注入情景提示词记录器（<userData>/prompts/scenario-prompt.md） */
   setScenarioContext(ctx: ScenarioContext | null): void {
     this.scenario = ctx;
+  }
+
+  /** 注入外部工具定义（MCP 等）；传空数组即撤销 */
+  setExternalToolDefs(defs: Array<{ type: string; function: Record<string, unknown> }>): void {
+    const builtin = new Set(TOOL_DEFS.map((d) => String((d.function as { name?: string }).name ?? '')));
+    this.externalToolDefs = (Array.isArray(defs) ? defs : []).filter((d) => {
+      const name = String((d?.function as { name?: string })?.name ?? '');
+      return name && !builtin.has(name);
+    });
+  }
+
+  /** 本轮可用工具 = 内置 + 外部（外部只来自已连接的服务） */
+  private allToolDefs(): Array<{ type: string; function: Record<string, unknown> }> {
+    return this.externalToolDefs.length ? [...TOOL_DEFS, ...this.externalToolDefs] : TOOL_DEFS;
   }
 
   /** 当前可注入的情景提示词文本（自检用） */
@@ -1006,6 +660,20 @@ export class ChatClient {
    */
   async startChat(text: string): Promise<void> {
     this.cancel();
+    this.busy = true;
+    try {
+      await this.startChatInner(text);
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  /** 后台任务用来避让：是否有正在进行的回复 */
+  isBusy(): boolean {
+    return this.busy;
+  }
+
+  private async startChatInner(text: string): Promise<void> {
     this.cancelled = false;
 
     const userText = text.trim();
@@ -1298,6 +966,8 @@ export class ChatClient {
 
     let finalText = '';
     let toolCallCount = 0;
+    // 循环卫生：连续相同工具+参数在第 3/5 次追加建议性提醒（不阻断）
+    let loopGuard: ToolLoopGuardState = createToolLoopGuard();
     let lastToolNote = ''; // 最后一次工具结果摘要（步数用尽时如实汇报，不再谎报成功）
     this.sawReasoning = false; // 本轮是否收到推理内容（用于说明行）
     try {
@@ -1335,7 +1005,7 @@ export class ChatClient {
           observation: phase === 'reflect' ? lastObservation : '',
         });
         messages[0] = { role: 'system', content: `${systemText}\n\n${phaseText}` };
-        const resp = await this.requestOnce(messages, TOOL_DEFS);
+        const resp = await this.requestOnce(messages, this.allToolDefs());
         const respText = typeof resp.text === 'string' ? resp.text.trim() : '';
         if (this.cancelled || generation !== this.chatGeneration) return;
         // 工具名归一化（兼容 read_file / run_command 这类短别名）
@@ -1357,7 +1027,12 @@ export class ChatClient {
           this.handlers.onThink?.({ kind: 'tool', text: `调用 ${toolName}`, tool: toolName });
           let jsonResult: string;
           try {
+            const guard = nextToolLoopGuard(loopGuard, toolName, jsonAction.parameters ?? {});
+            loopGuard = guard.state;
             jsonResult = await withTimeout(this.toolExecutor!(toolName, jsonAction.parameters), toolTimeoutMs(toolName));
+            if (guard.reminder) jsonResult = `${jsonResult}
+
+[工具循环提醒] ${guard.reminder}`;
           } catch (err) {
             jsonResult = `工具执行失败：${err instanceof Error ? err.message : String(err)}`;
           }
@@ -1406,7 +1081,11 @@ export class ChatClient {
             const args = tc.args ? JSON.parse(tc.args) : {};
             const validationError = validateToolArgs(tc.name, args);
             if (validationError) throw new Error(validationError);
+            const guard = nextToolLoopGuard(loopGuard, tc.name, args);
+            loopGuard = guard.state;
+            const guardReminder = guard.reminder;
             result = await withTimeout(this.toolExecutor!(tc.name, args), toolTimeoutMs(tc.name));
+            if (guardReminder) result = `${result}\n\n[工具循环提醒] ${guardReminder}`;
           } catch (err) {
             result = `工具执行失败：${err instanceof Error ? err.message : String(err)}`;
           }
@@ -1821,7 +1500,7 @@ export class ChatClient {
   /** 工具清单（第 2 层追加）：一行一个「名称：一句用途」，参数 schema 由 API 提供 */
   private toolCatalogHint(): string {
     const lines: string[] = [];
-    for (const def of TOOL_DEFS) {
+    for (const def of this.allToolDefs()) {
       const fn = def.function as { name?: string; description?: string };
       const name = typeof fn.name === 'string' ? fn.name : '';
       if (!name) continue;

@@ -20,12 +20,17 @@ export const IPC_AI_ERROR = 'chat:error';
 export const IPC_ACTION = 'pet:action';
 /** 主进程 push→renderer：要求渲染气泡 {text, ttlMs}。 */
 export const IPC_UI_BUBBLE = 'ui:bubble';
+/** 渲染层告知主进程：设置面板是否展开（决定窗口层级：设置打开时桌宠主窗提到最上）。 */
+export const IPC_UI_SETTINGS_OPEN = 'ui:settingsPanelOpen';
 /** invoke renderer→main：返回可用模型名数组 string[]。 */
 export const IPC_MODEL_LIST = 'model:list';
 /** invoke renderer→main：读取持久化应用设置。 */
 export const IPC_SETTINGS_GET = 'settings:get';
 /** invoke renderer→main：保存并立即应用应用设置。 */
 export const IPC_SETTINGS_SET = 'settings:set';
+export const IPC_MCP_STATUS = 'mcp:status';
+export const IPC_MCP_ACTION = 'mcp:action';
+export const IPC_AUTO_RUN = 'autotask:run';
 /** 主进程捕获透明拖拽窗口右键后推送菜单坐标。 */
 export const IPC_CONTEXT_MENU = 'ui:contextMenu';
 /** 主进程 push→renderer：全局鼠标屏幕坐标（DIP，轮询），用于宠物视线自动跟随。 */
@@ -480,6 +485,14 @@ export interface ElectronAPI {
   getSettings(): Promise<AppSettings>;
   /** 持久化并立即应用设置。 */
   setSettings(settings: AppSettings): Promise<{ ok: boolean; error?: string }>;
+  /** MCP 面板状态（两个方向 + 自主任务运行情况）。 */
+  getMcpStatus(): Promise<McpPanelStatus>;
+  /** MCP 操作：reload=重载 mcp.json 与 mcp-server 配置。 */
+  mcpAction(action: 'reload'): Promise<string>;
+  /** 立即运行一次自主任务（手动触发，不受间隔/每日上限限制）。 */
+  runAutoTaskNow(): Promise<string>;
+  /** 设置面板展开/收起（主进程据此调整窗口层级）。 */
+  setSettingsPanelOpen(open: boolean): void;
   /** 订阅透明拖拽窗口的右键菜单坐标。 */
   onContextMenu?(cb: (position: { x: number; y: number }) => void): () => void;
   /**
@@ -705,6 +718,22 @@ export interface AppSettings {
   motionTriggers?: Partial<Record<BehaviorKey, MotionTriggerValue>>;
   /** 桌宠名字（用户在设置里可改）：注入人设（AI 自称）、问候语与输入框提示。空 = 用默认。 */
   petName?: string;
+  /** MCP 服务端（反向接入）：是否开启、端口、访问 token（都只存本机 settings.json） */
+  mcpServerEnabled?: boolean;
+  mcpServerPort?: number;
+  mcpServerToken?: string;
+  /** 定时自主任务：开关、模式、自定义提示词、间隔（分钟）、每日上限 */
+  autoTaskEnabled?: boolean;
+  autoTaskMode?: 'mcp_check' | 'scene_brief' | 'custom';
+  autoTaskPrompt?: string;
+  autoTaskIntervalMin?: number;
+  autoTaskDailyLimit?: number;
+  /** 事件触发自主任务：窗口切到匹配应用/标题（或提醒到点）时跑一次；冷却与每日上限共用 */
+  autoTaskEventEnabled?: boolean;
+  autoTaskEventMatch?: string;
+  autoTaskEventCooldownMin?: number;
+  /** 自主任务是否允许调用"只读且服务器 autoApprove"的 MCP 工具（默认关闭） */
+  autoTaskAllowMcp?: boolean;
   /**
    * 行为触发映射（**按模型分开存**）。
    *
@@ -738,4 +767,22 @@ export interface PluginManifest {
   version: string;
   /** 插件入口文件路径/URL，供主进程定位并加载。 */
   entry: string;
+}
+
+/** MCP 设置页需要的状态（字符串由主进程组装，设置页只展示） */
+export interface McpPanelStatus {
+  clientText: string;
+  serverText: string;
+  serverEnabled: boolean;
+  serverUrl: string;
+  autoTask: {
+    enabled: boolean;
+    mode: string;
+    intervalMin: number;
+    dailyLimit: number;
+    countToday: number;
+    lastRunAt: number;
+    running: boolean;
+    lastResult: string;
+  };
 }

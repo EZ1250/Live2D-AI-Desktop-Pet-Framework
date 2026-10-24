@@ -275,7 +275,9 @@ body.is-dragover #stage::after {
   text-align: center;
   white-space: normal;
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22);
-  pointer-events: none;      /* 不拦截点击/拖拽 */
+  /* 气泡是"模型之上的可交互浮层"：显示时要拦截自身区域（滚动/按住），
+     隐藏时必须放行，否则整块透明区域会成为挡板。 */
+  pointer-events: none;
   opacity: 0;
   transition: opacity 0.25s ease;
   z-index: 60;
@@ -283,6 +285,8 @@ body.is-dragover #stage::after {
 
 #bubble.is-visible {
   opacity: 1;
+  pointer-events: auto;
+  cursor: default;
 }
 
 /* 长回复不要把气泡撑破：文字区自己滚动（气泡本身不拦截点击） */
@@ -546,6 +550,68 @@ body.is-dragover #stage::after {
   font-size: 11px;
 }
 
+/* MCP 状态块：必须包一层普通 div 再放进设置表单的 grid，否则多行状态文字会被压缩成一行、压住按钮 */
+.settings-mcp-block {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.settings-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 4px 0 8px;
+}
+
+.settings-inline button {
+  padding: 5px 10px;
+  font-size: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  cursor: pointer;
+}
+
+.settings-inline button:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.settings-inline button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.settings-inline .settings-status {
+  flex: 1 1 100%;
+  margin: 0;
+}
+
+/* MCP 状态是动态多行文本（含本机路径）：独立成卡片、显式换行，避免在 grid 行里被压成一行 */
+.settings-mcp-status {
+  align-self: start;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  margin: 2px 0 2px;
+  padding: 6px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.18);
+  color: rgba(255, 255, 255, 0.75);
+  line-height: 1.5;
+}
+
+.settings-mcp-note {
+  align-self: start;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  line-height: 1.5;
+}
+
 .settings-actions {
   /* 钉在表单滚动区底部：不管上面展开了多少内容，「保存设置」永远看得见点得到。
      放在表单最后一个子节点（#settings-status 已挪到它前面），所以钉住时不会盖住任何东西。 */
@@ -574,6 +640,7 @@ body.is-dragover #stage::after {
 }
 
 .settings-status {
+  align-self: start;
   min-height: 15px;
   min-width: 0;
   color: rgba(255, 255, 255, 0.68);

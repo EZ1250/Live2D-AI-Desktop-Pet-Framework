@@ -43,6 +43,10 @@ import {
   IPC_SEND_MESSAGE,
   IPC_SETTINGS_GET,
   IPC_SETTINGS_SET,
+  IPC_UI_SETTINGS_OPEN,
+  IPC_MCP_STATUS,
+  IPC_MCP_ACTION,
+  IPC_AUTO_RUN,
   IPC_THINK_WINDOW_HIDE,
   IPC_THINK_WINDOW_SHOW,
   IPC_TODO_ADD,
@@ -121,6 +125,20 @@ export interface IpcDeps {
   hideThinkWindow?: () => void;
   /** 真正要调用 AI 之前触发一次：主进程据此自动打开思考浮窗 */
   onChatStarted?: () => void;
+  /** MCP 服务状态文本（/mcp 命令用；未配置时返回空串） */
+  mcpStatus?: () => string;
+  /** 热重载 MCP 配置（/mcp reload 用） */
+  mcpReload?: () => Promise<string> | string;
+  /** MCP 设置页状态 */
+  mcpPanelStatus?: () => import('../shared/contracts').McpPanelStatus | null;
+  /** MCP 操作（设置页按钮：重载） */
+  mcpAction?: (action: string) => Promise<string>;
+  /** 立即运行一次自主任务（设置页按钮） */
+  autoRunNow?: () => Promise<string>;
+  /** 设置保存后立即应用（MCP 服务端重启、自主任务重新排程） */
+  onSettingsSaved?: (settings: AppSettings) => void;
+  /** 设置面板展开/收起（主进程据此调整窗口层级） */
+  onSettingsPanelOpen?: (open: boolean) => void;
 }
 
 export interface IpcBridge {
@@ -149,6 +167,9 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
 
   // ---- IPC_PET_EVENT：宠物交互事件（单击 / 连点 / 长拖）→ 语料分组 -------------
   // 冷却与"哪个分组"都放在 main 侧（handleSceneGroup 有分组冷却表），渲染层只管上报动作。
+    ipcMain.on(IPC_UI_SETTINGS_OPEN, (_event, open: unknown): void => {
+    deps.onSettingsPanelOpen?.(open === true);
+  });
   ipcMain.on(IPC_PET_EVENT, (_event, type: unknown): void => {
     if (typeof type !== 'string') return;
     if (type !== 'click' && type !== 'multiClick' && type !== 'dragLong') return;
@@ -378,6 +399,11 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
         // API Key 留空 = "不改"（renderer 始终看不到真实 Key，不能用空值覆盖）
         if (!settings.aiApiKey) next.aiApiKey = current.aiApiKey;
         saveAppSettings(next);
+    try {
+      deps.onSettingsSaved?.(next);
+    } catch (err) {
+      console.error('[ipc] onSettingsSaved 失败：', err);
+    }
         deps.chat.updateSettings(next);
         return { ok: true };
       } catch (err) {
@@ -412,7 +438,8 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
 
     // ---- 斜杠命令（本地处理，不调 LLM）----
     if (message.startsWith('/')) {
-      const cmd = message.slice(1).trim().toLowerCase();
+      const rawCmd = message.slice(1).trim();
+      const [cmd, cmdArg] = rawCmd.toLowerCase().split(/\s+/, 2);
       switch (cmd) {
         case 'todo':
           try {
@@ -432,9 +459,20 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
           return reply('已清空对话上下文。');
         case 'usage':
           return reply(deps.chat.getUsageStats());
+        case 'mcp': {
+          if (cmdArg === 'reload') {
+            const doReload = deps.mcpReload;
+            if (!doReload) return reply('MCP 重载不可用。');
+            void Promise.resolve(doReload())
+              .then((text) => reply(text || 'MCP 已重载。'))
+              .catch((err) => reply(`MCP 重载失败：${err instanceof Error ? err.message : String(err)}`));
+            return { ok: true };
+          }
+          return reply(deps.mcpStatus?.() || '未配置 MCP 服务（可在 userData/mcp.json 添加，格式见 docs/PROJECT_LAYOUT.md §7.7）。');
+        }
         default:
           return reply(
-            `未知命令：/${cmd}\n可用命令：\n/todo 打开待办面板\n/notes 列出笔记\n/skills 列出技能\n/tools 列出工具\n/reset 清空上下文\n/usage 用量统计`,
+            `未知命令：/${rawCmd}\n可用命令：\n/todo 打开待办面板\n/notes 列出笔记\n/skills 列出技能\n/tools 列出工具\n/mcp 查看 MCP 服务状态（/mcp reload 重载配置）\n/reset 清空上下文\n/usage 用量统计`,
           );
       }
     }
@@ -480,6 +518,13 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
   });
 
   // ---- IPC_TODO_* 待办笔记本 ------------------------------------------------
+  ipcMain.handle(IPC_MCP_STATUS, (): import('../shared/contracts').McpPanelStatus | null => deps.mcpPanelStatus?.() ?? null);
+  ipcMain.handle(IPC_MCP_ACTION, (_event, action: unknown): Promise<string> => {
+    const act = action === 'reload' ? 'reload' : 'reload';
+    return deps.mcpAction?.(act) ?? Promise.resolve('MCP 操作不可用。');
+  });
+  ipcMain.handle(IPC_AUTO_RUN, (): Promise<string> => deps.autoRunNow?.() ?? Promise.resolve('自主任务不可用。'));
+
   ipcMain.handle(IPC_TODO_GET, (): unknown => deps.toolbox.getTodos());
   ipcMain.handle(IPC_TODO_ADD, (_event, raw: unknown): unknown => {
     return deps.toolbox.addTodoRaw(typeof raw === 'string' ? raw : '');
@@ -1040,6 +1085,60 @@ function sanitizeSettings(raw: unknown): AppSettings | null {
     if (value === undefined) continue;
     if (typeof value !== 'number' || !Number.isFinite(value)) return null;
     (settings as Record<string, number | undefined>)[key as string] = Math.round(Math.max(min, Math.min(max, value)));
+  }
+  // MCP 服务端 + 自主任务（设置页新字段）
+  if (input.mcpServerEnabled !== undefined) {
+    if (typeof input.mcpServerEnabled !== 'boolean') return null;
+    settings.mcpServerEnabled = input.mcpServerEnabled;
+  }
+  if (input.mcpServerPort !== undefined) {
+    const port = input.mcpServerPort;
+    if (typeof port !== 'number' || !Number.isFinite(port) || port < 1024 || port > 65535) return null;
+    settings.mcpServerPort = Math.round(port);
+  }
+  if (input.mcpServerToken !== undefined) {
+    if (typeof input.mcpServerToken !== 'string') return null;
+    settings.mcpServerToken = input.mcpServerToken.trim().slice(0, 128);
+  }
+  if (input.autoTaskEnabled !== undefined) {
+    if (typeof input.autoTaskEnabled !== 'boolean') return null;
+    settings.autoTaskEnabled = input.autoTaskEnabled;
+  }
+  if (input.autoTaskMode !== undefined) {
+    const mode = input.autoTaskMode;
+    if (mode !== 'mcp_check' && mode !== 'scene_brief' && mode !== 'custom') return null;
+    settings.autoTaskMode = mode;
+  }
+  if (input.autoTaskPrompt !== undefined) {
+    if (typeof input.autoTaskPrompt !== 'string') return null;
+    settings.autoTaskPrompt = input.autoTaskPrompt.trim().slice(0, 200);
+  }
+  if (input.autoTaskIntervalMin !== undefined) {
+    const v = input.autoTaskIntervalMin;
+    if (typeof v !== 'number' || !Number.isFinite(v)) return null;
+    settings.autoTaskIntervalMin = Math.min(240, Math.max(5, Math.round(v)));
+  }
+  if (input.autoTaskDailyLimit !== undefined) {
+    const v = input.autoTaskDailyLimit;
+    if (typeof v !== 'number' || !Number.isFinite(v)) return null;
+    settings.autoTaskDailyLimit = Math.min(200, Math.max(1, Math.round(v)));
+  }
+  if (input.autoTaskEventEnabled !== undefined) {
+    if (typeof input.autoTaskEventEnabled !== 'boolean') return null;
+    settings.autoTaskEventEnabled = input.autoTaskEventEnabled;
+  }
+  if (input.autoTaskEventMatch !== undefined) {
+    if (typeof input.autoTaskEventMatch !== 'string') return null;
+    settings.autoTaskEventMatch = input.autoTaskEventMatch.trim().slice(0, 80);
+  }
+  if (input.autoTaskEventCooldownMin !== undefined) {
+    const v = input.autoTaskEventCooldownMin;
+    if (typeof v !== 'number' || !Number.isFinite(v)) return null;
+    settings.autoTaskEventCooldownMin = Math.min(120, Math.max(5, Math.round(v)));
+  }
+  if (input.autoTaskAllowMcp !== undefined) {
+    if (typeof input.autoTaskAllowMcp !== 'boolean') return null;
+    settings.autoTaskAllowMcp = input.autoTaskAllowMcp;
   }
   return settings;
 }

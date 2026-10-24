@@ -245,6 +245,10 @@ let streamTTL = DEFAULT_TTL_MS;
 /** 本轮气泡的 ttlMs 是否由调用方显式指定（显式值原样夹取，否则按内容长度自适应） */
 let ttlExplicit = false;
 let bubbleTone: 'info' | 'error' = 'info';
+/** 用户正在看/操作气泡（悬停、点击、滚动）→ 暂停 TTL 自动隐藏 */
+let bubbleHeld = false;
+/** 是否正在拖动桌宠（点击穿透判定要避让：拖拽期间整窗保持可交互） */
+let petDragging = false;
 
 /** 气泡停留时长：显式值夹取到 [3s,300s]；未指定则按内容长度自适应 */
 function computeBubbleTtl(text: string, explicitMs?: number): number {
@@ -264,10 +268,30 @@ function clearBubbleTimers(): void {
   hideTimer = 0;
 }
 function hideBubble(): void {
+  bubbleHeld = false;
   clearBubbleTimers();
   stopSpeechMouth(); // 气泡收起 → 口型立刻收回（看不到"静音还在动嘴"）
   typewriterActive = false;
   if (bubbleEl) bubbleEl.classList.remove('is-visible', 'is-typing');
+}
+
+/** 气泡被悬停/点击/滚动：暂停自动隐藏，让用户能读完/滚动长回复 */
+function holdBubble(): void {
+  if (!bubbleEl || !bubbleEl.classList.contains('is-visible')) return;
+  bubbleHeld = true;
+  if (hideTimer) {
+    window.clearTimeout(hideTimer);
+    hideTimer = 0;
+  }
+}
+
+/** 移开气泡：没在打字就按内容长度重新开始倒计时 */
+function releaseBubbleHold(): void {
+  if (!bubbleHeld) return;
+  bubbleHeld = false;
+  if (!bubbleEl || !bubbleEl.classList.contains('is-visible')) return;
+  if (typeTimer || !streamBuffer) return;
+  hideTimer = window.setTimeout(hideBubble, computeBubbleTtl(streamBuffer, ttlExplicit ? streamTTL : undefined));
 }
 
 function pumpTypewriter(): void {
@@ -288,7 +312,8 @@ function pumpTypewriter(): void {
   typeTimer = 0; // 关键：本轮定时器已自然结束，必须归零；否则 feedChatDelta 里 `if (!typeTimer)` 永远为假，后续流式增量再也打不出来
   window.setTimeout(stopSpeechMouth, 320); // 说完留一拍再闭嘴（与下面 TTL 淡出衔接）
   if (bubbleEl) bubbleEl.classList.remove('is-typing');
-  hideTimer = window.setTimeout(hideBubble, computeBubbleTtl(streamBuffer, ttlExplicit ? streamTTL : undefined));
+  if (!bubbleHeld)
+    hideTimer = window.setTimeout(hideBubble, computeBubbleTtl(streamBuffer, ttlExplicit ? streamTTL : undefined));
 }
 
 /**
@@ -317,7 +342,8 @@ function showBubble(text: string, opts?: { ttlMs?: number; tone?: 'info' | 'erro
     bubbleTextEl.textContent = text;
     typewriterActive = false;
     bubbleEl.classList.remove('is-typing');
-    hideTimer = window.setTimeout(hideBubble, computeBubbleTtl(text, ttlExplicit ? streamTTL : undefined));
+    if (!bubbleHeld)
+      hideTimer = window.setTimeout(hideBubble, computeBubbleTtl(text, ttlExplicit ? streamTTL : undefined));
     return;
   }
   typewriterActive = true;
@@ -947,7 +973,7 @@ let currentTrackingApi: Any = null;
 /* ================================================================
   7.6 拖拽移动窗口 + 滚轮缩放
    ================================================================ */
-const DRAG_IGNORE_SELECTOR = '#context-menu, #todo-panel, #ask-box, #think-panel, #settings-panel, #chatbar input, .chat-input, input, button, select, textarea';
+const DRAG_IGNORE_SELECTOR = '#bubble, #context-menu, #todo-panel, #ask-box, #think-panel, #settings-panel, #chatbar input, .chat-input, input, button, select, textarea';
 
 /* ================================================================
    7.7 点击特效：粉色星星小范围扩散（不挡视野、初始半透明、与主题统一）
@@ -1049,6 +1075,20 @@ function applyPetName(next: string | undefined): void {
 }
 
 function installWindowInteractions(bridge: RendererBridge): void {
+  // 气泡在模型之上：点它/划过它走气泡自己的逻辑（保持显示、滚动长文），不触发桌宠点击/拖拽/缩放
+  if (bubbleEl) {
+    bubbleEl.addEventListener('pointerenter', () => holdBubble());
+    bubbleEl.addEventListener('pointerleave', () => releaseBubbleHold());
+    bubbleEl.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+      holdBubble();
+    });
+    bubbleEl.addEventListener('click', (e) => {
+      e.stopPropagation();
+      holdBubble();
+    });
+    bubbleEl.addEventListener('wheel', (e) => e.stopPropagation(), { passive: true });
+  }
   // —— 交互语料事件：单击 / 连点（>5 次）/ 长拖（>5s）→ 主进程按分组冷却出气泡 ——
   const CLICK_WINDOW_MS = 2500; // 连点统计窗口（超出就算新的一轮）
   const MULTI_CLICK_COUNT = 6; // "点击超过 5 次" = 第 6 次触发
@@ -1074,7 +1114,7 @@ function installWindowInteractions(bridge: RendererBridge): void {
     'wheel',
     (e) => {
       if (dragging) return; // 拖拽过程中无视滚轮，避免误放大
-      if ((e.target as Element)?.closest?.('#todo-panel, #ask-box, #think-panel, #settings-panel, #context-menu, #chatbar')) return; // 面板区滚动不缩放
+      if ((e.target as Element)?.closest?.('#bubble, #todo-panel, #ask-box, #think-panel, #settings-panel, #context-menu, #chatbar')) return; // 气泡/面板区滚动不缩放
       if (!currentHandle || typeof currentHandle.zoom !== 'function') return;
       e.preventDefault();
       currentHandle.zoom(e.deltaY < 0 ? 1 : -1);
@@ -1103,6 +1143,7 @@ function installWindowInteractions(bridge: RendererBridge): void {
     }
     flushDrag();
     dragging = false;
+    petDragging = false;
     pendingDx = 0;
     pendingDy = 0;
     bridge.endWindowDrag();
@@ -1112,6 +1153,7 @@ function installWindowInteractions(bridge: RendererBridge): void {
     const t = e.target as Element | null;
     if (t && t.closest && t.closest(DRAG_IGNORE_SELECTOR)) return; // 输入/菜单/设置区不拖
     dragging = true;
+    petDragging = true;
     moved = false;
     dragStartedAt = performance.now();
     dragLongReported = false;
@@ -2095,9 +2137,21 @@ function installClickThroughBridge(bridge: RendererBridge): void {
       // 窗口内开着覆盖层面板（设置/待办/右键菜单/思考浮窗）时**必须**保持可交互：
       // 这些面板就在本窗口内部，而 setIgnoreMouseEvents 是整窗生效的 ——
       // 一旦按"光标不在角色身上"判成穿透，面板自己也点不动了。
+      if (petDragging) {
+        bridge.reportHitResult?.(false, false); // 拖拽中：整窗收事件，避免光标滑出模型后窗口变穿透
+        return;
+      }
       if (hasOpenOverlay()) {
         bridge.reportHitResult?.(false, true);
         return;
+      }
+      // 气泡是模型之上的可交互浮层：光标在气泡内不能判成穿透
+      if (bubbleEl && bubbleEl.classList.contains('is-visible')) {
+        const r = bubbleEl.getBoundingClientRect();
+        if (pos.x >= r.left && pos.x <= r.right && pos.y >= r.top && pos.y <= r.bottom) {
+          bridge.reportHitResult?.(false, false);
+          return;
+        }
       }
       const h = currentHandle;
       if (!h || typeof h.hitTest !== 'function') {
@@ -2191,6 +2245,12 @@ function readNumber(id: string, fallback: number): number {
   const input = elementById<HTMLInputElement>(id);
   const value = Number(input?.value);
   return Number.isFinite(value) ? value : fallback;
+}
+
+/** 整数夹取：空/非法/越界一律回退默认值（避免用户清空数字框后整次保存失败） */
+function clampInt(value: number, min: number, max: number, fallback: number): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(value)));
 }
 
 /** 服务端拉到的全部可用模型（设置页内嵌列表用） */
@@ -2812,6 +2872,29 @@ async function populateSettings(bridge: RendererBridge): Promise<void> {
   applyPetName(settings.petName);
   const petNameInput = elementById<HTMLInputElement>('setting-pet-name');
   if (petNameInput) petNameInput.value = settings.petName ?? '';
+  // MCP / 自主任务
+  const setChecked = (id: string, checked: boolean): void => {
+    const el = elementById<HTMLInputElement>(id);
+    if (el) el.checked = checked;
+  };
+  const setInputValue = (id: string, value: string): void => {
+    const el = elementById<HTMLInputElement>(id);
+    if (el) el.value = value;
+  };
+  setChecked('setting-mcp-server-enabled', settings.mcpServerEnabled === true);
+  setInputValue('setting-mcp-server-port', String(settings.mcpServerPort ?? 37653));
+  setInputValue('setting-mcp-server-token', settings.mcpServerToken ?? '');
+  setChecked('setting-autotask-enabled', settings.autoTaskEnabled === true);
+  const autoTaskModeSelect = elementById<HTMLSelectElement>('setting-autotask-mode');
+  if (autoTaskModeSelect) autoTaskModeSelect.value = settings.autoTaskMode ?? 'mcp_check';
+  setInputValue('setting-autotask-prompt', settings.autoTaskPrompt ?? '');
+  setInputValue('setting-autotask-interval', String(settings.autoTaskIntervalMin ?? 30));
+  setInputValue('setting-autotask-limit', String(settings.autoTaskDailyLimit ?? 20));
+  setChecked('setting-autotask-event-enabled', settings.autoTaskEventEnabled === true);
+  setInputValue('setting-autotask-event-match', settings.autoTaskEventMatch ?? '');
+  setInputValue('setting-autotask-event-cooldown', String(settings.autoTaskEventCooldownMin ?? 15));
+  setChecked('setting-autotask-allow-mcp', settings.autoTaskAllowMcp === true);
+  void refreshMcpPanel(bridge);
   const values: Array<[string, string | number | undefined]> = [
     ['setting-provider', settings.provider],
     ['setting-base-url', settings.aiBaseUrl],
@@ -3008,9 +3091,67 @@ async function runVoiceCheck(bridge: RendererBridge): Promise<void> {
   }
 }
 
+/** 设置页 MCP / 自主任务状态：主进程组装文本，这里只展示 */
+async function refreshMcpPanel(bridge: RendererBridge): Promise<void> {
+  const statusEl = elementById<HTMLElement>('setting-mcp-status');
+  const hintEl = elementById<HTMLElement>('setting-mcp-server-hint');
+  const autoEl = elementById<HTMLElement>('setting-autotask-status');
+  try {
+    const st = await bridge.getMcpStatus?.();
+    if (!st) {
+      if (statusEl) statusEl.textContent = '当前版本不支持 MCP 状态查询';
+      return;
+    }
+    if (statusEl) statusEl.textContent = [st.clientText, st.serverText].filter(Boolean).join('\n');
+    if (hintEl) {
+      if (!st.serverEnabled) hintEl.textContent = '未开启反向接入。';
+      else if (st.serverUrl) hintEl.textContent = `服务端地址：${st.serverUrl}（请求头 Authorization: Bearer <上面的 token>）`;
+      else hintEl.textContent = '已开启，保存设置后启动。';
+    }
+    if (autoEl) {
+      const a = st.autoTask;
+      const last = a.lastRunAt ? new Date(a.lastRunAt).toLocaleString('zh-CN', { hour12: false }) : '从未';
+      const state = a.running ? '运行中…' : a.enabled ? '已开启' : '未开启';
+      const lastResult = a.lastResult ? `｜${a.lastResult.slice(0, 60)}` : '';
+      autoEl.textContent = `${state}｜今日 ${a.countToday}/${a.dailyLimit} 次｜上次：${last}${lastResult}`;
+    }
+  } catch (err) {
+    if (statusEl) statusEl.textContent = `读取失败：${(err as Error).message ?? String(err)}`;
+  }
+}
+
+async function reloadMcpFromUi(bridge: RendererBridge): Promise<void> {
+  const btn = elementById<HTMLButtonElement>('setting-mcp-reload');
+  if (btn) btn.disabled = true;
+  try {
+    await bridge.mcpAction?.('reload');
+    await refreshMcpPanel(bridge);
+    setSettingsStatus('MCP 已重载。');
+  } catch (err) {
+    setSettingsStatus(`MCP 重载失败：${(err as Error).message ?? String(err)}`, true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function runAutoTaskNowFromUi(bridge: RendererBridge): Promise<void> {
+  const btn = elementById<HTMLButtonElement>('setting-autotask-run');
+  if (btn) btn.disabled = true;
+  try {
+    const result = await bridge.runAutoTaskNow?.();
+    await refreshMcpPanel(bridge);
+    setSettingsStatus(`自主任务：${(result ?? '').slice(0, 120)}`);
+  } catch (err) {
+    setSettingsStatus(`自主任务失败：${(err as Error).message ?? String(err)}`, true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 function openSettings(bridge: RendererBridge): void {
   const panel = elementById<HTMLElement>('settings-panel');
   if (!panel) return;
+  try { bridge.setSettingsPanelOpen?.(true); } catch { /* 旧版 preload 无此方法 */ }
   hideContextMenu();
   panel.hidden = false;
   // 表单是唯一滚动容器：每次打开都从顶部开始，否则会停在上次的位置，看着像"内容缺了"
@@ -3026,6 +3167,7 @@ function openSettings(bridge: RendererBridge): void {
 function closeSettings(): void {
   const panel = elementById<HTMLElement>('settings-panel');
   if (panel) panel.hidden = true;
+  try { (window as Any).electron?.setSettingsPanelOpen?.(false); } catch { /* ignore */ }
 }
 
 async function saveSettings(bridge: RendererBridge): Promise<void> {
@@ -3057,6 +3199,18 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
     motionTriggers: collectMotionTriggers(),
     // 行为触发按模型分桶：只更新"当前模型"这一桶，其它模型的绑定原样保留
     petName: value('setting-pet-name').slice(0, 24),
+    mcpServerEnabled: elementById<HTMLInputElement>('setting-mcp-server-enabled')?.checked === true,
+    mcpServerPort: clampInt(readNumber('setting-mcp-server-port', 37653), 1024, 65535, 37653),
+    mcpServerToken: value('setting-mcp-server-token').slice(0, 128),
+    autoTaskEnabled: elementById<HTMLInputElement>('setting-autotask-enabled')?.checked === true,
+    autoTaskMode: (elementById<HTMLSelectElement>('setting-autotask-mode')?.value as AppSettings['autoTaskMode']) ?? 'mcp_check',
+    autoTaskPrompt: value('setting-autotask-prompt').slice(0, 200),
+    autoTaskIntervalMin: clampInt(readNumber('setting-autotask-interval', 30), 5, 240, 30),
+    autoTaskDailyLimit: clampInt(readNumber('setting-autotask-limit', 20), 1, 200, 20),
+    autoTaskEventEnabled: elementById<HTMLInputElement>('setting-autotask-event-enabled')?.checked === true,
+    autoTaskEventMatch: value('setting-autotask-event-match').slice(0, 80),
+    autoTaskEventCooldownMin: clampInt(readNumber('setting-autotask-event-cooldown', 15), 5, 120, 15),
+    autoTaskAllowMcp: elementById<HTMLInputElement>('setting-autotask-allow-mcp')?.checked === true,
     motionTriggersByModel: (() => {
       const next = { ...motionTriggersByModel };
       const name = activeModelName || '';
@@ -3077,6 +3231,7 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
   applySfxSettings(settings); // 音效开关/音量立刻生效（无需重启）
   applyFraming(settings.displayMode === 'half' ? 'half' : 'full'); // 取景立刻生效
   void refreshVoiceStatus(bridge); // 语音状态行跟着更新
+  void refreshMcpPanel(bridge); // MCP / 自主任务状态行跟着更新
   void refreshVoiceModelIndex(bridge, { autoFill: false }); // 转写模型体检（保存后重新校验一次）
   setSettingsStatus('已保存，下一条消息立即使用新配置。');
   showBubble('设置已生效', { ttlMs: 2200 });
@@ -4582,6 +4737,16 @@ function installSettingsUi(bridge: RendererBridge): void {
   // 语音识别：自检按钮（用内置合成音频打两条路由，不需要麦克风）
   elementById<HTMLButtonElement>('setting-voice-check')?.addEventListener('click', () => {
     void runVoiceCheck(bridge);
+  });
+  // MCP / 自主任务面板
+  elementById<HTMLButtonElement>('setting-mcp-refresh')?.addEventListener('click', () => {
+    void refreshMcpPanel(bridge);
+  });
+  elementById<HTMLButtonElement>('setting-mcp-reload')?.addEventListener('click', () => {
+    void reloadMcpFromUi(bridge);
+  });
+  elementById<HTMLButtonElement>('setting-autotask-run')?.addEventListener('click', () => {
+    void runAutoTaskNowFromUi(bridge);
   });
   // 可插拔资产：打开文件夹 / 添加 / 重新扫描
   elementById<HTMLButtonElement>('asset-model-open')?.addEventListener('click', () => {

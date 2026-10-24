@@ -53,6 +53,10 @@ import {
   IPC_SEND_MESSAGE,
   IPC_SETTINGS_GET,
   IPC_SETTINGS_SET,
+  IPC_UI_SETTINGS_OPEN,
+  IPC_MCP_STATUS,
+  IPC_MCP_ACTION,
+  IPC_AUTO_RUN,
   IPC_THINK_PUSH,
   IPC_THINK_WINDOW_HIDE,
   IPC_THINK_WINDOW_SHOW,
@@ -130,6 +134,18 @@ const api: ElectronAPI = {
 
   setSettings(settings: AppSettings): Promise<{ ok: boolean; error?: string }> {
     return ipcRenderer.invoke(IPC_SETTINGS_SET, settings);
+  },
+  getMcpStatus(): Promise<import('../shared/contracts').McpPanelStatus> {
+    return ipcRenderer.invoke(IPC_MCP_STATUS);
+  },
+  mcpAction(action: 'reload'): Promise<string> {
+    return ipcRenderer.invoke(IPC_MCP_ACTION, action);
+  },
+  setSettingsPanelOpen(open: boolean): void {
+    ipcRenderer.send(IPC_UI_SETTINGS_OPEN, Boolean(open));
+  },
+  runAutoTaskNow(): Promise<string> {
+    return ipcRenderer.invoke(IPC_AUTO_RUN);
   },
 
   /** 开发辅助：弹出系统文件夹选择器（取消返回空字符串）。 */

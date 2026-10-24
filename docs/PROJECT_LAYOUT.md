@@ -673,6 +673,155 @@ handle 跑真实 `init()`，从推送通道一路断到 `setExpression`）。
 `[chat] 系统提示词：<字数>（第 1~3 层）| 情景提示词：<字数或"暂无记录"> | 第 4 层阶段指令按轮注入`。
 `tests/promptLayers.test.js` 与 `tests/scenario.test.js` 覆盖层拼接、阶段指令、衰减权重、预算截断、去重与隐私清洗。
 
+## 7.7 MCP 外部工具接入（可选，默认关闭）
+
+让桌宠接入本机/远程的 MCP（Model Context Protocol）服务，把外部工具加进现有 AI 工具循环
+（"行动 → 执行 → 反思"不改）。**没有 `mcp.json` 时完全跳过：不 spawn 进程、不联网、工具数不变、提示词不变。**
+
+**配置**：`<userData>/mcp.json`（只在本机用户数据目录，绝不进安装包；`scripts/check-privacy.js` 已把它列为禁止进包文件名）
+
+```json
+{
+  "servers": [
+    { "serverName": "local", "transport": "stdio", "command": "node", "args": ["server.js"],
+      "cwd": "C:\\tools\\my-mcp", "env": { "API_TOKEN": "${env:MY_TOKEN}" },
+      "toolCallTimeoutMs": 60000, "autoApprove": false },
+    { "serverName": "web", "transport": "http", "url": "http://127.0.0.1:3000/mcp",
+      "headers": { "Authorization": "Bearer ${env:MCP_TOKEN}" } }
+  ]
+}
+```
+
+字段：`serverName`（1~32 位字母/数字/_/-，唯一）、`transport`（`stdio`|`http`）；
+stdio 用 `command/args/cwd/env`，http 用 `url/headers`；`toolCallTimeoutMs` 默认 60000；
+`autoApprove: true` 表示该服务器的调用免确认（默认 false = 每次都弹确认）。`${env:NAME}` 会替换成进程环境变量。
+改动配置后**重启应用**生效（不做热加载）。
+
+**工具命名与调用**：工具以 `mcp__<serverName>__<原始工具名>` 出现（超长/冲突追加 8 位哈希）；
+发给 MCP 的始终是原始工具名，公开名不会回传给服务端。单个服务器最多 60 个工具、总数最多 120 个，超出的丢弃。
+
+**确认与权限**：MCP 调用默认逐次弹确认（显示 server/工具/参数摘要）；`autoApprove` 的服务器跳过确认；
+「只读/计划」权限模式下 MCP 调用直接拒绝。`MCP 工具返回错误：…` 会作为失败结果交给模型反思，不假装成功。
+
+**实现与限制**（`src/main/ai/mcpClient.ts`，不引入新依赖，手写最小 JSON-RPC）：
+- 只实现 `initialize` / `tools/list`（含分页）/ `tools/call` 与 `tools/list_changed` 通知；
+- 只支持 `stdio` 与 `streamable-http`（含自定义 headers 与 `Mcp-Session-Id`）；不支持旧 SSE 双向、OAuth、资源订阅；
+- 启动后台连接不阻塞主进程；连接失败只标记该服务器（工具不出现），其他服务器和现有功能不受影响；
+- 调用失败会重连一次后重试；退出时 `dispose()` 杀掉 stdio 子进程（`taskkill /T`）；
+- stdio 子进程环境先清洗（剔除名字含 KEY/PASSWORD/SECRET/TOKEN 的变量）再合并 `env`，日志不打印 env/headers 内容。
+
+自检：聊天里发 `/mcp` 查看各服务器连接状态、工具数与**具体工具名**；`/mcp reload` 无需重启即可
+重新读取 `mcp.json` / `mcp-server.json`（改配置、换端口、开关服务端都走它）。无配置时返回提示与配置路径。
+`tests/mcpClient.test.js` 覆盖配置校验、命名映射、结果格式化、env 清洗与 stdio/http 端到端。
+
+**反方向：桌宠作为 MCP 服务端（可选，默认关闭）**
+`src/main/ai/mcpServer.ts` 把桌宠能力暴露成本机 MCP 服务，供 DSH / QQ bridge / 其它 agent 远程驱动。
+**在设置页「MCP 与自主任务」里勾选「开启反向接入」并保存即可**（默认关闭）：开关/端口/token 存进 `settings.json`，token 留空时首次启动自动生成并回写；旧 `<userData>/mcp-server.json` 仅作无设置页驱动的回退。
+
+
+
+外部客户端按标准 MCP streamable-http 连 `http://127.0.0.1:<port>/mcp`，请求头
+`Authorization: Bearer <token>`（token 在 mcp-server.json 里）。只绑定 127.0.0.1、仅 POST /mcp、
+无鉴权直接 401；端口被占用会向后找 1~19 个空闲端口并回写配置。工具：
+
+| 工具 | 用途 | 只读 |
+|---|---|---|
+| `pet_say` | 让桌宠气泡说话（远程提醒/播报） | 否 |
+| `pet_status` | 模型/桌宠名/活动窗口/待办数/MCP 连接情况 | 是 |
+| `pet_emotion` | 切换表情（空串恢复默认） | 否 |
+| `pet_motion` | 播放动作（Idle / wave） | 否 |
+| `pet_todo_add` / `pet_todo_list` | 待办笔记本增/查 | 否 / 是 |
+| `pet_note_add` | 往笔记里记一条 | 否 |
+| `pet_reminder_add` | 加一次性提醒（afterMinutes 分钟后） | 否 |
+| `pet_chat` | 让桌宠 AI 回一句话（外部桥接；3 秒最小间隔、单飞，避免频繁烧模型额度） | 否 |
+| `pet_ask` | 通过桌宠向用户提问并等待回答（120 秒超时，选项 2~4 个） | 否 |
+| `pet_screenshot` | 全屏截图（PNG base64 + 保存路径，存 userData/shots） | 否 |
+
+只读资源（MCP `resources/list` + `resources/read`，文本）：`pet://status`、`pet://todos`、`pet://scenario`、`pet://skills`。
+客户端不支持 resources 时不影响 tools；未知 uri 返回 JSON-RPC 错误。
+
+启用后设置页与 `/mcp` 会同时显示「外部工具连接」与「本机 MCP 服务端」两段状态（含可用工具名/地址/token 提示）；
+外部 agent 调用桌宠工具会写进情景提示词（`外部自动化：…`），本地 AI 能感知到"刚才被远程操作过"。
+`tests/mcpServer.test.js` 覆盖配置回退、token 鉴权、initialize/tools/list/tools/call、热重载与错误分支。
+
+**接入示例**
+- DSH（作为 MCP 客户端连桌宠，放到 DSH 的插件配置里）：
+
+  ```yaml
+  - id: pet-mcp
+    name: '@deepseek-ai/dsh-mcp-client'
+    config:
+      serverName: pet
+      transport: streamable-http
+      url: http://127.0.0.1:37653/mcp
+      headers:
+        Authorization: !!js '`Bearer ${process.env.PET_MCP_TOKEN}`'
+  ```
+
+- 桌宠连 QQ bridge 提供的 MCP server（stdio；先在该目录 `npm install` 好它自己的依赖）：
+
+  ```json
+  {
+    "servers": [
+      { "serverName": "qq-bridge", "transport": "stdio", "command": "node",
+        "args": ["C:\\tools\\qq-bridge-plus-main\\src\\mcp-host-server.js"] }
+    ]
+  }
+  ```
+
+  连接成功后对 AI 说"看看 QQ 网关状态"它就能调用对应工具；默认每次调用都会弹确认，
+  确认信任该服务后再在该 server 配置里加 `"autoApprove": true`。
+
+## 7.8 定时 / 后台自主任务（可选，默认关闭）
+
+设置页「MCP 与自主任务」里开启；规则在 `src/main/ai/autonomy.ts`（纯函数、可单测）：
+
+- **频率**：每分钟检查一次是否到点；间隔 5~240 分钟、每日上限 1~200 次（默认 30 分钟 / 20 次），跨天自动清零；
+  计数与上次运行时间存 `<userData>/autonomy-state.json`。
+- **避让**：AI 正在回复、有等待回答的确认框、上一次还没跑完时一律跳过；刚启动不会立刻跑。
+- **模式**：`mcp_check`（默认，纯本地检查两个方向状态，只在异常时提醒，不调 AI）；`scene_brief`（把活动窗口/待办/MCP
+  状态作为上下文，静默 ChatClient 让模型说一句 ≤40 字，回复"无需提醒"就安静）；`custom`（用设置里的提示词做同样一次静默提问）。
+- **结果**：气泡显示 12 秒 + 写入情景提示词（`自主任务（模式）：…`）；「立即运行一次」跳过间隔与每日上限，但不打断正在进行的对话。
+- **后台只读 MCP 工具**（设置页勾选「自主任务可调用只读 MCP 工具」，默认关闭）：
+  - 只允许 **服务器配置了 `autoApprove: true` 且工具声明 `annotations.readOnlyHint: true`** 的 MCP 工具（策略在 `mcpClient.isAutoApprovedReadOnly`，一处判断）；
+  - 后台不弹确认；每次自主任务最多 6 次工具调用、同一工具+参数最多 2 次（防死循环，参考 DSH 的有界工具循环与重复调用保护）；
+  - 未勾选/无允许工具时，静默 ChatClient 保持"无工具"原行为，提示词也不追加工具清单；
+  - 工具调用写进情景提示词（`自主任务调用工具：…`）。
+- **事件触发**（设置页同一区域，默认关闭）：
+  - `事件触发` 开关 + `匹配串`（活动窗口的**应用名或标题包含**即命中，不区分大小写；留空不启用窗口触发）+ `冷却（分钟）`（5~120，默认 15）；
+  - 命中后跑一次与定时任务相同的模式；**与定时任务共用每日上限**、同样避让"AI 正在回复/有确认框/上一次没跑完"；
+  - **提醒到点**也算事件触发（不需要匹配串）：开关开启时，到点气泡 + 跑一次自主任务；
+  - 错过的定时点不补跑（只按当前时间判断），事件冷却独立于定时间隔。
+
+## 7.9 窗口层级（置顶优先级）
+
+所有窗口都 `alwaysOnTop`（高于电脑上其他应用），彼此间由 `restackOwnWindows()` 定顺序（从高到低）：
+
+1. 设置面板及其展开内容（设置面板在桌宠主窗里 → 设置打开时主窗提到最上；系统文件夹选择框是原生模态，天然最高）
+2. 思考 / 回答浮窗
+3. 对话气泡窗
+4. 桌宠模型主窗
+
+实现要点：`renderer` 打开/收起设置时经 `ui:settingsPanelOpen` 通知主进程；任一窗口显示/获得焦点后重排（`setAlwaysOnTop(true) + moveTop()`），
+避免"设了 alwaysOnTop 但同层级窗口互相盖住/气泡窗掉到普通窗口层"。
+
+## 7.10 工具目录与循环卫生（架构）
+
+参考 Claude Code / deepseek-harness 的工具体系与 qq-bridge 的分组限制、LocationSpoofer 的模块分层：
+
+- **工具目录外置**：44 个模型可见工具定义从 `chatClient.ts` 抽到 `src/main/ai/tools/catalog/`，
+  按领域拆文件（system / workspace / dev / web / media / schedule / mail / life / pet / agent），
+  `all.ts` 负责按**拆分前完全一致**的顺序组装，`index.ts` 只做出口；
+  `chatClient` 仍导出同一个 `TOOL_DEFS`（老引用不破）。名称/顺序属行为的一部分，`tests/toolCatalog.test.js` 有快照。
+  为什么顺序重要：工具清单顺序会进入提示词与 API tools 数组，改顺序会无谓地影响模型选择与缓存前缀。
+- **重复工具调用守卫**（`src/main/ai/toolLoopGuard.ts`，参考 DSH repeat-tool-guard）：
+  对「工具名 + 规范化参数（对象按 key 排序）」统计**连续**相同调用；第 3 次追加简短提醒、第 5 次追加含工具名/参数预览的详细提醒，
+  **只提醒、不阻断**；换一个调用即重置；超过阈值不再重复打扰。接入函数调用与文本协议两条工具循环，提醒随工具结果一起回到模型。
+  为什么是"建议性"：合法场景可能真要重复检查（轮询/重读变化中的文件），阻断会惩罚正确行为。
+
+后续架构项（未做，需单独确认）：把工具**执行器**从 `mainImpl.js` 按领域抽到 `tools/exec/`；`mainImpl.js` 按
+窗口/IPC/托盘/自启动拆模块；`chatClient` 的 phase 循环抽成 `agentLoop.ts` 并加老对话压缩；事件总线/审计日志；下次到期调度器（orb 思路）。
+
 ## 8. 自检命令
 
 ```bash
