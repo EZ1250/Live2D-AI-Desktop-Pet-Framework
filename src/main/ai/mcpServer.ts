@@ -318,6 +318,11 @@ export class PetMcpServer {
       `\n可用：${[...TOOL_DEFS.map((t) => t.name), ...this.phoneToolDefs().map((t) => t.name)].join(', ')}`;
   }
 
+  /** 运行状态（实际端口/绑定方式），供设置页拼访问地址与手机连接提示 */
+  describe(): { running: boolean; port: number; lan: boolean } {
+    return { running: this.started && this.server !== null, port: this.actualPort, lan: this.cfg.lan };
+  }
+
   /** 热重载 mcp-server.json：先关监听，再按当前配置重启（端口/开关变化都会生效） */
   async reload(): Promise<void> {
     this.dispose();

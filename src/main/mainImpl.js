@@ -3703,13 +3703,27 @@ async function runAutoTask(trigger, eventMatched = false) {
 function mcpPanelStatusNow() {
     const settings = (0, chatClient_1.loadAppSettings)();
     const serverText = petMcpServer ? petMcpServer.statusText() : 'MCP 服务端：不可用';
-    const urlMatch = serverText.match(/http:\/\/127\.0\.0\.1:\d+\/mcp/);
+    const serverInfo = petMcpServer ? petMcpServer.describe() : null;
+    const serverRunning = serverInfo ? serverInfo.running : false;
+    const lan = serverInfo ? serverInfo.lan : settings.mcpServerLanEnabled === true;
+    const port = serverRunning ? serverInfo.port : settings.mcpServerPort ?? 37653;
+    let lanIp = '';
+    if (serverRunning && lan) {
+        for (const addrs of Object.values(os.networkInterfaces())) {
+            const found = (addrs || []).find((a) => a && a.family === 'IPv4' && !a.internal);
+            if (found) {
+                lanIp = found.address;
+                break;
+            }
+        }
+    }
+    const serverHost = !serverRunning ? '' : lan ? lanIp || '0.0.0.0' : '127.0.0.1';
     const cfg = autoTaskCfg ?? autoTaskSettingsNormalized(settings);
     return {
         clientText: mcpClient ? mcpClient.statusText() : 'MCP 外部工具：未初始化',
         serverText,
         serverEnabled: settings.mcpServerEnabled === true,
-        serverUrl: urlMatch ? urlMatch[0] : '',
+        serverUrl: serverRunning ? `http://${serverHost}:${port}/mcp` : '',
         autoTask: {
             enabled: cfg.enabled,
             mode: cfg.mode,

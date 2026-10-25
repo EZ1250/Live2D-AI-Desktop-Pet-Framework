@@ -3235,6 +3235,16 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
   void refreshVoiceStatus(bridge); // 语音状态行跟着更新
   void refreshMcpPanel(bridge); // MCP / 自主任务状态行跟着更新
   void refreshVoiceModelIndex(bridge, { autoFill: false }); // 转写模型体检（保存后重新校验一次）
+  // 反向接入首次开启时服务端会自动生成 token：回填到输入框，用户才能复制给手机/外部客户端
+  if (!value('setting-mcp-server-token')) {
+    try {
+      const fresh = await bridge.getSettings();
+      const tokenInput = elementById<HTMLInputElement>('setting-mcp-server-token');
+      if (tokenInput && fresh.mcpServerToken) tokenInput.value = fresh.mcpServerToken;
+    } catch {
+      /* 读取失败时保持在输入框，下次打开设置会重新 populate */
+    }
+  }
   setSettingsStatus('已保存，下一条消息立即使用新配置。');
   showBubble('设置已生效', { ttlMs: 2200 });
 }
