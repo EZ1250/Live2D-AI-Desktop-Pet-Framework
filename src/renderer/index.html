@@ -284,6 +284,7 @@
         </div>
       </div>
       <label class="settings-checkbox" title="桌宠作为本机 MCP 服务端，供 DSH / QQ bridge 等外部 agent 调用；只监听 127.0.0.1，需要 token"><input id="setting-mcp-server-enabled" type="checkbox" /> 反向接入</label>
+      <label class="settings-checkbox" title="允许同一局域网内的手机/其他设备直连（明文 HTTP + Bearer token，仅建议可信网络；防火墙需放行端口）"><input id="setting-mcp-server-lan" type="checkbox" /> 允许局域网访问</label>
       <label>MCP 服务端口<input id="setting-mcp-server-port" type="number" min="1024" max="65535" step="1" placeholder="37653" /></label>
       <label>访问 token<input id="setting-mcp-server-token" type="text" maxlength="128" placeholder="留空=首次启动自动生成" autocomplete="off" /></label>
       <div class="settings-mcp-block">

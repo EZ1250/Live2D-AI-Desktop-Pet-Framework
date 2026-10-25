@@ -2882,6 +2882,7 @@ async function populateSettings(bridge: RendererBridge): Promise<void> {
     if (el) el.value = value;
   };
   setChecked('setting-mcp-server-enabled', settings.mcpServerEnabled === true);
+  setChecked('setting-mcp-server-lan', settings.mcpServerLanEnabled === true);
   setInputValue('setting-mcp-server-port', String(settings.mcpServerPort ?? 37653));
   setInputValue('setting-mcp-server-token', settings.mcpServerToken ?? '');
   setChecked('setting-autotask-enabled', settings.autoTaskEnabled === true);
@@ -3200,6 +3201,7 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
     // 行为触发按模型分桶：只更新"当前模型"这一桶，其它模型的绑定原样保留
     petName: value('setting-pet-name').slice(0, 24),
     mcpServerEnabled: elementById<HTMLInputElement>('setting-mcp-server-enabled')?.checked === true,
+    mcpServerLanEnabled: elementById<HTMLInputElement>('setting-mcp-server-lan')?.checked === true,
     mcpServerPort: clampInt(readNumber('setting-mcp-server-port', 37653), 1024, 65535, 37653),
     mcpServerToken: value('setting-mcp-server-token').slice(0, 128),
     autoTaskEnabled: elementById<HTMLInputElement>('setting-autotask-enabled')?.checked === true,

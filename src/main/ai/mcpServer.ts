@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as http from 'http';
 import * as crypto from 'crypto';
 import * as path from 'path';
+import type { Duplex } from 'stream';
 
 const PROTOCOL_VERSION = '2025-06-18';
 const DEFAULT_PORT = 37653;
@@ -34,13 +35,16 @@ export interface PetMcpServerOptions {
   log?: (message: string) => void;
   deps: PetMcpServerDeps;
   /** 从设置读初始配置（设置页驱动；不传则回退读 mcp-server.json，供测试/旧配置用） */
-  readInitial?: () => { enabled: boolean; port: number; token: string };
+  readInitial?: () => { enabled: boolean; lan?: boolean; port: number; token: string };
   /** 实际端口/token 生成后回写（main 用来存进 settings.json） */
-  persist?: (cfg: { enabled: boolean; port: number; token: string }) => void;
+  persist?: (cfg: { enabled: boolean; lan: boolean; port: number; token: string }) => void;
+  /** 手机工具调用超时（测试可覆盖；默认 30s） */
+  phoneCallTimeoutMs?: number;
 }
 
 interface PetMcpServerConfig {
   enabled: boolean;
+  lan: boolean;
   port: number;
   token: string;
 }
@@ -142,7 +146,7 @@ const TOOL_DEFS = [
 ];
 
 export function loadPetMcpServerConfig(text: string | null): { cfg: PetMcpServerConfig; error: string } {
-  const fallback: PetMcpServerConfig = { enabled: false, port: DEFAULT_PORT, token: '' };
+  const fallback: PetMcpServerConfig = { enabled: false, lan: false, port: DEFAULT_PORT, token: '' };
   if (text === null) return { cfg: fallback, error: '' };
   try {
     const raw = JSON.parse(text.replace(/^\uFEFF/, '')) as Record<string, unknown>;
@@ -150,18 +154,42 @@ export function loadPetMcpServerConfig(text: string | null): { cfg: PetMcpServer
     const portRaw = typeof raw.port === 'number' && Number.isFinite(raw.port) ? Math.round(raw.port) : DEFAULT_PORT;
     const port = portRaw >= 0 && portRaw <= 65535 ? portRaw : DEFAULT_PORT;
     const token = typeof raw.token === 'string' && raw.token.trim() ? raw.token.trim() : '';
-    return { cfg: { enabled, port, token }, error: '' };
+    const lan = raw.lan === true;
+    return { cfg: { enabled, lan, port, token }, error: '' };
   } catch (err) {
     return { cfg: fallback, error: (err as Error).message };
   }
 }
 
+interface PhoneTool {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  annotations: { readOnlyHint?: boolean; destructiveHint?: boolean; timeoutMs?: number };
+}
+
+interface PendingPhoneCall {
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
+const PHONE_PREFIX = 'phone_';
+const PHONE_NAME_RE = /^[a-z][a-z0-9_]{1,31}$/;
+const PHONE_POLL_MAX_WAIT_MS = 25_000;
+const PHONE_TOOL_TIMEOUT_MS = 30_000;
+
 export class PetMcpServer {
   private server: http.Server | null = null;
-  private cfg: PetMcpServerConfig = { enabled: false, port: DEFAULT_PORT, token: '' };
+  private cfg: PetMcpServerConfig = { enabled: false, lan: false, port: DEFAULT_PORT, token: '' };
   private actualPort = 0;
   private started = false;
   private readonly opts: PetMcpServerOptions;
+  private readonly wsSockets = new Set<Duplex>();
+  private readonly phoneTools = new Map<string, PhoneTool>();
+  private readonly phoneQueue: PendingPhoneCall[] = [];
+  private readonly phoneWaiters = new Set<(call: PendingPhoneCall | null) => void>();
+  private readonly pendingPhoneCalls = new Map<string, { resolve: (result: unknown) => void; timer: NodeJS.Timeout }>();
 
   constructor(opts: PetMcpServerOptions) {
     this.opts = opts;
@@ -180,6 +208,7 @@ export class PetMcpServer {
       const portRaw = typeof initial.port === 'number' && Number.isFinite(initial.port) ? Math.round(initial.port) : DEFAULT_PORT;
       cfg = {
         enabled: initial.enabled === true,
+        lan: initial.lan === true,
         port: portRaw >= 0 && portRaw <= 65535 ? portRaw : DEFAULT_PORT,
         token: typeof initial.token === 'string' ? initial.token.trim() : '',
       };
@@ -210,7 +239,7 @@ export class PetMcpServer {
     this.started = true;
     if (this.opts.persist) {
       try {
-        this.opts.persist({ enabled: true, port: this.actualPort, token: this.cfg.token });
+        this.opts.persist({ enabled: true, lan: this.cfg.lan, port: this.actualPort, token: this.cfg.token });
       } catch (err) {
         this.log(`MCP 服务端：配置回写失败（${(err as Error).message}）`);
       }
@@ -218,7 +247,7 @@ export class PetMcpServer {
       this.persistConfig();
     }
     const where = this.opts.readInitial ? 'token 见设置页' : 'token 见 mcp-server.json';
-    this.log(`MCP 服务端已启动：http://127.0.0.1:${this.actualPort}/mcp（tool ${TOOL_DEFS.length} 个，${where}）`);
+    this.log(`MCP 服务端已启动：${this.cfg.lan ? 'http://0.0.0.0（局域网）' : 'http://127.0.0.1'}:${this.actualPort}/mcp + ws://…:${this.actualPort}/ws（tool ${TOOL_DEFS.length + this.phoneTools.size} 个，${where}）`);
   }
 
   private listenWithFallback(): Promise<number> {
@@ -228,6 +257,7 @@ export class PetMcpServer {
       for (let offset = 0; offset < attempts; offset++) {
         const port = base === 0 ? 0 : base + offset;
         const server = http.createServer((req, res) => this.handleHttp(req, res));
+        server.on('upgrade', (req, socket) => this.handleWsUpgrade(req, socket as Duplex));
         const result = await new Promise<number>((resolve) => {
           const onError = (err: NodeJS.ErrnoException): void => {
             server.removeListener('listening', onListening);
@@ -245,7 +275,7 @@ export class PetMcpServer {
           };
           server.once('error', onError);
           server.once('listening', onListening);
-          server.listen(port, '127.0.0.1');
+          server.listen(port, this.cfg.lan ? '0.0.0.0' : '127.0.0.1');
         });
         if (result >= 0) {
           this.server = server;
@@ -268,7 +298,7 @@ export class PetMcpServer {
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(
         this.opts.configPath,
-        JSON.stringify({ enabled: true, port: this.actualPort, token: this.cfg.token }, null, 2),
+        JSON.stringify({ enabled: true, lan: this.cfg.lan, port: this.actualPort, token: this.cfg.token }, null, 2),
         'utf8',
       );
     } catch (err) {
@@ -284,8 +314,8 @@ export class PetMcpServer {
         : '反向接入（桌宠 MCP 服务端）：未启用（在 userData/mcp-server.json 写 {"enabled": true} 后重启即可）。';
     }
     const where = this.opts.readInitial ? '开关/端口/token 见设置页' : 'token 见 mcp-server.json';
-    return `反向接入（桌宠 MCP 服务端）：已启动 http://127.0.0.1:${this.actualPort}/mcp（tool ${TOOL_DEFS.length} 个；${where}）` +
-      `\n可用：${TOOL_DEFS.map((t) => t.name).join(', ')}`;
+    return `反向接入（桌宠 MCP 服务端）：已启动 ${this.cfg.lan ? 'http://0.0.0.0（局域网）' : 'http://127.0.0.1'}:${this.actualPort}/mcp + ws://…:${this.actualPort}/ws（tool ${TOOL_DEFS.length + this.phoneTools.size} 个；${where}）` +
+      `\n可用：${[...TOOL_DEFS.map((t) => t.name), ...this.phoneToolDefs().map((t) => t.name)].join(', ')}`;
   }
 
   /** 热重载 mcp-server.json：先关监听，再按当前配置重启（端口/开关变化都会生效） */
@@ -296,9 +326,17 @@ export class PetMcpServer {
   }
 
   dispose(): void {
+    for (const pending of this.pendingPhoneCalls.values()) clearTimeout(pending.timer);
+    this.pendingPhoneCalls.clear();
+    this.phoneWaiters.clear();
+    this.phoneQueue.length = 0;
     const srv = this.server;
     this.server = null;
     this.started = false;
+    for (const socket of this.wsSockets) {
+      try { socket.destroy(); } catch { /* ignore */ }
+    }
+    this.wsSockets.clear();
     if (!srv) return;
     try {
       srv.close();
@@ -375,6 +413,138 @@ export class PetMcpServer {
       }
     }
   }
+﻿  /** WS 鉴权：手机/浏览器 WS 无法自定义 Authorization 头，token 走 query（仅本机/局域网 + Bearer 等价的 timingSafeEqual 比较） */
+  private wsAuthorized(url: URL): boolean {
+    const token = (url.searchParams.get('token') ?? '').trim();
+    if (!token || token.length !== this.cfg.token.length) return false;
+    try {
+      return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(this.cfg.token));
+    } catch {
+      return false;
+    }
+  }
+
+  private handleWsUpgrade(req: http.IncomingMessage, socket: Duplex): void {
+    try {
+      const url = new URL(req.url || '/', 'http://127.0.0.1');
+      if (url.pathname !== '/ws') {
+        socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      if (!this.wsAuthorized(url)) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      const key = req.headers['sec-websocket-key'];
+      if (typeof key !== 'string' || !key) {
+        socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      const accept = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+      socket.write(
+        'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
+          `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+      );
+      this.wsSockets.add(socket);
+      let buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+      socket.on('data', (chunk: Buffer) => {
+        buffer = Buffer.concat([buffer, chunk]);
+        buffer = this.consumeWsFrames(socket, buffer);
+      });
+      socket.on('close', () => this.wsSockets.delete(socket));
+      socket.on('error', () => this.wsSockets.delete(socket));
+    } catch (err) {
+      this.log(`MCP 服务端：WS 握手异常（${(err as Error).message}）`);
+      try { socket.destroy(); } catch { /* ignore */ }
+    }
+  }
+
+  /** 解析客户端帧（mask/分片合并/ping/pong/close）；返回未消费残留 */
+  private consumeWsFrames(socket: Duplex, buffer: Buffer<ArrayBufferLike>): Buffer<ArrayBufferLike> {
+    for (;;) {
+      if (buffer.length < 2) return buffer;
+      const opcode = buffer[0] & 0x0f;
+      const masked = (buffer[1] & 0x80) !== 0;
+      let length = buffer[1] & 0x7f;
+      let offset = 2;
+      if (length === 126) {
+        if (buffer.length < 4) return buffer;
+        length = buffer.readUInt16BE(2);
+        offset = 4;
+      } else if (length === 127) {
+        if (buffer.length < 10) return buffer;
+        length = Number(buffer.readBigUInt64BE(2));
+        offset = 10;
+      }
+      if (length > MAX_BODY_BYTES) {
+        socket.destroy();
+        return Buffer.alloc(0);
+      }
+      const maskLength = masked ? 4 : 0;
+      if (buffer.length < offset + maskLength + length) return buffer;
+      const mask = masked ? buffer.subarray(offset, offset + 4) : null;
+      offset += maskLength;
+      const payload = Buffer.from(buffer.subarray(offset, offset + length));
+      if (mask) {
+        for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
+      }
+      buffer = buffer.subarray(offset + length);
+      if (opcode === 0x8) {
+        try { socket.end(Buffer.from([0x88, 0x00])); } catch { /* ignore */ }
+        this.wsSockets.delete(socket);
+        return Buffer.alloc(0);
+      }
+      if (opcode === 0x9) {
+        this.wsSendFrame(socket, 0xa, payload);
+        continue;
+      }
+      if (opcode === 0x1) void this.handleWsMessage(socket, payload.toString('utf8'));
+    }
+  }
+
+  private wsSendFrame(socket: Duplex, opcode: number, payload: Buffer): void {
+    try {
+      let header: Buffer;
+      if (payload.length < 126) {
+        header = Buffer.from([0x80 | opcode, payload.length]);
+      } else if (payload.length < 65536) {
+        header = Buffer.alloc(4);
+        header[0] = 0x80 | opcode;
+        header[1] = 126;
+        header.writeUInt16BE(payload.length, 2);
+      } else {
+        header = Buffer.alloc(10);
+        header[0] = 0x80 | opcode;
+        header[1] = 127;
+        header.writeBigUInt64BE(BigInt(payload.length), 2);
+      }
+      socket.write(Buffer.concat([header, payload]));
+    } catch { /* ignore */ }
+  }
+
+  private wsSendJson(socket: Duplex, payload: unknown): void {
+    this.wsSendFrame(socket, 0x1, Buffer.from(JSON.stringify(payload)));
+  }
+
+  private async handleWsMessage(socket: Duplex, text: string): Promise<void> {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      this.wsSendJson(socket, { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'invalid json' } });
+      return;
+    }
+    try {
+      const payload = await this.handleRpc(parsed);
+      if (payload !== undefined) this.wsSendJson(socket, payload);
+    } catch (err) {
+      this.wsSendJson(socket, { jsonrpc: '2.0', id: null, error: { code: -32603, message: (err as Error).message } });
+    }
+  }
+
 
   private authorized(req: http.IncomingMessage): boolean {
     const header = req.headers.authorization;
@@ -427,7 +597,7 @@ export class PetMcpServer {
       case 'ping':
         return {};
       case 'tools/list':
-        return { tools: TOOL_DEFS };
+        return { tools: [...TOOL_DEFS, ...this.phoneToolDefs()] };
       case 'resources/list':
         return { resources: this.opts.deps.resourceList() };
       case 'resources/read': {
@@ -439,11 +609,131 @@ export class PetMcpServer {
       case 'tools/call': {
         const name = typeof params.name === 'string' ? params.name : '';
         const args = (params.arguments ?? {}) as Record<string, unknown>;
+        if (name.startsWith(PHONE_PREFIX)) {
+          const phoneName = name.slice(PHONE_PREFIX.length);
+          if (!this.phoneTools.has(phoneName)) {
+            return { isError: true, content: [{ type: 'text' as const, text: `手机端没有工具：${phoneName}` }] };
+          }
+          return await this.callPhoneTool(phoneName, args);
+        }
         return await this.callTool(name, args);
+      }
+      case 'phone/register': {
+        const list = Array.isArray(params.tools) ? params.tools : [];
+        if (list.length > 32) throw new Error('手机工具最多 32 个');
+        for (const raw of list) this.registerPhoneTool(raw);
+        return { ok: true, tools: this.phoneToolDefs().map((t) => t.name) };
+      }
+      case 'phone/unregister': {
+        const names = Array.isArray(params.names) ? params.names : [];
+        for (const raw of names) {
+          const name = String(raw).replace(PHONE_PREFIX, '');
+          this.phoneTools.delete(name);
+        }
+        return { ok: true, tools: this.phoneToolDefs().map((t) => t.name) };
+      }
+      case 'phone/poll': {
+        const waitRaw = typeof params.waitMs === 'number' ? Math.round(params.waitMs) : PHONE_POLL_MAX_WAIT_MS;
+        const waitMs = Math.max(100, Math.min(PHONE_POLL_MAX_WAIT_MS, waitRaw));
+        const call = await this.waitPhoneCall(waitMs);
+        return call ? { call } : {};
+      }
+      case 'phone/result': {
+        const id = typeof params.id === 'string' ? params.id : '';
+        if (!id) throw new Error('phone/result 缺少 id');
+        this.resolvePhoneCall(id, params);
+        return { ok: true };
       }
       default:
         throw new Error(`不支持的方法：${method}`);
     }
+  }
+
+  /** 暴露给 MCP 的工具定义：名称统一 phone_ 前缀，schema/annotations 由手机端上报 */
+  private phoneToolDefs(): Array<{ name: string; description: string; inputSchema: unknown; annotations: unknown }> {
+    return [...this.phoneTools.values()].map((tool) => ({
+      name: PHONE_PREFIX + tool.name,
+      description: `[手机] ${tool.description || tool.name}`,
+      inputSchema: tool.inputSchema,
+      annotations: tool.annotations,
+    }));
+  }
+
+  private registerPhoneTool(raw: unknown): void {
+    const item = raw as Record<string, unknown> | null;
+    if (!item || typeof item !== 'object') throw new Error('手机工具定义必须是对象');
+    const name = typeof item.name === 'string' ? item.name.trim() : '';
+    if (!PHONE_NAME_RE.test(name)) throw new Error(`手机工具名不合法：${name}（需小写字母/数字/下划线，2~32 位）`);
+    const description = typeof item.description === 'string' ? item.description.trim().slice(0, 200) : '';
+    const inputSchema = item.inputSchema && typeof item.inputSchema === 'object' ? (item.inputSchema as Record<string, unknown>) : { type: 'object', properties: {} };
+    const annotations = item.annotations && typeof item.annotations === 'object' ? (item.annotations as Record<string, unknown>) : {};
+    this.phoneTools.set(name, {
+      name,
+      description,
+      inputSchema,
+      annotations: {
+        readOnlyHint: annotations.readOnlyHint === true,
+        destructiveHint: annotations.destructiveHint === true,
+        timeoutMs: typeof annotations.timeoutMs === 'number' ? Math.max(1000, Math.min(300_000, Math.round(annotations.timeoutMs))) : undefined,
+      },
+    });
+  }
+
+  private deliverPhoneCall(call: PendingPhoneCall): void {
+    for (const waiter of this.phoneWaiters) {
+      this.phoneWaiters.delete(waiter);
+      waiter(call);
+      return;
+    }
+    this.phoneQueue.push(call);
+  }
+
+  private waitPhoneCall(waitMs: number): Promise<PendingPhoneCall | null> {
+    const queued = this.phoneQueue.shift();
+    if (queued) return Promise.resolve(queued);
+    return new Promise((resolve) => {
+      const waiter = (call: PendingPhoneCall | null): void => {
+        clearTimeout(timer);
+        resolve(call);
+      };
+      const timer = setTimeout(() => {
+        this.phoneWaiters.delete(waiter);
+        resolve(null);
+      }, waitMs);
+      timer.unref?.();
+      this.phoneWaiters.add(waiter);
+    });
+  }
+
+  private callPhoneTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+    const id = crypto.randomUUID();
+    const timeoutMs = this.opts.phoneCallTimeoutMs ?? PHONE_TOOL_TIMEOUT_MS;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingPhoneCalls.delete(id);
+        resolve({ isError: true, content: [{ type: 'text' as const, text: `手机端在 ${timeoutMs}ms 内没有返回结果（工具：${name}）` }] });
+      }, timeoutMs);
+      timer.unref?.();
+      this.pendingPhoneCalls.set(id, {
+        resolve: (result) => {
+          clearTimeout(timer);
+          resolve(result);
+        },
+        timer,
+      });
+      this.deliverPhoneCall({ id, name, arguments: args });
+    });
+  }
+
+  private resolvePhoneCall(id: string, params: Record<string, unknown>): void {
+    const pending = this.pendingPhoneCalls.get(id);
+    if (!pending) return; // 已超时/重复回执：忽略
+    this.pendingPhoneCalls.delete(id);
+    const rawContent = Array.isArray(params.content) ? params.content : [];
+    const content = rawContent.length
+      ? rawContent
+      : [{ type: 'text' as const, text: typeof params.text === 'string' ? params.text : '手机端已完成' }];
+    pending.resolve({ content });
   }
 
   private async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {

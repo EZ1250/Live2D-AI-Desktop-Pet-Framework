@@ -2747,11 +2747,11 @@ async function bootstrap() {
         log: (msg) => console.log(`[main] ${msg}`),
         readInitial: () => {
             const cur = (0, chatClient_1.loadAppSettings)();
-            return { enabled: cur.mcpServerEnabled === true, port: cur.mcpServerPort ?? 37653, token: cur.mcpServerToken ?? '' };
+            return { enabled: cur.mcpServerEnabled === true, lan: cur.mcpServerLanEnabled === true, port: cur.mcpServerPort ?? 37653, token: cur.mcpServerToken ?? '' };
         },
         persist: (cfg) => {
             try {
-                (0, chatClient_1.saveAppSettings)({ ...(0, chatClient_1.loadAppSettings)(), mcpServerEnabled: cfg.enabled, mcpServerPort: cfg.port, mcpServerToken: cfg.token });
+                (0, chatClient_1.saveAppSettings)({ ...(0, chatClient_1.loadAppSettings)(), mcpServerEnabled: cfg.enabled, mcpServerLanEnabled: cfg.lan, mcpServerPort: cfg.port, mcpServerToken: cfg.token });
             }
             catch (err) {
                 console.error('[main] MCP 服务端配置保存失败：', err);

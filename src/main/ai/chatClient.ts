@@ -246,6 +246,7 @@ export function loadAppSettings(): AppSettings {
       petName: str('petName') ?? '',
       // MCP 服务端 + 定时自主任务：新设置项一律在这里补读，否则"能存不能读"
       mcpServerEnabled: bool(false, 'mcpServerEnabled'),
+      mcpServerLanEnabled: bool(false, 'mcpServerLanEnabled'),
       mcpServerPort: Math.round(Math.min(65535, Math.max(1024, num(37653, 'mcpServerPort')))),
       mcpServerToken: (str('mcpServerToken') ?? '').slice(0, 128),
       autoTaskEnabled: bool(false, 'autoTaskEnabled'),

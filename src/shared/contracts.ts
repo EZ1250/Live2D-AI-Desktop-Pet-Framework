@@ -720,6 +720,8 @@ export interface AppSettings {
   petName?: string;
   /** MCP 服务端（反向接入）：是否开启、端口、访问 token（都只存本机 settings.json） */
   mcpServerEnabled?: boolean;
+  /** 允许局域网访问（默认 false，只监听 127.0.0.1；明文 HTTP，仅可信网络） */
+  mcpServerLanEnabled?: boolean;
   mcpServerPort?: number;
   mcpServerToken?: string;
   /** 定时自主任务：开关、模式、自定义提示词、间隔（分钟）、每日上限 */

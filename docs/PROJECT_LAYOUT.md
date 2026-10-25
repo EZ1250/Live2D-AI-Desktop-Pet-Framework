@@ -822,6 +822,17 @@ stdio 用 `command/args/cwd/env`，http 用 `url/headers`；`toolCallTimeoutMs` 
 后续架构项（未做，需单独确认）：把工具**执行器**从 `mainImpl.js` 按领域抽到 `tools/exec/`；`mainImpl.js` 按
 窗口/IPC/托盘/自启动拆模块；`chatClient` 的 phase 循环抽成 `agentLoop.ts` 并加老对话压缩；事件总线/审计日志；下次到期调度器（orb 思路）。
 
+## 7.11 远程访问 / WebSocket / 手机 MCP 桥接（PC 端）
+
+- **局域网开关**：设置页「允许局域网访问」（`mcpServerLanEnabled`，默认关闭）；关闭时只监听 127.0.0.1，开启时监听 0.0.0.0 并要求 Bearer token（明文 HTTP，仅可信网络；防火墙需放行端口）。
+- **双通道**：HTTP `POST /mcp`（既有）与 WebSocket `/ws`。手机/浏览器 WS 无法自定义 Authorization 头，token 走 query，服务端用 timingSafeEqual 校验；最小 RFC6455 实现（握手/mask/分片合并/ping-pong/close），与 HTTP 共用同一 JSON-RPC dispatch。
+- **手机原生工具桥**（VCPToolBox 异步插件 + qq-bridge host bridge 思路）：
+  - 手机调 `phone/register` 上报工具（名称白名单校验，最多 32 个）；
+  - PC 端 `tools/list` 动态合并为 `phone_<name>`，schema/annotations 均来自手机上报，不硬编码；
+  - PC 端调用 `phone_*` → 手机 `phone/poll` 长轮询取任务 → 执行 → `phone/result` 回执 → 调用方拿到结果；默认 30s 超时返回 isError（fail-closed），dispose 清理 pending/等待者；
+  - 手机工具数量/可用列表进入启动日志与 `/mcp` 状态文本。
+- **Android 客户端**：`android-mcp-client/`（Kotlin + Compose，WS 优先、HTTP 回退；工具列表运行时拉取；每调用带超时与错误提示；危险工具二次确认；手机原生能力注册）。构建需 JDK 17 + Android SDK 35，本仓库开发机未装，APK 需在 Android Studio 构建。
+
 ## 8. 自检命令
 
 ```bash

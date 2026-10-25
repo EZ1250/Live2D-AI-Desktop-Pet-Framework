@@ -1091,6 +1091,10 @@ function sanitizeSettings(raw: unknown): AppSettings | null {
     if (typeof input.mcpServerEnabled !== 'boolean') return null;
     settings.mcpServerEnabled = input.mcpServerEnabled;
   }
+    if (input.mcpServerLanEnabled !== undefined) {
+        if (typeof input.mcpServerLanEnabled !== 'boolean') return null;
+        settings.mcpServerLanEnabled = input.mcpServerLanEnabled;
+    }
   if (input.mcpServerPort !== undefined) {
     const port = input.mcpServerPort;
     if (typeof port !== 'number' || !Number.isFinite(port) || port < 1024 || port > 65535) return null;
