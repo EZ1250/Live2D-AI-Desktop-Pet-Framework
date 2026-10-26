@@ -924,7 +924,7 @@ export class PetMcpServer {
           if (!text)
             return { isError: true, content: [{ type: 'text', text: '参数 text 不能为空' }] };
           const detail = await this.opts.deps.chatDetail(text);
-          return { content: [{ type: 'text', text: `思考：${detail.thinking || '（无）'}\n\n回复：${detail.reply}` }] };
+          return { content: [{ type: 'text', text: JSON.stringify({ reply: detail.reply, thinking: detail.thinking }) }] };
         }
         case 'pet_screenshot': {
           const shot = await this.opts.deps.screenshot();

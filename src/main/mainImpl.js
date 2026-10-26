@@ -2811,7 +2811,7 @@ async function bootstrap() {
             },
             chat: (prompt) => askPetChat(prompt),
             chatDetail: (prompt) => askPetChatDetail(prompt),
-            chatHistory: (sessionId, limit) => petChatHistoryForPhone(sessionId, limit),
+            chatHistory: (sessionId, limit) => bridge.readChatHistory(sessionId, limit),
             avatarFrame: (maxWidth) => capturePetAvatarFrame(maxWidth),
             touch: (action, x, y) => handlePhoneTouch(action, x, y),
             ask: async (question, options) => {
@@ -3612,39 +3612,6 @@ async function askPetChat(promptText) {
 async function askPetChatDetail(promptText) {
     const reply = await askPetChat(promptText);
     return { reply, thinking: externalChatThink.trim().slice(0, 8000) };
-}
-
-/** 电脑端聊天历史（只读 chat-log.json，给手机端读取；无 sessionId 返回会话列表） */
-function petChatHistoryForPhone(sessionId, limit) {
-    const file = path.join(electron_1.app.getPath('userData'), 'chat-log.json');
-    let sessions = [];
-    try {
-        const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
-        if (Array.isArray(raw.sessions))
-            sessions = raw.sessions;
-        else if (Array.isArray(raw))
-            sessions = [{ id: 'legacy', title: '历史对话', startedAt: 0, entries: raw }];
-    }
-    catch {
-        return JSON.stringify([]);
-    }
-    const cleanSession = (s) => ({
-        id: String(s.id || ''),
-        title: String(s.title || '未命名对话').slice(0, 40),
-        startedAt: typeof s.startedAt === 'number' ? s.startedAt : 0,
-        count: Array.isArray(s.entries) ? s.entries.length : 0,
-    });
-    if (!sessionId)
-        return JSON.stringify(sessions.map(cleanSession).slice(0, 30));
-    const session = sessions.find((s) => String(s.id || '') === sessionId);
-    if (!session)
-        return JSON.stringify([]);
-    const entries = (Array.isArray(session.entries) ? session.entries : []).slice(-limit).map((e) => ({
-        role: e && e.role === 'user' ? 'user' : e && e.role === 'pet' ? 'pet' : e && e.role === 'error' ? 'error' : 'tool',
-        text: String((e && e.text) || '').slice(0, 2000),
-        at: typeof (e && e.at) === 'number' ? e.at : 0,
-    }));
-    return JSON.stringify(entries);
 }
 
 /** 抓桌宠窗口一帧（手机 Live2D 头像，PNG base64） */

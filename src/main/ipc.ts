@@ -147,6 +147,8 @@ export interface IpcDeps {
 export interface IpcBridge {
   /** 向主窗口 webContents 推送事件（频道与负载由调用方按契约给定） */
   pushToRenderer: (channel: string, payload: unknown) => void;
+  /** 只读聊天历史（复用 chat-log.json 的读取；供 MCP 手机历史工具） */
+  readChatHistory: (sessionId: string, limit: number) => string;
 }
 
 export function registerIpc(deps: IpcDeps): IpcBridge {
@@ -904,7 +906,32 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
     }
   );
 
-  return { pushToRenderer };
+  /** 手机端读取聊天历史：无 sessionId 返回会话列表，有则返回该会话最近消息 */
+  const readChatHistoryForPhone = (sessionId: string, limit: number): string => {
+    const data = readChatLogFile();
+    if (!sessionId) {
+      return JSON.stringify(
+        data.sessions.slice(0, 30).map((session) => ({
+          id: session.id,
+          title: session.title,
+          startedAt: session.startedAt,
+          count: session.entries.length,
+        })),
+      );
+    }
+    const session = data.sessions.find((item) => item.id === sessionId);
+    if (!session) return JSON.stringify([]);
+    const safeLimit = Math.max(1, Math.min(100, Math.round(limit) || 40));
+    return JSON.stringify(
+      session.entries.slice(-safeLimit).map((entry) => ({
+        role: entry.role,
+        text: entry.text.slice(0, 2000),
+        at: entry.at,
+      })),
+    );
+  };
+
+  return { pushToRenderer, readChatHistory: readChatHistoryForPhone };
 }
 
 function sanitizeSettings(raw: unknown): AppSettings | null {
