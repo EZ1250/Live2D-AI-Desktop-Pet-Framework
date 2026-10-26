@@ -31,6 +31,8 @@ export interface PetMcpServerDeps {
   avatarFrame?(maxWidth?: number): Promise<{ data: string; width: number; height: number }>;
   /** 手机触摸：action=move/click，x/y 为桌宠窗口内归一化坐标 0..1 */
   touch?(action: 'move' | 'click', x: number, y: number): Promise<string>;
+  /** 电脑端聊天历史：无 sessionId 时返回会话列表，否则返回该会话消息（JSON 文本） */
+  chatHistory?(sessionId: string, limit: number): string;
   /** 带思考过程的外部 AI 回复 */
   chatDetail?(prompt: string): Promise<{ reply: string; thinking: string }>;
 }
@@ -162,6 +164,12 @@ const TOOL_DEFS = [
       required: ['action', 'x', 'y'],
     },
     annotations: { readOnlyHint: false },
+  },
+  {
+    name: 'pet_chat_history',
+    description: '读取电脑端聊天历史：不传 sessionId 返回会话列表（JSON）；传 sessionId 返回该会话最近消息（JSON，role/text/at）。',
+    inputSchema: { type: 'object', properties: { sessionId: { type: 'string' }, limit: { type: 'number' } } },
+    annotations: { readOnlyHint: true },
   },
   {
     name: 'pet_chat_detail',
@@ -901,6 +909,13 @@ export class PetMcpServer {
           const x = typeof args.x === 'number' && Number.isFinite(args.x) ? args.x : 0.5;
           const y = typeof args.y === 'number' && Number.isFinite(args.y) ? args.y : 0.5;
           return { content: [{ type: 'text', text: await this.opts.deps.touch(action, x, y) }] };
+        }
+        case 'pet_chat_history': {
+          if (!this.opts.deps.chatHistory)
+            return { isError: true, content: [{ type: 'text', text: '聊天历史不可用' }] };
+          const sessionId = typeof args.sessionId === 'string' ? args.sessionId : '';
+          const limit = typeof args.limit === 'number' ? Math.round(args.limit) : 40;
+          return { content: [{ type: 'text', text: this.opts.deps.chatHistory(sessionId, Math.max(1, Math.min(100, limit))) }] };
         }
         case 'pet_chat_detail': {
           if (!this.opts.deps.chatDetail)
