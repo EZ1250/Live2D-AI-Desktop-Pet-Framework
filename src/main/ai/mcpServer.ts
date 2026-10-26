@@ -27,6 +27,12 @@ export interface PetMcpServerDeps {
   /** 只读资源清单与读取（pet://…） */
   resourceList(): Array<{ uri: string; name: string; description?: string }>;
   resourceRead(uri: string): string | null;
+  /** 抓一帧桌宠窗口（手机 Live2D 头像用），返回 PNG base64 */
+  avatarFrame?(maxWidth?: number): Promise<{ data: string; width: number; height: number }>;
+  /** 手机触摸：action=move/click，x/y 为桌宠窗口内归一化坐标 0..1 */
+  touch?(action: 'move' | 'click', x: number, y: number): Promise<string>;
+  /** 带思考过程的外部 AI 回复 */
+  chatDetail?(prompt: string): Promise<{ reply: string; thinking: string }>;
 }
 
 export interface PetMcpServerOptions {
@@ -138,6 +144,32 @@ const TOOL_DEFS = [
     annotations: { readOnlyHint: false },
   },
   {
+    name: 'pet_avatar',
+    description: '抓取当前桌宠窗口的一帧画面（手机端 Live2D 头像用）。maxWidth 可选（120~640）。',
+    inputSchema: { type: 'object', properties: { maxWidth: { type: 'number' } } },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'pet_touch',
+    description: '手机触摸桌宠：action=move 让桌宠视线跟随到该位置；action=click 在命中可交互区域时触发一次左键点击（不能拖动）。x/y 为桌宠窗口内归一化坐标 0~1。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['move', 'click'] },
+        x: { type: 'number' },
+        y: { type: 'number' },
+      },
+      required: ['action', 'x', 'y'],
+    },
+    annotations: { readOnlyHint: false },
+  },
+  {
+    name: 'pet_chat_detail',
+    description: '让桌宠 AI 回复并同时返回思考过程（手机对话页用；会消耗模型额度）。',
+    inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
+    annotations: { readOnlyHint: false },
+  },
+  {
     name: 'pet_screenshot',
     description: '截取当前整个屏幕（PNG），返回图片与保存路径。注意：内容可能含用户隐私，只在用户知情时调用。',
     inputSchema: { type: 'object', properties: {} },
@@ -186,6 +218,7 @@ export class PetMcpServer {
   private started = false;
   private readonly opts: PetMcpServerOptions;
   private readonly wsSockets = new Set<Duplex>();
+  private readonly wsAvatarTimers = new Map<Duplex, { timer: NodeJS.Timeout | null; busy: boolean }>();
   private readonly phoneTools = new Map<string, PhoneTool>();
   private readonly phoneQueue: PendingPhoneCall[] = [];
   private readonly phoneWaiters = new Set<(call: PendingPhoneCall | null) => void>();
@@ -338,6 +371,10 @@ export class PetMcpServer {
     const srv = this.server;
     this.server = null;
     this.started = false;
+    for (const state of this.wsAvatarTimers.values()) {
+      if (state.timer) clearInterval(state.timer);
+    }
+    this.wsAvatarTimers.clear();
     for (const socket of this.wsSockets) {
       try { socket.destroy(); } catch { /* ignore */ }
     }
@@ -459,8 +496,14 @@ export class PetMcpServer {
         buffer = Buffer.concat([buffer, chunk]);
         buffer = this.consumeWsFrames(socket, buffer);
       });
-      socket.on('close', () => this.wsSockets.delete(socket));
-      socket.on('error', () => this.wsSockets.delete(socket));
+      socket.on('close', () => {
+        this.stopAvatarStream(socket);
+        this.wsSockets.delete(socket);
+      });
+      socket.on('error', () => {
+        this.stopAvatarStream(socket);
+        this.wsSockets.delete(socket);
+      });
     } catch (err) {
       this.log(`MCP 服务端：WS 握手异常（${(err as Error).message}）`);
       try { socket.destroy(); } catch { /* ignore */ }
@@ -543,6 +586,18 @@ export class PetMcpServer {
       return;
     }
     try {
+      const msg = parsed as { id?: unknown; method?: unknown; params?: Record<string, unknown> };
+      if (msg && (msg.method === 'pet/avatarStart' || msg.method === 'pet/avatarStop')) {
+        const id = typeof msg.id === 'number' ? msg.id : null;
+        if (msg.method === 'pet/avatarStart') {
+          const raw = typeof msg.params?.maxWidth === 'number' ? Math.round(msg.params.maxWidth) : 300;
+          this.startAvatarStream(socket, Math.max(120, Math.min(640, raw)));
+        } else {
+          this.stopAvatarStream(socket);
+        }
+        if (id !== null) this.wsSendJson(socket, { jsonrpc: '2.0', id, result: { ok: true } });
+        return;
+      }
       const payload = await this.handleRpc(parsed);
       if (payload !== undefined) this.wsSendJson(socket, payload);
     } catch (err) {
@@ -550,6 +605,38 @@ export class PetMcpServer {
     }
   }
 
+
+  /** 24fps 头像推流；上一帧未完成时跳帧（背压），避免拖慢主进程 */
+  private startAvatarStream(socket: Duplex, maxWidth: number): void {
+    this.stopAvatarStream(socket);
+    const state = { timer: null as NodeJS.Timeout | null, busy: false };
+    this.wsAvatarTimers.set(socket, state);
+    const tick = async (): Promise<void> => {
+      if (state.busy || !this.wsSockets.has(socket)) return;
+      if (!this.opts.deps.avatarFrame) return;
+      state.busy = true;
+      try {
+        const frame = await this.opts.deps.avatarFrame(maxWidth);
+        if (this.wsSockets.has(socket)) {
+          this.wsSendJson(socket, { jsonrpc: '2.0', method: 'pet/avatarFrame', params: frame });
+        }
+      } catch {
+        /* 单帧失败跳过 */
+      } finally {
+        state.busy = false;
+      }
+    };
+    state.timer = setInterval(() => void tick(), 42);
+    state.timer.unref?.();
+    void tick();
+  }
+
+  private stopAvatarStream(socket: Duplex): void {
+    const state = this.wsAvatarTimers.get(socket);
+    if (!state) return;
+    if (state.timer) clearInterval(state.timer);
+    this.wsAvatarTimers.delete(socket);
+  }
 
   private authorized(req: http.IncomingMessage): boolean {
     const header = req.headers.authorization;
@@ -794,6 +881,35 @@ export class PetMcpServer {
           if (!Number.isFinite(minutesRaw) || minutesRaw < 1 || minutesRaw > 10080)
             return { isError: true, content: [{ type: 'text', text: 'afterMinutes 必须是 1~10080 的整数' }] };
           return { content: [{ type: 'text', text: this.opts.deps.reminderAdd(text, minutesRaw) }] };
+        }
+        case 'pet_avatar': {
+          if (!this.opts.deps.avatarFrame)
+            return { isError: true, content: [{ type: 'text', text: '头像抓帧不可用' }] };
+          const maxWidth = typeof args.maxWidth === 'number' ? Math.round(args.maxWidth) : 300;
+          const frame = await this.opts.deps.avatarFrame(Math.max(120, Math.min(640, maxWidth)));
+          return {
+            content: [
+              { type: 'image', data: frame.data, mimeType: 'image/png' },
+              { type: 'text', text: `${frame.width}×${frame.height}` },
+            ],
+          };
+        }
+        case 'pet_touch': {
+          if (!this.opts.deps.touch)
+            return { isError: true, content: [{ type: 'text', text: '触摸不可用' }] };
+          const action = args.action === 'click' ? 'click' : 'move';
+          const x = typeof args.x === 'number' && Number.isFinite(args.x) ? args.x : 0.5;
+          const y = typeof args.y === 'number' && Number.isFinite(args.y) ? args.y : 0.5;
+          return { content: [{ type: 'text', text: await this.opts.deps.touch(action, x, y) }] };
+        }
+        case 'pet_chat_detail': {
+          if (!this.opts.deps.chatDetail)
+            return { isError: true, content: [{ type: 'text', text: 'chatDetail 不可用' }] };
+          const text = textOf('text', 500);
+          if (!text)
+            return { isError: true, content: [{ type: 'text', text: '参数 text 不能为空' }] };
+          const detail = await this.opts.deps.chatDetail(text);
+          return { content: [{ type: 'text', text: `思考：${detail.thinking || '（无）'}\n\n回复：${detail.reply}` }] };
         }
         case 'pet_screenshot': {
           const shot = await this.opts.deps.screenshot();

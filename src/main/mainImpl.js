@@ -187,6 +187,8 @@ let externalChatResolve = null;
 let externalChatReject = null;
 let externalChatBusy = false;
 let lastExternalChatAt = 0;
+let externalChatThink = '';
+let phoneTouchUntil = 0;
 // 后台自主任务的工具调用预算（防失控/死循环；参考 DSH 的有界工具循环与重复调用保护）
 let autoTaskToolCount = 0;
 const autoTaskToolRepeat = new Map();
@@ -550,6 +552,8 @@ function startCursorTracking() {
         if (!win || win.isDestroyed())
             return;
         const now = Date.now();
+        if (now < phoneTouchUntil)
+            return; // 手机触摸交互期间：保持手机合成的视线位置，不被真实鼠标轮询覆盖
         try {
             const p = electron_1.screen.getCursorScreenPoint();
             const moved = !lastCursorSent || lastCursorSent.x !== p.x || lastCursorSent.y !== p.y;
@@ -2799,6 +2803,9 @@ async function bootstrap() {
                 return { base64: fs.readFileSync(file).toString('base64'), savedPath: file };
             },
             chat: (prompt) => askPetChat(prompt),
+            chatDetail: (prompt) => askPetChatDetail(prompt),
+            avatarFrame: (maxWidth) => capturePetAvatarFrame(maxWidth),
+            touch: (action, x, y) => handlePhoneTouch(action, x, y),
             ask: async (question, options) => {
                 scenario?.record('event', '外部自动化：向用户提问');
                 return await askUser(question, options.map((label) => ({ label })));
@@ -3503,6 +3510,9 @@ function initAutoTask(settings, resolver) {
         autoTaskChat.setPromptLibrary(promptLibrary);
     externalChat = new chatClient_1.ChatClient(settings, {
         onChunk: () => undefined,
+        onThink: (evt) => {
+            if (evt && evt.kind === 'reasoning' && typeof evt.text === 'string') externalChatThink += evt.text;
+        },
         onDone: (full) => {
             const resolve = externalChatResolve;
             externalChatResolve = null;
@@ -3569,6 +3579,7 @@ async function askPetChat(promptText) {
         throw new Error('调用太频繁（最小间隔 3 秒）');
     lastExternalChatAt = now;
     externalChatBusy = true;
+    externalChatThink = '';
     try {
         externalChat.updateSettings((0, chatClient_1.loadAppSettings)());
         const reply = await new Promise((resolve, reject) => {
@@ -3587,6 +3598,52 @@ async function askPetChat(promptText) {
     finally {
         externalChatBusy = false;
     }
+}
+
+/** 带思考过程的外部 AI 回复（手机对话页） */
+async function askPetChatDetail(promptText) {
+    const reply = await askPetChat(promptText);
+    return { reply, thinking: externalChatThink.trim().slice(0, 8000) };
+}
+
+/** 抓桌宠窗口一帧（手机 Live2D 头像，PNG base64） */
+async function capturePetAvatarFrame(maxWidth = 300) {
+    const win = mainWindow;
+    if (!win || win.isDestroyed())
+        throw new Error('桌宠窗口不可用');
+    const image = await win.webContents.capturePage();
+    const size = image.getSize();
+    const width = Math.max(120, Math.min(640, Math.round(maxWidth), size.width || 640));
+    const resized = image.resize({ width });
+    const out = resized.getSize();
+    return { data: resized.toPNG().toString('base64'), width: out.width, height: out.height };
+}
+
+/** 手机触摸：归一化坐标 → 桌宠窗口本地/屏幕坐标；move 触发视线跟随，click 发一次左键单击（不拖动） */
+async function handlePhoneTouch(action, x, y) {
+    const win = mainWindow;
+    if (!win || win.isDestroyed())
+        throw new Error('桌宠窗口不可用');
+    const nx = Math.min(1, Math.max(0, Number(x) || 0));
+    const ny = Math.min(1, Math.max(0, Number(y) || 0));
+    const [cw, ch] = win.getContentSize();
+    const localX = Math.round(nx * Math.max(1, cw - 1));
+    const localY = Math.round(ny * Math.max(1, ch - 1));
+    const cb = win.getContentBounds();
+    const globalX = cb.x + localX;
+    const globalY = cb.y + localY;
+    phoneTouchUntil = Date.now() + 1500;
+    lastCursorSent = { x: globalX, y: globalY };
+    sendToRenderer(contracts_1.IPC_GLOBAL_CURSOR, { x: globalX, y: globalY });
+    if (action === 'click') {
+        win.webContents.sendInputEvent({ type: 'mouseMove', x: localX, y: localY });
+        win.webContents.sendInputEvent({ type: 'mouseDown', x: localX, y: localY, button: 'left', clickCount: 1 });
+        win.webContents.sendInputEvent({ type: 'mouseUp', x: localX, y: localY, button: 'left', clickCount: 1 });
+        scenario?.record('event', '手机触摸：点击桌宠');
+        return '你点了桌宠一下，看看它的反应吧。';
+    }
+    scenario?.record('event', '手机触摸：视线跟随');
+    return '桌宠的视线跟到了这个位置。';
 }
 
 /** 只读 pet:// 资源（外部 MCP 客户端读取桌宠上下文用） */

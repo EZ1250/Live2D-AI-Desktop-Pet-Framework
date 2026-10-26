@@ -841,6 +841,14 @@ stdio 用 `command/args/cwd/env`，http 用 `url/headers`；`toolCallTimeoutMs` 
 - 打开聊天窗口时会自动加载最近一次记录；记录存 `%APPDATA%\pet-desktop-app\autotask-last-round.json`（仅本机，不进安装包），**不写入 chat-log.json**，避免每 5 分钟污染用户对话历史；
 - 模型未返回推理内容时显示「（本次模型没有返回思考内容）」，回复照常显示。
 
+## 7.13 手机端能力接口（头像流 / 触摸 / 思考对话）
+
+- `pet/avatarStart` / `pet/avatarStop`（WS 扩展）：订阅后电脑端以 ~42ms 间隔抓桌宠窗口（`BrowserWindow.capturePage`，默认缩到 300px 宽）并推 `pet/avatarFrame` 通知（PNG base64）；上一帧未编码完时跳帧（背压）；实测约 21–22fps（目标 24），停止后立即不再推送；
+- 工具 `pet_avatar`：一次性抓帧（HTTP 回退/单帧预览用）；
+- 工具 `pet_touch`：`{action:'move'|'click', x, y}`，x/y 为桌宠窗口归一化坐标；move 合成全局光标位置触发视线跟随（触摸后 1.5s 内真实鼠标轮询不覆盖）；click 在桌宠窗口内发一次左键单击（不做拖动）；
+- 工具 `pet_chat_detail`：在 `pet_chat` 基础上返回思考过程（手机对话页用，消耗模型额度）；
+- 点击产生的互动文字由工具返回值带回手机端并追加到对话界面。
+
 ## 8. 自检命令
 
 ```bash
