@@ -176,6 +176,7 @@ let autoTaskState = { dayKey: "", countToday: 0, lastRunAt: 0, lastEventAt: 0 };
 let autoTaskRunning = false;
 let autoTaskLastResult = "";
 let autoTaskLastRound = null;
+let autoTaskRoundDraft = null;
 let autoTaskRoundThink = '';
 let autoTaskRoundPrompt = '';
 let autoTaskResolve = null;
@@ -1647,7 +1648,7 @@ function closeThinkWindowWindow() {
 }
 // ---------------------------------------------------------------- 推送路由
 /** 对话频道：桌宠窗口（出气泡）+ 气泡窗（出对话记录）都要收 */
-const CHAT_MIRROR_CHANNELS = new Set([contracts_1.IPC_AI_CHUNK, contracts_1.IPC_AI_DONE, contracts_1.IPC_AI_ERROR]);
+const CHAT_MIRROR_CHANNELS = new Set([contracts_1.IPC_AI_CHUNK, contracts_1.IPC_AI_DONE, contracts_1.IPC_AI_ERROR, contracts_1.IPC_AUTOTASK_ROUND_PUSH]);
 /** 思考频道：只发给思考浮窗（气泡窗很小，不显示思考流） */
 const THINK_CHANNELS = new Set([contracts_1.IPC_THINK_PUSH, contracts_1.IPC_PLAN_PUSH]);
 /** 推给桌宠窗口；对话频道镜像给气泡窗，思考频道发给思考浮窗 */
@@ -2236,7 +2237,7 @@ async function bootstrap() {
             return 'MCP 已重载。';
         },
         autoRunNow: () => runAutoTask('manual'),
-        autoTaskLastRound: () => autoTaskLastRound,
+        autoTaskLastRound: () => autoTaskRoundDraft ?? autoTaskLastRound,
         onSettingsSaved: (next) => {
             applyAutoTaskSettings(next);
             configureAutoTaskTools();
@@ -3421,6 +3422,8 @@ function loadAutoTaskLastRound() {
             prompt: typeof raw.prompt === 'string' ? raw.prompt.slice(0, 2000) : '',
             thinking: typeof raw.thinking === 'string' ? raw.thinking.slice(0, 8000) : '',
             reply: raw.reply.slice(0, 4000),
+            running: false,
+            durationMs: typeof raw.durationMs === 'number' ? raw.durationMs : undefined,
         };
     }
     catch {
@@ -3697,6 +3700,16 @@ async function runAutoTask(trigger, eventMatched = false) {
         return autoTaskLastResult;
     }
     autoTaskRunning = true;
+    autoTaskRoundDraft = {
+        at: Date.now(),
+        trigger,
+        mode: autoTaskCfg.mode,
+        prompt: '',
+        thinking: '',
+        reply: '',
+        running: true,
+    };
+    pushToWindows(contracts_1.IPC_AUTOTASK_ROUND_PUSH, autoTaskRoundDraft);
     autoTaskToolCount = 0;
     autoTaskToolRepeat.clear();
     autoTaskRoundThink = '';
@@ -3723,21 +3736,29 @@ async function runAutoTask(trigger, eventMatched = false) {
                 ...ctx,
             });
             autoTaskRoundPrompt = prompt;
+            if (autoTaskRoundDraft)
+                autoTaskRoundDraft = { ...autoTaskRoundDraft, prompt };
+
             const reply = (await askAutoTask(prompt + autoTaskToolHint())).trim().replace(/^["「]|["」]$/g, '');
             autoTaskLastResult = reply;
             if (reply && !reply.includes('无需提醒'))
                 sendToRenderer(contracts_1.IPC_UI_BUBBLE, { text: reply.slice(0, 120), ttlMs: 12000 });
         }
         scenario?.record('event', `自主任务（${autoTaskCfg.mode}）：${String(autoTaskLastResult).slice(0, 80)}`);
+        const roundAt = autoTaskRoundDraft ? autoTaskRoundDraft.at : Date.now();
         autoTaskLastRound = {
-            at: Date.now(),
+            at: roundAt,
             trigger,
             mode: autoTaskCfg.mode,
             prompt: autoTaskRoundPrompt,
             thinking: autoTaskRoundThink.trim().slice(0, 8000),
             reply: String(autoTaskLastResult).slice(0, 4000),
+            running: false,
+            durationMs: Math.max(0, Date.now() - roundAt),
         };
+        autoTaskRoundDraft = null;
         persistAutoTaskLastRound();
+        pushToWindows(contracts_1.IPC_AUTOTASK_ROUND_PUSH, autoTaskLastRound);
         const now = Date.now();
         autoTaskState = {
             ...autoTaskState,
@@ -3750,6 +3771,20 @@ async function runAutoTask(trigger, eventMatched = false) {
     }
     catch (err) {
         autoTaskLastResult = `失败：${err instanceof Error ? err.message : String(err)}`;
+        const roundAt = autoTaskRoundDraft ? autoTaskRoundDraft.at : Date.now();
+        autoTaskLastRound = {
+            at: roundAt,
+            trigger,
+            mode: autoTaskCfg.mode,
+            prompt: autoTaskRoundPrompt,
+            thinking: autoTaskRoundThink.trim().slice(0, 8000),
+            reply: String(autoTaskLastResult).slice(0, 4000),
+            running: false,
+            durationMs: Math.max(0, Date.now() - roundAt),
+        };
+        autoTaskRoundDraft = null;
+        persistAutoTaskLastRound();
+        pushToWindows(contracts_1.IPC_AUTOTASK_ROUND_PUSH, autoTaskLastRound);
         return autoTaskLastResult;
     }
     finally {

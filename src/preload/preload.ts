@@ -17,6 +17,7 @@ import {
   IPC_AI_DONE,
   IPC_AI_ERROR,
   IPC_AUTOTASK_LAST_ROUND,
+  IPC_AUTOTASK_ROUND_PUSH,
   IPC_AI_MODEL_LIST,
   IPC_ASK_ANSWER,
   IPC_ASK_CANCEL,
@@ -152,6 +153,11 @@ const api: ElectronAPI = {
   /** 最近一次自主任务详情（含思考过程）。 */
   getAutoTaskLastRound(): Promise<AutoTaskRound | null> {
     return ipcRenderer.invoke(IPC_AUTOTASK_LAST_ROUND);
+  },
+
+  /** 订阅自主任务运行详情（实时更新对话信息）。 */
+  onAutoTaskRound(cb: (round: AutoTaskRound) => void): () => void {
+    return subscribeChannel<AutoTaskRound>(IPC_AUTOTASK_ROUND_PUSH, cb);
   },
 
   /** 开发辅助：弹出系统文件夹选择器（取消返回空字符串）。 */

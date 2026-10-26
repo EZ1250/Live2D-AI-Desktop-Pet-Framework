@@ -32,6 +32,7 @@ export const IPC_MCP_STATUS = 'mcp:status';
 export const IPC_MCP_ACTION = 'mcp:action';
 export const IPC_AUTO_RUN = 'autotask:run';
 export const IPC_AUTOTASK_LAST_ROUND = 'autotask:lastRound';
+export const IPC_AUTOTASK_ROUND_PUSH = 'autotask:roundPush';
 /** 主进程捕获透明拖拽窗口右键后推送菜单坐标。 */
 export const IPC_CONTEXT_MENU = 'ui:contextMenu';
 /** 主进程 push→renderer：全局鼠标屏幕坐标（DIP，轮询），用于宠物视线自动跟随。 */
@@ -127,6 +128,10 @@ export interface AutoTaskRound {
   prompt: string;
   thinking: string;
   reply: string;
+  /** 正在运行中（start 推送）；完成/失败后为 false */
+  running?: boolean;
+  /** 本次运行耗时（毫秒，完成时才有） */
+  durationMs?: number;
 }
 
 export interface ChatLogEntry {
@@ -625,6 +630,8 @@ export interface ElectronAPI {
   onAskCancel?(cb: () => void): () => void;
   /** 订阅 AI 思考过程事件（推理内容 + 工具调用步骤），用于“思考浮窗”。 */
   onThink?(cb: (evt: { kind: 'start' | 'reasoning' | 'tool' | 'result' | 'done' | 'error'; text: string; tool?: string }) => void): () => void;
+  /** 订阅自主任务运行详情（开始/完成实时更新对话信息）。 */
+  onAutoTaskRound?(cb: (round: AutoTaskRound) => void): () => void;
   /** 订阅 AI 的任务进度清单（plan_update 工具推送），用于在浮窗里显示进度。 */
   onPlan?(cb: (payload: { items: Array<{ text: string; status: 'pending' | 'doing' | 'done' }> }) => void): () => void;
 }

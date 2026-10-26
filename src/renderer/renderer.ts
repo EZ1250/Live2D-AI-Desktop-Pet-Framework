@@ -1591,45 +1591,83 @@ const AUTO_TASK_MODE_LABEL: Record<string, string> = {
   scene_brief: '看一眼桌面',
   custom: '自定义提示词',
 };
+let autoTaskRoundRow: HTMLElement | null = null;
+let autoTaskRoundAt = 0;
 
-/** 最近一次自主任务详情 → 追加到"对话信息"（不写 chat-log.json，避免每 5 分钟污染历史） */
-function appendAutoTaskRound(round: {
+/** 自主任务运行卡片：运行中实时出现，完成后原地更新（不写 chat-log，避免污染历史） */
+function renderAutoTaskRound(round: {
   at: number;
   trigger: string;
   mode: string;
   prompt: string;
   thinking: string;
   reply: string;
+  running?: boolean;
+  durationMs?: number;
 } | null | undefined): void {
   if (!round || !chatLogEl || !round.at) return;
-  const row = document.createElement('div');
-  row.className = 'chat-row is-tool';
-  const body = document.createElement('span');
-  body.className = 'chat-text';
-  body.style.whiteSpace = 'pre-wrap';
+  const same = autoTaskRoundRow !== null && autoTaskRoundRow.isConnected && round.at === autoTaskRoundAt;
+  const row = same && autoTaskRoundRow ? autoTaskRoundRow : document.createElement('div');
+  if (!same) {
+    row.className = 'chat-row is-tool';
+    row.dataset.autotaskAt = String(round.at);
+  }
+  row.replaceChildren();
+  const box = document.createElement('div');
+  box.style.whiteSpace = 'pre-wrap';
+  box.style.fontSize = '12px';
   const time = new Date(round.at).toLocaleString('zh-CN', { hour12: false });
   const triggerLabel = round.trigger === 'manual' ? '手动' : round.trigger === 'event' ? '事件' : '定时';
-  const parts = [
-    `🧠 自主任务（${AUTO_TASK_MODE_LABEL[round.mode] ?? round.mode} · ${triggerLabel}） ${time}`,
-  ];
-  if (round.prompt) parts.push(`提示词：${round.prompt.slice(0, 800)}`);
-  parts.push(`思考：${(round.thinking || '（本次模型没有返回思考内容）').slice(0, 4000)}`);
-  parts.push(`回复：${(round.reply || '').slice(0, 2000)}`);
-  body.textContent = parts.join('\n');
-  row.appendChild(body);
-  chatLogEl.appendChild(row);
+  const status = round.running ? '运行中…' : '已完成';
+  const duration = round.durationMs !== undefined ? ` · 用时 ${(round.durationMs / 1000).toFixed(1)}s` : '';
+  const title = document.createElement('div');
+  title.textContent = `🧠 自主任务（${AUTO_TASK_MODE_LABEL[round.mode] ?? round.mode} · ${triggerLabel}）· ${status}${duration} · ${time}`;
+  title.style.fontWeight = '600';
+  box.appendChild(title);
+  if (round.reply) {
+    const reply = document.createElement('div');
+    reply.textContent = `回复：${round.reply.slice(0, 2000)}`;
+    box.appendChild(reply);
+  }
+  const thinking = document.createElement('div');
+  if (round.thinking) {
+    thinking.textContent = `思考：${round.thinking.slice(0, 4000)}`;
+    thinking.style.maxHeight = '168px';
+    thinking.style.overflowY = 'auto';
+  } else {
+    thinking.textContent = round.running ? '思考中…' : '思考：（本次模型没有返回思考内容）';
+  }
+  box.appendChild(thinking);
+  if (round.prompt) {
+    const details = document.createElement('details');
+    const summary = document.createElement('summary');
+    summary.textContent = '提示词（点击展开）';
+    summary.style.cursor = 'pointer';
+    const pre = document.createElement('div');
+    pre.textContent = round.prompt.slice(0, 4000);
+    pre.style.whiteSpace = 'pre-wrap';
+    pre.style.maxHeight = '200px';
+    pre.style.overflowY = 'auto';
+    details.appendChild(summary);
+    details.appendChild(pre);
+    box.appendChild(details);
+  }
+  row.appendChild(box);
+  if (!same) chatLogEl.appendChild(row);
   while (chatLogEl.childElementCount > CHAT_LOG_MAX_ROWS) {
     const first = chatLogEl.firstElementChild;
     if (!first) break;
     chatLogEl.removeChild(first);
   }
+  autoTaskRoundRow = row;
+  autoTaskRoundAt = round.at;
   chatScrollToEnd();
 }
 
 async function loadAutoTaskRound(bridge: RendererBridge): Promise<void> {
   try {
     const round = await bridge.getAutoTaskLastRound?.();
-    appendAutoTaskRound(round ?? null);
+    renderAutoTaskRound(round ?? null);
   } catch {
     /* 读取失败不影响聊天 */
   }
@@ -2055,6 +2093,11 @@ function subscribeOptionalPushes(bridge: RendererBridge): void {
         if ((BEHAVIOR_KEYS as string[]).includes(name)) emitBehavior(name as BehaviorKey);
       }
       return;
+    });
+  }
+  if (typeof bridge.onAutoTaskRound === 'function') {
+    bridge.onAutoTaskRound((round) => {
+      renderAutoTaskRound(round);
     });
   }
   if (typeof bridge.onThink === 'function') {
@@ -4810,17 +4853,6 @@ function installSettingsUi(bridge: RendererBridge): void {
   });
   elementById<HTMLButtonElement>('setting-autotask-run')?.addEventListener('click', () => {
     void runAutoTaskNowFromUi(bridge);
-  });
-  // 打开对话信息，查看最近一次自主任务的提示词/思考过程/回复（chat 窗口启动时会自动加载）
-  elementById<HTMLButtonElement>('setting-autotask-last-round')?.addEventListener('click', () => {
-    void (async () => {
-      try {
-        if (typeof bridge.chatWindowOpen === 'function') await bridge.chatWindowOpen();
-        setSettingsStatus('已打开对话信息：最后一条是自主任务的提示词、思考过程与回复。');
-      } catch (err) {
-        setSettingsStatus(`打开对话信息失败：${(err as Error).message ?? String(err)}`, true);
-      }
-    })();
   });
   // 可插拔资产：打开文件夹 / 添加 / 重新扫描
   elementById<HTMLButtonElement>('asset-model-open')?.addEventListener('click', () => {
