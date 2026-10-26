@@ -1205,7 +1205,7 @@ function installWindowInteractions(bridge: RendererBridge): void {
 }
 
 /* ================================================================
-   7.8 点击模型 → 播放「点一下」表情（白子专属）+ 星星特效 + 轻灵音效
+   7.8 点击模型 → 播放「点一下」表情（模型自带优先）+ 星星特效 + 轻灵音效
    ================================================================ */
 let tapExpressionResetTimer = 0;
 let activeTapExpression = ''; // 当前由点击触发且在保持中的表情名
@@ -1389,7 +1389,7 @@ let aiStartEmitted = false;
  * 把设置里的触发映射落到"当前模型"上。
  *
  * 优先取**按模型分桶**的那一份（`motionTriggersByModel[当前模型]`），没有才退回旧版的全局
- * `motionTriggers`。这样换模型时各用各的绑定，不会出现"白子的表情在 Hiyori 上全部失效"。
+ * `motionTriggers`。这样换模型时各用各的绑定，不会出现"模型 A 的表情在模型 B 上全部失效"。
  */
 function applyBehaviorTriggersFromSettings(settings: AppSettings): void {
   const byModel = (settings.motionTriggersByModel as Record<string, Record<string, string>> | undefined) ?? {};
@@ -1397,7 +1397,7 @@ function applyBehaviorTriggersFromSettings(settings: AppSettings): void {
   const legacy = (settings.motionTriggers as Record<string, string> | undefined) ?? {};
   const perModel = activeModelName ? byModel[activeModelName] : undefined;
   // 没有这个模型自己的桶时，才退回旧版全局映射；且**只在它的目标确实存在于当前模型上**时沿用。
-  // 否则换个模型（例如白子的「猫咪滤镜」在 Hiyori 上不存在）整块都会被标成
+  // 否则换个模型（例如模型 A 的某个表情在模型 B 上不存在）整块都会被标成
   // 「（当前模型没有）」，看起来就像"设置没被记住"。那种情况当作没配（= 自动）更诚实。
   let effective = perModel;
   if (!effective && Object.keys(legacy).length) {
@@ -1586,6 +1586,55 @@ function appendChatLog(
   return row;
 }
 
+const AUTO_TASK_MODE_LABEL: Record<string, string> = {
+  mcp_check: 'MCP 检查',
+  scene_brief: '看一眼桌面',
+  custom: '自定义提示词',
+};
+
+/** 最近一次自主任务详情 → 追加到"对话信息"（不写 chat-log.json，避免每 5 分钟污染历史） */
+function appendAutoTaskRound(round: {
+  at: number;
+  trigger: string;
+  mode: string;
+  prompt: string;
+  thinking: string;
+  reply: string;
+} | null | undefined): void {
+  if (!round || !chatLogEl || !round.at) return;
+  const row = document.createElement('div');
+  row.className = 'chat-row is-tool';
+  const body = document.createElement('span');
+  body.className = 'chat-text';
+  body.style.whiteSpace = 'pre-wrap';
+  const time = new Date(round.at).toLocaleString('zh-CN', { hour12: false });
+  const triggerLabel = round.trigger === 'manual' ? '手动' : round.trigger === 'event' ? '事件' : '定时';
+  const parts = [
+    `🧠 自主任务（${AUTO_TASK_MODE_LABEL[round.mode] ?? round.mode} · ${triggerLabel}） ${time}`,
+  ];
+  if (round.prompt) parts.push(`提示词：${round.prompt.slice(0, 800)}`);
+  parts.push(`思考：${(round.thinking || '（本次模型没有返回思考内容）').slice(0, 4000)}`);
+  parts.push(`回复：${(round.reply || '').slice(0, 2000)}`);
+  body.textContent = parts.join('\n');
+  row.appendChild(body);
+  chatLogEl.appendChild(row);
+  while (chatLogEl.childElementCount > CHAT_LOG_MAX_ROWS) {
+    const first = chatLogEl.firstElementChild;
+    if (!first) break;
+    chatLogEl.removeChild(first);
+  }
+  chatScrollToEnd();
+}
+
+async function loadAutoTaskRound(bridge: RendererBridge): Promise<void> {
+  try {
+    const round = await bridge.getAutoTaskLastRound?.();
+    appendAutoTaskRound(round ?? null);
+  } catch {
+    /* 读取失败不影响聊天 */
+  }
+}
+
 /** 启动时把历史记录渲染出来（不再回写，避免重复） */
 async function loadChatLog(bridge: RendererBridge): Promise<void> {
   if (!chatLogEl || typeof bridge.chatLogGet !== 'function') return;
@@ -1598,6 +1647,7 @@ async function loadChatLog(bridge: RendererBridge): Promise<void> {
     streamRowEl = null;
     if (entries.length === 0) {
       appendChatLog('tool', '说点什么开始对话吧（右键桌宠可以唤起我）', { persist: false });
+      void loadAutoTaskRound(bridge);
       return;
     }
     for (const entry of entries) {
@@ -1605,6 +1655,7 @@ async function loadChatLog(bridge: RendererBridge): Promise<void> {
       appendChatLog(entry.role, entry.text, { persist: false, at: entry.at });
     }
     chatScrollToEnd();
+    void loadAutoTaskRound(bridge);
   } catch (err) {
     console.warn('[renderer] 读取聊天记录失败', err);
   }
@@ -2856,7 +2907,7 @@ async function populateSettings(bridge: RendererBridge): Promise<void> {
       modelSelect.appendChild(option);
     }
     // ★ 必须把下拉选中值设成"当前真正在用的模型"：
-    //   不设的话它停在列表第一个（例如「神宫白子」），而实际可能在用 Hiyori ——
+    //   不设的话它停在列表第一个（例如「模型 A」），而实际可能在用模型 B ——
     //   用户打开设置就会以为"模型选择没被保存"，这是最容易被当成"设置不持久"的地方。
     const currentModel = settings.modelName || activeModelName || '';
     if (currentModel) {
@@ -4759,6 +4810,17 @@ function installSettingsUi(bridge: RendererBridge): void {
   });
   elementById<HTMLButtonElement>('setting-autotask-run')?.addEventListener('click', () => {
     void runAutoTaskNowFromUi(bridge);
+  });
+  // 打开对话信息，查看最近一次自主任务的提示词/思考过程/回复（chat 窗口启动时会自动加载）
+  elementById<HTMLButtonElement>('setting-autotask-last-round')?.addEventListener('click', () => {
+    void (async () => {
+      try {
+        if (typeof bridge.chatWindowOpen === 'function') await bridge.chatWindowOpen();
+        setSettingsStatus('已打开对话信息：最后一条是自主任务的提示词、思考过程与回复。');
+      } catch (err) {
+        setSettingsStatus(`打开对话信息失败：${(err as Error).message ?? String(err)}`, true);
+      }
+    })();
   });
   // 可插拔资产：打开文件夹 / 添加 / 重新扫描
   elementById<HTMLButtonElement>('asset-model-open')?.addEventListener('click', () => {

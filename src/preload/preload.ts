@@ -16,6 +16,7 @@ import {
   IPC_AI_CHUNK,
   IPC_AI_DONE,
   IPC_AI_ERROR,
+  IPC_AUTOTASK_LAST_ROUND,
   IPC_AI_MODEL_LIST,
   IPC_ASK_ANSWER,
   IPC_ASK_CANCEL,
@@ -80,7 +81,7 @@ import type {
   PluginManifest,
   AppSettings,
   PetEventType,
-  ChatLogEntry,
+  ChatLogEntry, AutoTaskRound,
   ChatLogSnapshot,
   ChatWindowResult,
   TodoDto,
@@ -146,6 +147,11 @@ const api: ElectronAPI = {
   },
   runAutoTaskNow(): Promise<string> {
     return ipcRenderer.invoke(IPC_AUTO_RUN);
+  },
+
+  /** 最近一次自主任务详情（含思考过程）。 */
+  getAutoTaskLastRound(): Promise<AutoTaskRound | null> {
+    return ipcRenderer.invoke(IPC_AUTOTASK_LAST_ROUND);
   },
 
   /** 开发辅助：弹出系统文件夹选择器（取消返回空字符串）。 */

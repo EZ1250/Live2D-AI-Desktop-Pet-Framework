@@ -31,6 +31,7 @@ export const IPC_SETTINGS_SET = 'settings:set';
 export const IPC_MCP_STATUS = 'mcp:status';
 export const IPC_MCP_ACTION = 'mcp:action';
 export const IPC_AUTO_RUN = 'autotask:run';
+export const IPC_AUTOTASK_LAST_ROUND = 'autotask:lastRound';
 /** 主进程捕获透明拖拽窗口右键后推送菜单坐标。 */
 export const IPC_CONTEXT_MENU = 'ui:contextMenu';
 /** 主进程 push→renderer：全局鼠标屏幕坐标（DIP，轮询），用于宠物视线自动跟随。 */
@@ -118,6 +119,16 @@ export interface ChatWindowResult {
 }
 
 /** 一条聊天记录（user=主人 / pet=桌宠回复 / tool=工具步骤 / error=错误提示）。 */
+/** 自主任务最近一次 AI 运行的对话详情（思考过程可在对话信息里回看） */
+export interface AutoTaskRound {
+  at: number;
+  trigger: 'schedule' | 'manual' | 'event';
+  mode: 'mcp_check' | 'scene_brief' | 'custom';
+  prompt: string;
+  thinking: string;
+  reply: string;
+}
+
 export interface ChatLogEntry {
   role: 'user' | 'pet' | 'tool' | 'error';
   text: string;
@@ -491,6 +502,8 @@ export interface ElectronAPI {
   mcpAction(action: 'reload'): Promise<string>;
   /** 立即运行一次自主任务（手动触发，不受间隔/每日上限限制）。 */
   runAutoTaskNow(): Promise<string>;
+  /** 最近一次自主任务 AI 运行详情（含提示词与思考过程）。 */
+  getAutoTaskLastRound?(): Promise<AutoTaskRound | null>;
   /** 设置面板展开/收起（主进程据此调整窗口层级）。 */
   setSettingsPanelOpen(open: boolean): void;
   /** 订阅透明拖拽窗口的右键菜单坐标。 */
@@ -739,7 +752,7 @@ export interface AppSettings {
   /**
    * 行为触发映射（**按模型分开存**）。
    *
-   * 为什么需要：不同模型的动作组/表情完全不同（白子的「猫咪滤镜」在 Hiyori 上根本不存在）。
+   * 为什么需要：不同模型的动作组/表情完全不同（模型 A 的某个表情在模型 B 上根本不存在）。
    * 只存一份全局映射时，换个模型这些绑定就全部失效 —— 用户看到的就是"设置没被记住/不生效"。
    * 现在按模型名分桶保存；`motionTriggers` 保留为旧版兼容的全局回退。
    */

@@ -47,6 +47,7 @@ import {
   IPC_MCP_STATUS,
   IPC_MCP_ACTION,
   IPC_AUTO_RUN,
+  IPC_AUTOTASK_LAST_ROUND,
   IPC_THINK_WINDOW_HIDE,
   IPC_THINK_WINDOW_SHOW,
   IPC_TODO_ADD,
@@ -60,7 +61,7 @@ import {
   IPC_VOICE_TRANSCRIBE,
 } from '../shared/contracts';
 import type { PetEventType } from '../shared/contracts';
-import type { AiModelListResult, AppSettings, AssetImportResult, AssetKind, AssetPresetResult, AssetScanResult, ChatLogEntry, ChatLogSnapshot, ChatWindowResult, ModelManifest, PluginManifest, VoiceCheckResult, VoiceModelIndexResult, VoiceStatusResult, VoiceTranscribeRequest, VoiceTranscribeResult } from '../shared/contracts';
+import type { AiModelListResult, AppSettings, AssetImportResult, AssetKind, AssetPresetResult, AssetScanResult, ChatLogEntry, AutoTaskRound, ChatLogSnapshot, ChatWindowResult, ModelManifest, PluginManifest, VoiceCheckResult, VoiceModelIndexResult, VoiceStatusResult, VoiceTranscribeRequest, VoiceTranscribeResult } from '../shared/contracts';
 import type { PathResolver } from './PathResolver';
 import { fetchAvailableModels, loadAppSettings, saveAppSettings, TOOL_DEFS } from './ai/chatClient';
 import { checkVoiceRoutes, indexVoiceModels, knownRoute, normalizeVoiceConfig, toBytes, transcribeAudio } from './ai/voice';
@@ -135,6 +136,8 @@ export interface IpcDeps {
   mcpAction?: (action: string) => Promise<string>;
   /** 立即运行一次自主任务（设置页按钮） */
   autoRunNow?: () => Promise<string>;
+  /** 最近一次自主任务详情（含思考过程，供对话信息查看） */
+  autoTaskLastRound?: () => AutoTaskRound | null;
   /** 设置保存后立即应用（MCP 服务端重启、自主任务重新排程） */
   onSettingsSaved?: (settings: AppSettings) => void;
   /** 设置面板展开/收起（主进程据此调整窗口层级） */
@@ -524,6 +527,7 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
     return deps.mcpAction?.(act) ?? Promise.resolve('MCP 操作不可用。');
   });
   ipcMain.handle(IPC_AUTO_RUN, (): Promise<string> => deps.autoRunNow?.() ?? Promise.resolve('自主任务不可用。'));
+  ipcMain.handle(IPC_AUTOTASK_LAST_ROUND, (): AutoTaskRound | null => deps.autoTaskLastRound?.() ?? null);
 
   ipcMain.handle(IPC_TODO_GET, (): unknown => deps.toolbox.getTodos());
   ipcMain.handle(IPC_TODO_ADD, (_event, raw: unknown): unknown => {

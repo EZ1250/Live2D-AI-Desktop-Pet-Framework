@@ -175,6 +175,9 @@ let autoTaskCfg = null;
 let autoTaskState = { dayKey: "", countToday: 0, lastRunAt: 0, lastEventAt: 0 };
 let autoTaskRunning = false;
 let autoTaskLastResult = "";
+let autoTaskLastRound = null;
+let autoTaskRoundThink = '';
+let autoTaskRoundPrompt = '';
 let autoTaskResolve = null;
 let autoTaskReject = null;
 // 外部 MCP 客户端桥接用的静默聊天（与自主任务分开，避免互相抢单飞）
@@ -2233,6 +2236,7 @@ async function bootstrap() {
             return 'MCP 已重载。';
         },
         autoRunNow: () => runAutoTask('manual'),
+        autoTaskLastRound: () => autoTaskLastRound,
         onSettingsSaved: (next) => {
             applyAutoTaskSettings(next);
             configureAutoTaskTools();
@@ -3398,6 +3402,41 @@ function loadAutoTaskState() {
     }
 }
 
+/** 最近一次自主任务详情（userData，仅本机；用于对话信息回看，不进安装包） */
+function autoTaskLastRoundPath() {
+    return path.join(electron_1.app.getPath('userData'), 'autotask-last-round.json');
+}
+
+function loadAutoTaskLastRound() {
+    try {
+        const raw = JSON.parse(fs.readFileSync(autoTaskLastRoundPath(), 'utf8'));
+        if (!raw || typeof raw !== 'object')
+            return null;
+        if (typeof raw.at !== 'number' || typeof raw.reply !== 'string')
+            return null;
+        return {
+            at: raw.at,
+            trigger: raw.trigger === 'manual' || raw.trigger === 'event' ? raw.trigger : 'schedule',
+            mode: raw.mode === 'scene_brief' || raw.mode === 'custom' ? raw.mode : 'mcp_check',
+            prompt: typeof raw.prompt === 'string' ? raw.prompt.slice(0, 2000) : '',
+            thinking: typeof raw.thinking === 'string' ? raw.thinking.slice(0, 8000) : '',
+            reply: raw.reply.slice(0, 4000),
+        };
+    }
+    catch {
+        return null;
+    }
+}
+
+function persistAutoTaskLastRound() {
+    try {
+        fs.writeFileSync(autoTaskLastRoundPath(), JSON.stringify(autoTaskLastRound), 'utf8');
+    }
+    catch {
+        /* 落盘失败不影响任务本身 */
+    }
+}
+
 function persistAutoTaskState() {
     try {
         fs.writeFileSync(autoTaskStatePath(), JSON.stringify(autoTaskState), 'utf8');
@@ -3434,9 +3473,15 @@ function applyAutoTaskSettings(settings) {
 }
 
 function initAutoTask(settings, resolver) {
+    autoTaskLastRound = loadAutoTaskLastRound();
     autoTaskState = loadAutoTaskState();
     autoTaskChat = new chatClient_1.ChatClient(settings, {
         onChunk: () => undefined,
+        onThink: (evt) => {
+            if (!autoTaskRunning || !evt) return;
+            if (evt.kind === 'reasoning' && typeof evt.text === 'string') autoTaskRoundThink += evt.text;
+            else if (evt.kind === 'tool' && typeof evt.text === 'string') autoTaskRoundThink += `\n[工具] ${evt.text}`;
+        },
         onDone: (full) => {
             const resolve = autoTaskResolve;
             autoTaskResolve = null;
@@ -3654,6 +3699,8 @@ async function runAutoTask(trigger, eventMatched = false) {
     autoTaskRunning = true;
     autoTaskToolCount = 0;
     autoTaskToolRepeat.clear();
+    autoTaskRoundThink = '';
+    autoTaskRoundPrompt = '';
     configureAutoTaskTools(settings);
     try {
         if (autoTaskCfg.mode === 'mcp_check') {
@@ -3668,18 +3715,29 @@ async function runAutoTask(trigger, eventMatched = false) {
         else {
             const ctx = autoTaskContext();
             const prompt = autonomy_1.buildAutoTaskPrompt(Date.now(), {
+            // 记录原始提示词（用于"对话信息"里回看思考）
                 mode: autoTaskCfg.mode,
                 prompt: autoTaskCfg.prompt,
                 petName: settings.petName || '',
                 model: settings.aiModel || '',
                 ...ctx,
             });
+            autoTaskRoundPrompt = prompt;
             const reply = (await askAutoTask(prompt + autoTaskToolHint())).trim().replace(/^["「]|["」]$/g, '');
             autoTaskLastResult = reply;
             if (reply && !reply.includes('无需提醒'))
                 sendToRenderer(contracts_1.IPC_UI_BUBBLE, { text: reply.slice(0, 120), ttlMs: 12000 });
         }
         scenario?.record('event', `自主任务（${autoTaskCfg.mode}）：${String(autoTaskLastResult).slice(0, 80)}`);
+        autoTaskLastRound = {
+            at: Date.now(),
+            trigger,
+            mode: autoTaskCfg.mode,
+            prompt: autoTaskRoundPrompt,
+            thinking: autoTaskRoundThink.trim().slice(0, 8000),
+            reply: String(autoTaskLastResult).slice(0, 4000),
+        };
+        persistAutoTaskLastRound();
         const now = Date.now();
         autoTaskState = {
             ...autoTaskState,
