@@ -189,6 +189,7 @@ let externalChatBusy = false;
 let lastExternalChatAt = 0;
 let externalChatThink = '';
 let phoneTouchUntil = 0;
+let phoneHitPending = null; // 手机点击命中检测的一次性 resolver
 // 后台自主任务的工具调用预算（防失控/死循环；参考 DSH 的有界工具循环与重复调用保护）
 let autoTaskToolCount = 0;
 const autoTaskToolRepeat = new Map();
@@ -687,6 +688,12 @@ function installClickThrough() {
         if (win.isDestroyed() || !win.isVisible())
             return;
         lastHitProbeAt = Date.now();
+        // 手机点击命中检测：优先满足等待中的手机 resolver（overlay=可交互；ignore=true=透明穿透）
+        if (phoneHitPending) {
+            const resolve = phoneHitPending;
+            phoneHitPending = null;
+            resolve(Boolean(payload && payload.overlay) || !(payload && payload.ignore));
+        }
         // 覆盖层面板（设置/待办/右键菜单/思考浮窗）就在本窗口内部，而 setIgnoreMouseEvents
         // 是**整窗**生效的：面板打开时若仍按"光标是否在角色身上"判定，光标落到面板以外就会被
         // 判成可穿透，面板自己也点不动。所以这种情况一律强制保持可交互。
@@ -3636,6 +3643,23 @@ async function handlePhoneTouch(action, x, y) {
     lastCursorSent = { x: globalX, y: globalY };
     sendToRenderer(contracts_1.IPC_GLOBAL_CURSOR, { x: globalX, y: globalY });
     if (action === 'click') {
+        // 只在"非穿透区域"触发点击：开启点击穿透时，先问渲染层该点是否命中角色
+        if (clickThroughEnabled && phoneHitPending === null) {
+            const hit = await new Promise((resolve) => {
+                phoneHitPending = resolve;
+                sendToRenderer(contracts_1.IPC_HIT_PROBE, { x: localX, y: localY });
+                setTimeout(() => {
+                    if (phoneHitPending === resolve) {
+                        phoneHitPending = null;
+                        resolve(null);
+                    }
+                }, 400);
+            });
+            if (hit === false)
+                return '这个位置是透明区域（穿透），没有触发点击。';
+            if (hit === null)
+                return '位置命中检测超时，本次没有触发点击。';
+        }
         win.webContents.sendInputEvent({ type: 'mouseMove', x: localX, y: localY });
         win.webContents.sendInputEvent({ type: 'mouseDown', x: localX, y: localY, button: 'left', clickCount: 1 });
         win.webContents.sendInputEvent({ type: 'mouseUp', x: localX, y: localY, button: 'left', clickCount: 1 });
