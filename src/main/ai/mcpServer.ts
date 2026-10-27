@@ -621,6 +621,8 @@ export class PetMcpServer {
     this.wsAvatarTimers.set(socket, state);
     const tick = async (): Promise<void> => {
       if (state.busy || !this.wsSockets.has(socket)) return;
+      // 发送端积压时跳帧：慢网络/手机解码慢时别把 PNG 帧堆在 Node 缓冲里
+      if (socket.writableLength > 512 * 1024) return;
       if (!this.opts.deps.avatarFrame) return;
       state.busy = true;
       try {

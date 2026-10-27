@@ -737,11 +737,13 @@ function updateGazeFromGlobal(screenX: number, screenY: number): void {
   const cx = window.screenX + w / 2; // 宠物窗口中心的屏幕坐标（DIP）
   const cy = window.screenY + h / 2;
   // 分母含 220px 软区：鼠标在窗口附近时视线按比例细腻跟动，远离则平滑趋于极限
-  gazeNX = Math.max(-1, Math.min(1, (screenX - cx) / (w / 2 + 220)));
-  gazeNY = Math.max(-1, Math.min(1, -(screenY - cy) / (h / 2 + 220))); // 向上为正
+  // 窗口外光标相对坐标可能到 -2/3，不能 clamp 到 [-1,1]（否则视线卡在边缘）；tanh 平滑饱和
+  const scaleX = w / 2 + 220;
+  const scaleY = h / 2 + 220;
+  gazeNX = Math.tanh((screenX - cx) / scaleX);
+  gazeNY = Math.tanh(-(screenY - cy) / scaleY); // 向上为正
   lastGazeMoveAt = performance.now();
 }
-
 function installGazeTracking(): void {
   window.addEventListener('pointermove', (e) => updateGazeFromPointer(e.clientX, e.clientY), { passive: true });
   // 鼠标离开窗口：视线不再更新，主循环里走“缓缓归零”分支

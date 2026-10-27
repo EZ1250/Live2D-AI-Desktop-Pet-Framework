@@ -136,7 +136,9 @@ const CHAT_BUBBLE_GAP = 8;
 const CHAT_BUBBLE_TOP_TOLERANCE = 26;
 const MONITOR_INTERVAL_MS = 2000;
 const PLUGIN_TICK_MS = 50;
-const CURSOR_POLL_MS = 80; // 全局光标轮询周期（视线自动跟随的平滑度）
+const CURSOR_POLL_MS = 80; // 全局光标轮询周期（窗口附近；视线自动跟随的平滑度）
+const CURSOR_FAR_POLL_MS = 250; // 鼠标远离窗口时的低频轮询（约 4fps，省资源）
+const CURSOR_NEAR_DISTANCE = 260; // 距窗口边界多少 DIP 内算"靠近"
 /** 鼠标静止时的光标心跳间隔：保证窗口外也一直望着鼠标（渲染层 3s 没更新会回正） */
 const CURSOR_HEARTBEAT_MS = 400;
 // ------------------------------------------------------------------ 模块级状态
@@ -546,6 +548,7 @@ let mouseIdleFired = false;
  * 实现"宠物望向鼠标"的自动视线跟随；移动时实时推，静止时按心跳补推）。
  */
 function startCursorTracking() {
+    let cursorFast = true;
     if (cursorTimer)
         return;
     const poll = () => {
@@ -556,6 +559,22 @@ function startCursorTracking() {
         if (now < phoneTouchUntil)
             return; // 手机触摸交互期间：保持手机合成的视线位置，不被真实鼠标轮询覆盖
         try {
+            let near = true;
+            try {
+                const boundsForPoll = win.getBounds();
+                const dx = Math.max(boundsForPoll.x - p.x, 0, p.x - (boundsForPoll.x + boundsForPoll.width));
+                const dy = Math.max(boundsForPoll.y - p.y, 0, p.y - (boundsForPoll.y + boundsForPoll.height));
+                near = Math.hypot(dx, dy) <= CURSOR_NEAR_DISTANCE;
+            }
+            catch {
+                near = true;
+            }
+            if (near !== cursorFast) {
+                cursorFast = near;
+                if (cursorTimer !== null)
+                    clearInterval(cursorTimer);
+                cursorTimer = setInterval(poll, near ? CURSOR_POLL_MS : CURSOR_FAR_POLL_MS);
+            }
             const p = electron_1.screen.getCursorScreenPoint();
             const moved = !lastCursorSent || lastCursorSent.x !== p.x || lastCursorSent.y !== p.y;
             if (moved) {
