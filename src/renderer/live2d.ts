@@ -45,8 +45,12 @@
     listExpressions?(): string[];
     /** 当前模型可用动作组名（无动作返回空数组） */
     listMotions?(): string[];
-    /** 设置视线目标：nx/ny ∈ [-1,1]，向右/向上为正；0 = 归位 */
+    /** 设置视线目标：nx/ny ∈ [-1,1]，向右/向上为正；0 = 归位（项目自建管线/兜底用） */
     setGaze?(nx: number, ny: number): void;
+    /** 喂给 SDK 内置 FocusController 的指针坐标（画布局部坐标，可在窗口外）；成功返回 true */
+    focusAt?(clientX: number, clientY: number): boolean;
+    /** 让 SDK 内置视线回正（静止超时兜底）；成功返回 true */
+    resetFocus?(): boolean;
     /** 视线跟踪自查：目标/平滑值/实际写进模型的参数（排查"不跟鼠标"用） */
     gaze?(): Any;
     /** 滚轮缩放：dir=+1 放大 / -1 缩小（档位 1.08^n，0=fit 基准） */
@@ -129,7 +133,7 @@
    * 内容框是否"像真的"（纯函数，可单测）。
    *
    * ⚠️ 这里**不能**要求"内容框落在 [0, natW]×[0, natH] 内"。
-   * 真机实测（Hiyori，本机 2026-10-21）：画布宽只有 1211，而真实绘制内容在局部坐标
+   * 真机实测（Cubism 3 模型，本机 2026-10-21）：画布宽只有 1211，而真实绘制内容在局部坐标
    * x≈929..2083 —— 也就是说**这个引擎里 model.position 参照的原点并不是画布包围盒的左上角**，
    * `model.width/height` 只给出尺寸、不给出偏移。按"必须落在画布内"去卡，会把**正确的**
    * 内容框否掉，退回画布包围盒后角色只剩右边缘一条（用户看到的"只显示一部分 + 严重偏移"）。
@@ -1199,6 +1203,30 @@
           setGaze(nx: number, ny: number): void {
           gazeTX = (Number.isFinite(nx) ? Math.max(-1, Math.min(1, nx)) : 0) * framingGazeGain();
           gazeTY = (Number.isFinite(ny) ? Math.max(-1, Math.min(1, ny)) : 0) * framingGazeGain();
+          },
+          /** 交给 SDK 内置 FocusController：画布局部坐标（可超出画布=窗口外），方向由 SDK 换算 */
+          focusAt(clientX: number, clientY: number): boolean {
+            try {
+              const m: Any = model;
+              if (!m || typeof m.focus !== 'function') return false;
+              let x = clientX;
+              let y = clientY;
+              try {
+                const view = (app as Any) && (app as Any).view;
+                const rect = view && typeof view.getBoundingClientRect === 'function' ? view.getBoundingClientRect() : null;
+                if (rect) { x -= rect.left; y -= rect.top; }
+              } catch { /* 用原始坐标 */ }
+              m.focus(x, y);
+              return true;
+            } catch { return false; }
+          },
+          /** SDK 视线回正（静止 3s 兜底） */
+          resetFocus(): boolean {
+            try {
+              const fc = model && model.internalModel && model.internalModel.focusController;
+              if (fc && typeof fc.focus === 'function') { fc.focus(0, 0, true); return true; }
+            } catch { /* ignore */ }
+            return false;
           },
           /**
            * 角色在窗口里的实际可见范围（相对窗口顶部的 px）。

@@ -57,6 +57,10 @@ interface RenderHandle {
   listMotions?(): string[];
   /** 视线目标 nx/ny ∈[-1,1]，向右/向上为正；0 = 归位 */
   setGaze?(nx: number, ny: number): void;
+  /** SDK 内置 FocusController 指针喂入（画布局部坐标，可窗口外） */
+  focusAt?(clientX: number, clientY: number): boolean;
+  /** SDK 视线回正 */
+  resetFocus?(): boolean;
   /** 视线跟踪自查（目标值 / 平滑值 / 实际写进模型的参数）：排查"不跟鼠标"用 */
   gaze?(): Any;
   /** 滚轮缩放：dir=+1 放大 / -1 缩小（moc3/portrait 支持；placeholder 不实现） */
@@ -720,7 +724,25 @@ let gazeNX = 0;          // 归一化鼠标偏移 [-1,1]，向右为正
 let gazeNY = 0;          // 向上为正
 let lastGazeMoveAt = 0;  // 0 = 尚未移动/已离开窗口
 let globalCursorPushes = 0; // 主进程推来的全局光标更新次数（自查"窗口外是否还在跟"用）
+let sdkFocusActive = false; // 当前是否由 Live2D/Pixi SDK 内置 FocusController 驱动视线（默认主路径）
 let lastGlobalCursorAt = 0; // 最近一次全局光标推送时刻（performance.now 基准）
+
+/**
+ * 优先喂给 SDK 内置 FocusController（默认主路径）。
+ * 成功返回 true；SDK 不可用/抛错时返回 false，调用方回退到项目自建 setGaze 管线。
+ */
+function trySdkFocus(clientX: number, clientY: number): boolean {
+  const h = currentHandle;
+  if (!h || typeof h.focusAt !== 'function') { sdkFocusActive = false; return false; }
+  try {
+    const ok = h.focusAt(clientX, clientY);
+    sdkFocusActive = ok;
+    return ok;
+  } catch {
+    sdkFocusActive = false;
+    return false;
+  }
+}
 
 function updateGazeFromPointer(clientX: number, clientY: number): void {
   const cx = window.innerWidth / 2 || 0.5;
@@ -728,6 +750,7 @@ function updateGazeFromPointer(clientX: number, clientY: number): void {
   gazeNX = Math.max(-1, Math.min(1, (clientX - cx) / cx));
   gazeNY = Math.max(-1, Math.min(1, (cy - clientY) / cy)); // 屏幕下方 → 负（低头）
   lastGazeMoveAt = performance.now();
+  trySdkFocus(clientX, clientY); // SDK 主路径（窗口内兜底由 SDK 自己的 autoInteract 也在跑）
 }
 
 /** 全局鼠标（主进程轮询推送，屏幕 DIP 坐标）→ 归一化视线目标。 */
@@ -743,6 +766,10 @@ function updateGazeFromGlobal(screenX: number, screenY: number): void {
   gazeNX = Math.tanh((screenX - cx) / scaleX);
   gazeNY = Math.tanh(-(screenY - cy) / scaleY); // 向上为正
   lastGazeMoveAt = performance.now();
+  // 喂给 SDK：画布局部坐标（可超出画布），方向交给 SDK 内部换算 → 窗口外也能生效
+  const localX = w / 2 + gazeNX * (w / 2);
+  const localY = h / 2 - gazeNY * (h / 2);
+  trySdkFocus(localX, localY);
 }
 function installGazeTracking(): void {
   window.addEventListener('pointermove', (e) => updateGazeFromPointer(e.clientX, e.clientY), { passive: true });
@@ -755,6 +782,17 @@ function driveGaze(nowMs: number): void {
   const h = currentHandle;
   if (!h || typeof h.setGaze !== 'function') return;
   const stale = !lastGazeMoveAt || nowMs - lastGazeMoveAt > GAZE_IDLE_MS;
+  if (sdkFocusActive) {
+    if (stale) {
+      // SDK 主路径静止 3s：先让 SDK 自己回正；SDK 做不到再回退代码管线
+      const ok = typeof h.resetFocus === 'function' ? h.resetFocus() : false;
+      if (!ok) {
+        sdkFocusActive = false;
+        h.setGaze(0, 0);
+      }
+    }
+    return; // SDK 模式：参数由 SDK 内部驱动，项目不再覆盖
+  }
   h.setGaze(stale ? 0 : gazeNX, stale ? 0 : gazeNY);
 }
 
@@ -5192,6 +5230,8 @@ function installDebugHooks(bridge: RendererBridge): void {
     bounds: () => currentHandle?.bounds?.() ?? null,
     // 追踪参数层（骨骼/表情/语音口型）：调试与自动化验证用
     tracking: () => currentTrackingApi?.state() ?? null,
+    /** 视线驱动模式自查：sdkFocusActive=true 表示当前由 SDK focus 驱动，false=项目代码管线兜底 */
+    gazeMode: () => ({ sdkFocusActive, globalCursorPushes }),
     pushTracking: (frame: TrackingInput, source = 'debug') => pushTrackingFrame(source, frame),
     emotion: (text: string) => applyEmotionFromText(text),
     speech: (openY: number, ttlMs = 400) => pushSpeechMouth({ openY }, ttlMs),
