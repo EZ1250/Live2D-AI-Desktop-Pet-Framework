@@ -3633,47 +3633,6 @@ async function askPetChatDetail(promptText) {
     return { reply, thinking: externalChatThink.trim().slice(0, 8000) };
 }
 
-/** 去掉与图片边缘连通的近黑像素（透明窗口 capturePage 可能把透明区域拍成黑底） */
-function stripBlackBackground(image) {
-    try {
-        const size = image.getSize();
-        const w = size.width;
-        const h = size.height;
-        if (w <= 0 || h <= 0)
-            return image;
-        const buf = image.toBitmap();
-        const pixel = (x, y) => (y * w + x) * 4;
-        const isBlack = (i) => buf[i] < 20 && buf[i + 1] < 20 && buf[i + 2] < 20;
-        const seen = new Uint8Array(w * h);
-        const stack = [];
-        for (let x = 0; x < w; x++) {
-            stack.push(x, 0, x, h - 1);
-        }
-        for (let y = 0; y < h; y++) {
-            stack.push(0, y, w - 1, y);
-        }
-        while (stack.length) {
-            const y = stack.pop();
-            const x = stack.pop();
-            if (x < 0 || y < 0 || x >= w || y >= h)
-                continue;
-            const idx = y * w + x;
-            if (seen[idx])
-                continue;
-            seen[idx] = 1;
-            const i = idx * 4;
-            if (!isBlack(i))
-                continue;
-            buf[i + 3] = 0;
-            stack.push(x + 1, y, x - 1, y, x, y + 1, x, y - 1);
-        }
-        return electron_1.nativeImage.createFromBitmap(buf, { width: w, height: h });
-    }
-    catch {
-        return image;
-    }
-}
-
 /** 抓桌宠窗口一帧（手机 Live2D 头像，PNG base64） */
 async function capturePetAvatarFrame(maxWidth = 300) {
     const win = mainWindow;
@@ -3685,9 +3644,8 @@ async function capturePetAvatarFrame(maxWidth = 300) {
     const size = image.getSize();
     const width = Math.max(120, Math.min(640, Math.round(maxWidth), size.width || 640));
     const resized = image.resize({ width });
-    const clean = stripBlackBackground(resized);
-    const out = clean.getSize();
-    return { data: clean.toPNG().toString('base64'), width: out.width, height: out.height };
+    const out = resized.getSize();
+    return { data: resized.toPNG().toString('base64'), width: out.width, height: out.height };
 }
 
 /** 手机触摸：归一化坐标 → 桌宠窗口本地/屏幕坐标；move 触发视线跟随，click 发一次左键单击（不拖动） */
