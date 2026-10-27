@@ -172,6 +172,8 @@
     bobY?: number;
     /** 内容锚点（容器局部坐标，可能量歪）；null/缺省 = 直接用画布包围盒 */
     content?: { x: number; y: number; w: number; h: number } | null;
+    /** 半身横向锚点（头部上半区质心 model 坐标）；缺省 = 用内容中心 */
+    headAnchor?: { x: number } | null;
   }
 
   interface PlacementResult {
@@ -209,8 +211,10 @@
     if (!Number.isFinite(s) || s <= 0) return null;
 
     const bbox = { x: 0, y: 0, w: natW, h: natH };
-    const placeWith = (a: { x: number; y: number; w: number; h: number }): { x: number; y: number } => {
-      const cx = (a.x + a.w / 2) * s; // 锚点中心相对容器原点的偏移
+    const placeWith = (a: { x: number; y: number; w: number; h: number }, useHead = false): { x: number; y: number } => {
+      const head = useHead && input.framing === 'half' ? input.headAnchor : null;
+      const anchorX = head && Number.isFinite(head.x) ? head.x : a.x + a.w / 2;
+      const cx = anchorX * s; // 锚点中心相对容器原点的偏移
       if (input.framing === 'half') {
         // 半身：横向对准内容中心；纵向把**头顶**顶到窗口上沿附近（脚被裁掉是对的）
         return { x: vw / 2 - cx, y: vh * HALF_TOP_PAD_RATIO - a.y * s + bobY };
@@ -232,7 +236,7 @@
     let used: 'content' | 'bbox' = 'bbox';
     let contentRejected = false;
     if (input.content) {
-      const candidate = placeWith(input.content);
+      const candidate = placeWith(input.content, true);
       const want = Math.min(input.content.w * s, vw);
       if (
         isContentRectPlausible(input.content, natW, natH) &&
@@ -593,6 +597,8 @@
      * 只在 refit 时重测并缓存：取景锚点必须**稳定**，跟着动作每帧变会让画面自己抖。
      */
     let contentRect: { x: number; y: number; w: number; h: number } | null = null;
+    /** 半身横向缩放锚点：头部上半区质心（model 坐标）；null = 回退内容中心 */
+    let headAnchor: { x: number } | null = null;
     /**
      * 测量时机：**必须等模型真的画过一帧再量**。
      * 挂载瞬间 `internalModel.localTransform` 还是单位阵，顶点又还没算过，量出来会是一个
@@ -633,7 +639,14 @@
      * 遮罩里不透明像素的归一化包围盒（[x0,y0,x1,y1]，0..1）与像素数；没有遮罩返回 null。
      * 命中遮罩本来就是"按实际绘制结果取样"，所以它就是**所见即所得**的内容范围。
      */
-    function maskOpaqueBBox(): { bbox: [number, number, number, number]; opaque: number } | null {
+    function maskOpaqueBBox(): {
+      bbox: [number, number, number, number];
+      opaque: number;
+      /** 上半区（bbox 顶部往下 35%）alpha 加权 x 质心，归一化 0..1；无有效像素时 null */
+      upperCentroidX: number | null;
+      /** 上半区 alpha 权重和（用于判断像素是否足够） */
+      upperWeight: number;
+    } | null {
       const d = maskData as Uint8ClampedArray | null;
       if (!d) return null;
       let opaque = 0;
@@ -653,7 +666,33 @@
         }
       }
       if (maxX < 0) return null;
-      return { bbox: [minX / MASK_W, minY / MASK_H, (maxX + 1) / MASK_W, (maxY + 1) / MASK_H], opaque };
+      const bbox: [number, number, number, number] = [
+        minX / MASK_W,
+        minY / MASK_H,
+        (maxX + 1) / MASK_W,
+        (maxY + 1) / MASK_H,
+      ];
+      // 半身横向锚点只看头部（上半区）：下半身裙摆/腿部不能把质心带偏
+      const band = 0.35;
+      const y0 = Math.max(0, Math.floor((bbox[1] + (bbox[3] - bbox[1]) * 0) * MASK_H));
+      const y1 = Math.min(MASK_H, Math.ceil((bbox[1] + (bbox[3] - bbox[1]) * band) * MASK_H));
+      let upperWeight = 0;
+      let upperX = 0;
+      for (let y = y0; y < y1; y++) {
+        for (let x = minX; x <= maxX; x++) {
+          const a = d[(y * MASK_W + x) * 4 + 3];
+          if (a > 24) {
+            upperWeight += a;
+            upperX += (x + 0.5) * a;
+          }
+        }
+      }
+      return {
+        bbox,
+        opaque,
+        upperCentroidX: upperWeight > 0 ? upperX / upperWeight / MASK_W : null,
+        upperWeight,
+      };
     }
 
     /**
@@ -673,6 +712,8 @@
       rect: { x: number; y: number; w: number; h: number };
       unclipped: boolean;
       bbox: [number, number, number, number];
+      /** 半身横向锚点（头部上半区质心，model 坐标）；内容被裁/顶部像素不足时 null */
+      headAnchor: { x: number } | null;
     } | null {
       const stats = maskOpaqueBBox();
       if (!stats) return null;
@@ -686,6 +727,11 @@
       if (!(s > 0)) return null;
       const m = CALIB_EDGE_MARGIN;
       const unclipped = bx0 > m && by0 > m && bx1 < 1 - m && by1 < 1 - m;
+      // 上半区至少要有几块实心像素，否则质心不可信（回退内容中心）
+      const headAnchor =
+        unclipped && stats.upperCentroidX != null && stats.upperWeight >= 255 * 4
+          ? { x: (stats.upperCentroidX * vw - posX) / s }
+          : null;
       return {
         rect: {
           x: (bx0 * vw - posX) / s,
@@ -695,6 +741,7 @@
         },
         unclipped,
         bbox: stats.bbox,
+        headAnchor,
       };
     }
 
@@ -710,11 +757,13 @@
         extra,
         bobY,
         content: contentRect,
+        headAnchor: framingMode === 'half' ? headAnchor : null,
       });
       if (!res) return;
       if (res.contentRejected) {
         // 内容锚点会把角色摆出窗口：丢掉它并回到画布包围盒（安全的旧行为）
         contentRect = null;
+        headAnchor = null;
         calibPhase = 'done';
         console.warn('[live2d] 内容锚点会把角色摆出窗口，取景退回画布包围盒');
       }
@@ -1636,6 +1685,7 @@
                   const ok = !!measured && measured.unclipped && isContentRectPlausible(measured.rect, natW, natH);
                   if (ok && measured) {
                     contentRect = measured.rect;
+                    headAnchor = measured.headAnchor;
                     calibPhase = 'verify';
                     refreshHitMask(); // 下一帧按内容锚点 + fit 摆一次，再复核
                   } else if (calibAttempts < CALIB_MAX_ATTEMPTS) {
@@ -1644,6 +1694,7 @@
                     refreshHitMask();
                   } else {
                     contentRect = null;
+        headAnchor = null;
                     calibPhase = 'done';
                     console.warn('[live2d] 内容锚点标定失败（内容始终被窗口裁切），取景退回画布包围盒');
                   }
@@ -1661,11 +1712,13 @@
                     // 复核不过：回 measure 换个更小的缩放重来（可能上一轮量的时候还不稳）
                     calibAttempts += 1;
                     contentRect = null;
+        headAnchor = null;
                     calibPhase = 'measure';
                     calibExtra = 0.85 * Math.pow(0.55, Math.min(3, calibAttempts));
                     refreshHitMask();
                   } else {
                     contentRect = null;
+        headAnchor = null;
                     calibPhase = 'done';
                     console.warn(
                       `[live2d] 内容锚点复核不通过（中心偏离 ${Math.round(offX)}×${Math.round(offY)}px），取景退回画布包围盒`
