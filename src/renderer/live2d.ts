@@ -633,7 +633,7 @@
      * 遮罩里不透明像素的归一化包围盒（[x0,y0,x1,y1]，0..1）与像素数；没有遮罩返回 null。
      * 命中遮罩本来就是"按实际绘制结果取样"，所以它就是**所见即所得**的内容范围。
      */
-    function maskOpaqueBBox(): { bbox: [number, number, number, number]; opaque: number } | null {
+    function maskOpaqueBBox(): { bbox: [number, number, number, number]; opaque: number; centroidX: number } | null {
       const d = maskData as Uint8ClampedArray | null;
       if (!d) return null;
       let opaque = 0;
@@ -641,10 +641,12 @@
       let minY = MASK_H;
       let maxX = -1;
       let maxY = -1;
+      let sumX = 0; // 不透明像素的 x 质心（比 bbox 中心更接近角色身体中心）
       for (let y = 0; y < MASK_H; y++) {
         for (let x = 0; x < MASK_W; x++) {
           if (d[(y * MASK_W + x) * 4 + 3] > 24) {
             opaque++;
+            sumX += x + 0.5;
             if (x < minX) minX = x;
             if (x > maxX) maxX = x;
             if (y < minY) minY = y;
@@ -653,7 +655,11 @@
         }
       }
       if (maxX < 0) return null;
-      return { bbox: [minX / MASK_W, minY / MASK_H, (maxX + 1) / MASK_W, (maxY + 1) / MASK_H], opaque };
+      return {
+        bbox: [minX / MASK_W, minY / MASK_H, (maxX + 1) / MASK_W, (maxY + 1) / MASK_H],
+        opaque,
+        centroidX: sumX / opaque / MASK_W,
+      };
     }
 
     /**
@@ -686,9 +692,13 @@
       if (!(s > 0)) return null;
       const m = CALIB_EDGE_MARGIN;
       const unclipped = bx0 > m && by0 > m && bx1 < 1 - m && by1 < 1 - m;
+      let rx = (bx0 * vw - posX) / s;
+      // 横向锚点用不透明像素质心（body 质心）：bbox 中心会被单侧挂件/特效拉偏
+      const bboxCx = (bx0 + bx1) / 2;
+      if (Number.isFinite(stats.centroidX)) rx += (stats.centroidX - bboxCx) * vw / s;
       return {
         rect: {
-          x: (bx0 * vw - posX) / s,
+          x: rx,
           y: (by0 * vh - posY) / s,
           w: ((bx1 - bx0) * vw) / s,
           h: ((by1 - by0) * vh) / s,
@@ -1218,7 +1228,22 @@
               } catch { /* 用原始坐标 */ }
               m.focus(x, y);
               return true;
-            } catch { return false; }
+            } catch { /* 继续走 focusController 兜底 */ }
+            // —— Cubism 5 / 其它封装没有 model.focus 时：直接驱动内部 focusController（与 SDK 同一目标格式）
+            try {
+              const m2: Any = model;
+              const fc = m2 && m2.internalModel && m2.internalModel.focusController;
+              if (fc && typeof fc.focus === 'function') {
+                const vw = (window as Any).innerWidth || 1;
+                const vh = (window as Any).innerHeight || 1;
+                const nx = (clientX - vw / 2) / (vw / 2);
+                const ny = (clientY - vh / 2) / (vh / 2);
+                const ang = Math.atan2(ny, nx);
+                fc.focus(Math.cos(ang), -Math.sin(ang), false);
+                return true;
+              }
+            } catch { /* ignore */ }
+            return false;
           },
           /** SDK 视线回正（静止 3s 兜底） */
           resetFocus(): boolean {
