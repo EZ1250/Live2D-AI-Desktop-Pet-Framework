@@ -172,6 +172,8 @@
     bobY?: number;
     /** 内容锚点（容器局部坐标，可能量歪）；null/缺省 = 直接用画布包围盒 */
     content?: { x: number; y: number; w: number; h: number } | null;
+    /** 用户滚轮缩放中：不再按内容宽度限幅（缩放手感优先，允许裁切） */
+    zoomed?: boolean;
   }
 
   interface PlacementResult {
@@ -209,7 +211,7 @@
     if (!Number.isFinite(s) || s <= 0) return null;
     // 半身：内容（按质心/bbox 量出来的真实像素范围）不能宽过窗口，否则左右会被裁，
     // 看起来就像"整体偏左/偏右"；这里按内容宽度收一点缩放，纵向裁切保持不变。
-    if (input.framing === 'half' && input.content && input.content.w > 0 && Number.isFinite(input.content.w)) {
+    if (input.framing === 'half' && !input.zoomed && input.content && input.content.w > 0 && Number.isFinite(input.content.w)) {
       const maxS = (vw * 0.98) / input.content.w;
       if (s > maxS) s = maxS;
     }
@@ -715,7 +717,7 @@
     }
 
     /** 取景：定位 + 缩放 —— 把决策交给纯函数 computeMoc3Placement（可单测），这里只负责落地。 */
-    function frameModel(extra: number, bobY: number): void {
+    function frameModel(extra: number, bobY: number, zoomed = false): void {
       if (!model || !natW || !natH) return;
       const res = computeMoc3Placement({
         vw: window.innerWidth || 1,
@@ -726,6 +728,7 @@
         extra,
         bobY,
         content: contentRect,
+        zoomed,
       });
       if (!res) return;
       if (res.contentRejected) {
@@ -1590,7 +1593,7 @@
               try {
                 if (calibrating && calibPhase === 'measure') frameModel(calibExtra, 0);
                 else if (calibrating && calibPhase === 'verify') frameModel(1, 0); // 按 fit 摆，复核是否居中
-                else frameModel(breathe * Math.pow(1.08, zoomSteps), bob);
+else frameModel(breathe * Math.pow(1.08, zoomSteps), bob, zoomSteps !== 0);
               } finally {
                 framingMode = savedFraming;
               }
