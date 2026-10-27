@@ -626,7 +626,11 @@ export class PetMcpServer {
       if (!this.opts.deps.avatarFrame) return;
       state.busy = true;
       try {
-        const frame = await this.opts.deps.avatarFrame(maxWidth);
+        // capturePage 在窗口隐藏/切模型等场景可能不 resolve：超时兜底，否则 busy 永久 true → 手机端画面卡死
+        const frame = await Promise.race([
+          this.opts.deps.avatarFrame(maxWidth),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('avatar frame timeout')), 1500)),
+        ]);
         if (this.wsSockets.has(socket)) {
           this.wsSendJson(socket, { jsonrpc: '2.0', method: 'pet/avatarFrame', params: frame });
         }

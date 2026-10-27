@@ -3679,6 +3679,8 @@ async function capturePetAvatarFrame(maxWidth = 300) {
     const win = mainWindow;
     if (!win || win.isDestroyed())
         throw new Error('桌宠窗口不可用');
+    if (!win.isVisible())
+        throw new Error('桌宠窗口不可见');
     const image = await win.webContents.capturePage();
     const size = image.getSize();
     const width = Math.max(120, Math.min(640, Math.round(maxWidth), size.width || 640));
