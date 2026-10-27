@@ -172,8 +172,6 @@
     bobY?: number;
     /** 内容锚点（容器局部坐标，可能量歪）；null/缺省 = 直接用画布包围盒 */
     content?: { x: number; y: number; w: number; h: number } | null;
-    /** 用户滚轮缩放中：不再按内容宽度限幅（缩放手感优先，允许裁切） */
-    zoomed?: boolean;
   }
 
   interface PlacementResult {
@@ -206,15 +204,9 @@
     if (!(vw > 0) || !(vh > 0) || !(natW > 0) || !(natH > 0)) return null;
     const extra = Number.isFinite(input.extra) ? (input.extra as number) : 1;
     const bobY = Number.isFinite(input.bobY) ? (input.bobY as number) : 0;
-    let s = Math.min((vw * MOC3_FIT_MARGIN) / natW, (vh * MOC3_FIT_MARGIN) / natH)
+    const s = Math.min((vw * MOC3_FIT_MARGIN) / natW, (vh * MOC3_FIT_MARGIN) / natH)
       * (input.framing === 'half' ? HALF_ZOOM : 1) * extra;
     if (!Number.isFinite(s) || s <= 0) return null;
-    // 半身：内容（按质心/bbox 量出来的真实像素范围）不能宽过窗口，否则左右会被裁，
-    // 看起来就像"整体偏左/偏右"；这里按内容宽度收一点缩放，纵向裁切保持不变。
-    if (input.framing === 'half' && !input.zoomed && input.content && input.content.w > 0 && Number.isFinite(input.content.w)) {
-      const maxS = (vw * 0.98) / input.content.w;
-      if (s > maxS) s = maxS;
-    }
 
     const bbox = { x: 0, y: 0, w: natW, h: natH };
     const placeWith = (a: { x: number; y: number; w: number; h: number }): { x: number; y: number } => {
@@ -641,7 +633,7 @@
      * 遮罩里不透明像素的归一化包围盒（[x0,y0,x1,y1]，0..1）与像素数；没有遮罩返回 null。
      * 命中遮罩本来就是"按实际绘制结果取样"，所以它就是**所见即所得**的内容范围。
      */
-    function maskOpaqueBBox(): { bbox: [number, number, number, number]; opaque: number; centroidX: number } | null {
+    function maskOpaqueBBox(): { bbox: [number, number, number, number]; opaque: number } | null {
       const d = maskData as Uint8ClampedArray | null;
       if (!d) return null;
       let opaque = 0;
@@ -649,12 +641,10 @@
       let minY = MASK_H;
       let maxX = -1;
       let maxY = -1;
-      let sumX = 0; // 不透明像素的 x 质心（比 bbox 中心更接近角色身体中心）
       for (let y = 0; y < MASK_H; y++) {
         for (let x = 0; x < MASK_W; x++) {
           if (d[(y * MASK_W + x) * 4 + 3] > 24) {
             opaque++;
-            sumX += x + 0.5;
             if (x < minX) minX = x;
             if (x > maxX) maxX = x;
             if (y < minY) minY = y;
@@ -663,11 +653,7 @@
         }
       }
       if (maxX < 0) return null;
-      return {
-        bbox: [minX / MASK_W, minY / MASK_H, (maxX + 1) / MASK_W, (maxY + 1) / MASK_H],
-        opaque,
-        centroidX: sumX / opaque / MASK_W,
-      };
+      return { bbox: [minX / MASK_W, minY / MASK_H, (maxX + 1) / MASK_W, (maxY + 1) / MASK_H], opaque };
     }
 
     /**
@@ -700,13 +686,9 @@
       if (!(s > 0)) return null;
       const m = CALIB_EDGE_MARGIN;
       const unclipped = bx0 > m && by0 > m && bx1 < 1 - m && by1 < 1 - m;
-      let rx = (bx0 * vw - posX) / s;
-      // 横向锚点用不透明像素质心（body 质心）：bbox 中心会被单侧挂件/特效拉偏
-      const bboxCx = (bx0 + bx1) / 2;
-      if (Number.isFinite(stats.centroidX)) rx += (stats.centroidX - bboxCx) * vw / s;
       return {
         rect: {
-          x: rx,
+          x: (bx0 * vw - posX) / s,
           y: (by0 * vh - posY) / s,
           w: ((bx1 - bx0) * vw) / s,
           h: ((by1 - by0) * vh) / s,
@@ -717,7 +699,7 @@
     }
 
     /** 取景：定位 + 缩放 —— 把决策交给纯函数 computeMoc3Placement（可单测），这里只负责落地。 */
-    function frameModel(extra: number, bobY: number, zoomed = false): void {
+    function frameModel(extra: number, bobY: number): void {
       if (!model || !natW || !natH) return;
       const res = computeMoc3Placement({
         vw: window.innerWidth || 1,
@@ -728,7 +710,6 @@
         extra,
         bobY,
         content: contentRect,
-        zoomed,
       });
       if (!res) return;
       if (res.contentRejected) {
@@ -1238,7 +1219,7 @@
               m.focus(x, y);
               return true;
             } catch { /* 继续走 focusController 兜底 */ }
-            // —— Cubism 5 / 其它封装没有 model.focus 时：直接驱动内部 focusController（与 SDK 同一目标格式）
+            // Cubism 5 / 其它封装没有 model.focus 时：直接驱动 focusController（保留 SDK 主路径）
             try {
               const m2: Any = model;
               const fc = m2 && m2.internalModel && m2.internalModel.focusController;
@@ -1593,7 +1574,7 @@
               try {
                 if (calibrating && calibPhase === 'measure') frameModel(calibExtra, 0);
                 else if (calibrating && calibPhase === 'verify') frameModel(1, 0); // 按 fit 摆，复核是否居中
-else frameModel(breathe * Math.pow(1.08, zoomSteps), bob, zoomSteps !== 0);
+                else frameModel(breathe * Math.pow(1.08, zoomSteps), bob);
               } finally {
                 framingMode = savedFraming;
               }
