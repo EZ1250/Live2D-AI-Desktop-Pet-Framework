@@ -725,6 +725,12 @@ let gazeNY = 0;          // 向上为正
 let lastGazeMoveAt = 0;  // 0 = 尚未移动/已离开窗口
 let globalCursorPushes = 0; // 主进程推来的全局光标更新次数（自查"窗口外是否还在跟"用）
 let sdkFocusActive = false; // 当前是否由 Live2D/Pixi SDK 内置 FocusController 驱动视线（默认主路径）
+let sdkTargetX = 0;   // 最近一次输入换算出的画布目标点
+let sdkTargetY = 0;
+let sdkFeedX = NaN;   // 逐帧插值后喂给 SDK 的实际坐标（消除低频输入的一卡一卡）
+let sdkFeedY = NaN;
+let sdkIdleReset = false; // 静止 3s 后只回正一次，避免反复覆盖 SDK 中性位
+let lastDriveAt = 0;
 let lastGlobalCursorAt = 0; // 最近一次全局光标推送时刻（performance.now 基准）
 
 /**
@@ -750,7 +756,10 @@ function updateGazeFromPointer(clientX: number, clientY: number): void {
   gazeNX = Math.max(-1, Math.min(1, (clientX - cx) / cx));
   gazeNY = Math.max(-1, Math.min(1, (cy - clientY) / cy)); // 屏幕下方 → 负（低头）
   lastGazeMoveAt = performance.now();
-  trySdkFocus(clientX, clientY); // SDK 主路径（窗口内兜底由 SDK 自己的 autoInteract 也在跑）
+  sdkTargetX = clientX;
+  sdkTargetY = clientY;
+  sdkIdleReset = false;
+  trySdkFocus(clientX, clientY); // SDK 主路径（窗口内跟手，SDK 自己的 autoInteract 也在跑）
 }
 
 /** 全局鼠标（主进程轮询推送，屏幕 DIP 坐标）→ 归一化视线目标。 */
@@ -767,9 +776,11 @@ function updateGazeFromGlobal(screenX: number, screenY: number): void {
   gazeNY = Math.tanh(-(screenY - cy) / scaleY); // 向上为正
   lastGazeMoveAt = performance.now();
   // 喂给 SDK：画布局部坐标（可超出画布），方向交给 SDK 内部换算 → 窗口外也能生效
-  const localX = w / 2 + gazeNX * (w / 2);
-  const localY = h / 2 - gazeNY * (h / 2);
-  trySdkFocus(localX, localY);
+  sdkTargetX = w / 2 + gazeNX * (w / 2);
+  sdkTargetY = h / 2 - gazeNY * (h / 2);
+  sdkIdleReset = false;
+  // 不在这里直接 focus：交给 driveGaze 每帧插值，避免低频输入一卡一卡
+  if (!sdkFocusActive) trySdkFocus(sdkTargetX, sdkTargetY);
 }
 function installGazeTracking(): void {
   window.addEventListener('pointermove', (e) => updateGazeFromPointer(e.clientX, e.clientY), { passive: true });
@@ -784,14 +795,24 @@ function driveGaze(nowMs: number): void {
   const stale = !lastGazeMoveAt || nowMs - lastGazeMoveAt > GAZE_IDLE_MS;
   if (sdkFocusActive) {
     if (stale) {
-      // SDK 主路径静止 3s：先让 SDK 自己回正；SDK 做不到再回退代码管线
-      const ok = typeof h.resetFocus === 'function' ? h.resetFocus() : false;
-      if (!ok) {
-        sdkFocusActive = false;
-        h.setGaze(0, 0);
+      if (!sdkIdleReset) {
+        sdkIdleReset = true;
+        sdkFeedX = NaN; // 下次移动重新起步
+        if (typeof h.resetFocus === 'function') h.resetFocus();
       }
+      return;
     }
-    return; // SDK 模式：参数由 SDK 内部驱动，项目不再覆盖
+    // 逐帧插值：即使输入只有 6.7fps，喂给 SDK 的坐标也是连续的（不卡顿）
+    if (!Number.isFinite(sdkFeedX)) { sdkFeedX = sdkTargetX; sdkFeedY = sdkTargetY; }
+    const dtMs = lastDriveAt ? Math.min(120, Math.max(1, nowMs - lastDriveAt)) : 16;
+    lastDriveAt = nowMs;
+    const ease = 1 - Math.exp(-(dtMs / 1000) * 20);
+    sdkFeedX += (sdkTargetX - sdkFeedX) * ease;
+    sdkFeedY += (sdkTargetY - sdkFeedY) * ease;
+    let ok = false;
+    try { ok = typeof h.focusAt === 'function' ? h.focusAt(sdkFeedX, sdkFeedY) : false; } catch { ok = false; }
+    if (ok) return; // SDK 模式：参数由 SDK 驱动，项目不再覆盖
+    sdkFocusActive = false; // SDK 中途失效 → 掉到下面的代码管线兜底
   }
   h.setGaze(stale ? 0 : gazeNX, stale ? 0 : gazeNY);
 }

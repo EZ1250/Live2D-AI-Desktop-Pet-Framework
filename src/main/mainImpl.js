@@ -137,7 +137,7 @@ const CHAT_BUBBLE_TOP_TOLERANCE = 26;
 const MONITOR_INTERVAL_MS = 2000;
 const PLUGIN_TICK_MS = 50;
 const CURSOR_POLL_MS = 80; // 全局光标轮询周期（窗口附近；视线自动跟随的平滑度）
-const CURSOR_FAR_POLL_MS = 250; // 鼠标远离窗口时的低频轮询（约 4fps，省资源）
+const CURSOR_FAR_POLL_MS = 150; // 鼠标远离窗口时的低频轮询（约 6.7fps；太低会一卡一卡）
 const CURSOR_NEAR_DISTANCE = 260; // 距窗口边界多少 DIP 内算"靠近"
 /** 鼠标静止时的光标心跳间隔：保证窗口外也一直望着鼠标（渲染层 3s 没更新会回正） */
 const CURSOR_HEARTBEAT_MS = 400;
