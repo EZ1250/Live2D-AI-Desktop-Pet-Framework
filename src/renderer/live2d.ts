@@ -204,9 +204,15 @@
     if (!(vw > 0) || !(vh > 0) || !(natW > 0) || !(natH > 0)) return null;
     const extra = Number.isFinite(input.extra) ? (input.extra as number) : 1;
     const bobY = Number.isFinite(input.bobY) ? (input.bobY as number) : 0;
-    const s = Math.min((vw * MOC3_FIT_MARGIN) / natW, (vh * MOC3_FIT_MARGIN) / natH)
+    let s = Math.min((vw * MOC3_FIT_MARGIN) / natW, (vh * MOC3_FIT_MARGIN) / natH)
       * (input.framing === 'half' ? HALF_ZOOM : 1) * extra;
     if (!Number.isFinite(s) || s <= 0) return null;
+    // 半身：内容（按质心/bbox 量出来的真实像素范围）不能宽过窗口，否则左右会被裁，
+    // 看起来就像"整体偏左/偏右"；这里按内容宽度收一点缩放，纵向裁切保持不变。
+    if (input.framing === 'half' && input.content && input.content.w > 0 && Number.isFinite(input.content.w)) {
+      const maxS = (vw * 0.98) / input.content.w;
+      if (s > maxS) s = maxS;
+    }
 
     const bbox = { x: 0, y: 0, w: natW, h: natH };
     const placeWith = (a: { x: number; y: number; w: number; h: number }): { x: number; y: number } => {
