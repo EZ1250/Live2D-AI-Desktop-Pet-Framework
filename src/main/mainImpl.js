@@ -1,3 +1,20 @@
+            let near = true;
+            try {
+                const boundsForPoll = win.getBounds();
+                const dx = Math.max(boundsForPoll.x - p.x, 0, p.x - (boundsForPoll.x + boundsForPoll.width));
+                const dy = Math.max(boundsForPoll.y - p.y, 0, p.y - (boundsForPoll.y + boundsForPoll.height));
+                near = Math.hypot(dx, dy) <= CURSOR_NEAR_DISTANCE;
+            }
+            catch {
+                near = true;
+            }
+            if (near !== cursorFast) {
+                cursorFast = near;
+                if (cursorTimer !== null)
+                    clearInterval(cursorTimer);
+                cursorTimer = setInterval(poll, near ? CURSOR_POLL_MS : CURSOR_FAR_POLL_MS);
+            }
+            const p = electron_1.screen.getCursorScreenPoint();
 "use strict";
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
@@ -558,6 +575,7 @@ function startCursorTracking() {
         const now = Date.now();
         if (now < phoneTouchUntil)
             return; // 手机触摸交互期间：保持手机合成的视线位置，不被真实鼠标轮询覆盖
+        const p = electron_1.screen.getCursorScreenPoint();
         try {
             let near = true;
             try {
@@ -575,7 +593,6 @@ function startCursorTracking() {
                     clearInterval(cursorTimer);
                 cursorTimer = setInterval(poll, near ? CURSOR_POLL_MS : CURSOR_FAR_POLL_MS);
             }
-            const p = electron_1.screen.getCursorScreenPoint();
             const moved = !lastCursorSent || lastCursorSent.x !== p.x || lastCursorSent.y !== p.y;
             if (moved) {
                 lastCursorSent = { x: p.x, y: p.y };
