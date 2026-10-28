@@ -188,6 +188,11 @@ let autoTaskResolve = null;
 let autoTaskReject = null;
 // 外部 MCP 客户端桥接用的静默聊天（与自主任务分开，避免互相抢单飞）
 let externalChat = null;
+// 手机对话：复用主 chat 实例与会话上下文（来源=phone，不改电脑端界面）
+let phoneChatActive = false;
+let phoneChatThinking = '';
+let phoneChatResolve = null;
+let phoneChatReject = null;
 let externalChatResolve = null;
 let externalChatReject = null;
 let externalChatBusy = false;
@@ -2239,6 +2244,7 @@ async function bootstrap() {
     appResolver = resolver;
     const bridge = (0, ipc_1.registerIpc)({
         getWindow: () => mainWindow,
+            isPhoneChatActive: () => phoneChatActive,
         pathResolver: resolver,
         chat,
         registry,
@@ -2784,8 +2790,22 @@ async function bootstrap() {
                 return `未知工具：${name}`;
         }
     };
-    chat?.setToolExecutor(toolExecutor);
-    builtinToolExecutor = toolExecutor;
+    // 手机对话的工具确认：只读直接执行；需要确认的先问手机（电脑端任务无 phoneChatActive，不受影响）
+    const phoneAwareToolExecutor = async (name, rawArgs) => {
+        if (phoneChatActive && phoneToolNeedsConfirm(name)) {
+            if (!petMcpServer)
+                return '工具确认通道未就绪。';
+            const choice = await petMcpServer.requestPhoneConfirm(name, '请求执行工具：' + name + '\n参数：' + JSON.stringify(rawArgs ?? {}).slice(0, 300));
+            if (choice === 'deny')
+                return '用户拒绝执行该操作。';
+            if (choice !== 'allow')
+                return '手机端未确认（超时/离线），已取消该操作。';
+            return await toolConfirmOverride.run({ answer: '允许', remaining: 4 }, () => toolExecutor(name, rawArgs));
+        }
+        return await toolExecutor(name, rawArgs);
+    };
+    chat?.setToolExecutor(phoneAwareToolExecutor);
+    builtinToolExecutor = phoneAwareToolExecutor;
     // 7.2 MCP 服务端（可选）：把桌宠能力暴露成本机 MCP，供 DSH / QQ bridge 等外部 agent 调用
     petMcpServer = new mcpServer_1.PetMcpServer({
         configPath: path.join(electron_1.app.getPath('userData'), 'mcp-server.json'),
@@ -3646,6 +3666,13 @@ async function askPetChat(promptText) {
 }
 
 /** 带思考过程的外部 AI 回复（手机对话页） */
+/** 手机对话下该工具是否需要手机确认：只读工具直接放行 */
+function phoneToolNeedsConfirm(name) {
+    if (mcpClient && mcpClient.isMcpTool(name) && mcpClient.isAutoApprovedReadOnly(name))
+        return false;
+    return !phoneReadonlyToolAllowed(name);
+}
+
 /** 去掉模型原生 tool-call 协议文本（Kimi/部分模型的 <|tool_call...|>），对话里不能直接展示 */
 function stripToolCallMarkers(text) {
     if (typeof text !== 'string' || !text)
@@ -3661,10 +3688,59 @@ function stripToolCallMarkers(text) {
 }
 
 async function askPetChatDetail(promptText) {
-    const raw = await askPetChat(promptText);
-    const reply = stripToolCallMarkers(raw);
-    const thinking = stripToolCallMarkers(externalChatThink.trim()).slice(0, 8000);
-    return { reply: reply || '（模型返回了工具调用，但当前对话通道未执行工具）', thinking };
+    if (!chat)
+        throw new Error('AI 未就绪');
+    const now = Date.now();
+    if (now - lastExternalChatAt < 3000)
+        throw new Error('调用太频繁（最小间隔 3 秒）');
+    if (chat.isBusy?.() === true)
+        throw new Error('桌宠正在回复其他请求，请稍后再试');
+    lastExternalChatAt = now;
+    // 复用主 chat 实例：同一份人设/记忆/上下文/工具提示；只临时替换回调，不推电脑端界面
+    const prevHandlers = typeof chat.getHandlers === 'function' ? chat.getHandlers() : null;
+    phoneChatActive = true;
+    phoneChatThinking = '';
+    chat.setHandlers({
+        onChunk: () => undefined,
+        onDone: (full) => {
+            const resolve = phoneChatResolve;
+            phoneChatResolve = null;
+            phoneChatReject = null;
+            if (resolve) resolve(full);
+        },
+        onError: (message) => {
+            const reject = phoneChatReject;
+            phoneChatResolve = null;
+            phoneChatReject = null;
+            if (reject) reject(new Error(message));
+        },
+        onThink: (evt) => {
+            if (!evt) return;
+            if (evt.kind === 'reasoning' && typeof evt.text === 'string') phoneChatThinking += evt.text;
+            else if ((evt.kind === 'tool' || evt.kind === 'result') && typeof evt.text === 'string')
+                phoneChatThinking += (evt.kind === 'tool' ? '\n[工具] ' : '\n[结果] ') + evt.text;
+        },
+    });
+    try {
+        const raw = await new Promise((resolve, reject) => {
+            phoneChatResolve = resolve;
+            phoneChatReject = reject;
+            chat.startChat(promptText.slice(0, 2000)).catch((err) => {
+                phoneChatResolve = null;
+                phoneChatReject = null;
+                reject(err instanceof Error ? err : new Error(String(err)));
+            });
+        });
+        const reply = stripToolCallMarkers(String(raw ?? '').trim().slice(0, 4000));
+        const thinking = stripToolCallMarkers(phoneChatThinking.trim()).slice(0, 8000);
+        scenario?.record('event', '手机对话：AI 回复「' + reply.slice(0, 40) + '」');
+        return { reply: reply || '（AI 没有返回内容）', thinking };
+    } finally {
+        if (prevHandlers) chat.setHandlers(prevHandlers);
+        phoneChatActive = false;
+        phoneChatResolve = null;
+        phoneChatReject = null;
+    }
 }
 
 /** 抓桌宠窗口一帧（手机 Live2D 头像，PNG base64） */

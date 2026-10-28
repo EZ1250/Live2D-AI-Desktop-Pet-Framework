@@ -100,6 +100,8 @@ export interface PluginRegistryLike {
 export interface IpcDeps {
   /** 当前主窗口提供者（activate 可能重建窗口，故每次现取） */
   getWindow: () => BrowserWindow | null;
+  /** 手机对话进行中（电脑端输入应排队/拒绝，避免打断手机请求） */
+  isPhoneChatActive?: () => boolean;
   pathResolver: PathResolver;
   chat: ChatClient;
   registry: PluginRegistryLike;
@@ -512,6 +514,9 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
       deps.onChatStarted?.();
     } catch {
       /* 浮窗开关失败不影响对话本身 */
+    }
+    if (deps.isPhoneChatActive?.() === true) {
+      return { ok: false, error: '手机对话进行中，请稍后再发' };
     }
     void deps.chat
       .startChat(message)

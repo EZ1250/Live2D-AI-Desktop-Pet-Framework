@@ -674,9 +674,9 @@ export class PetMcpServer {
   }
 
   /** 请手机端确认一次操作（供手机对话工具使用）；返回 allow/deny/timeout/disconnect/unavailable */
-  async requestPhoneConfirm(tool: string, detail: string, timeoutMs = 60_000): Promise<string> {
-    const socket = [...this.wsSockets][0];
-    if (!socket) return 'unavailable';
+  async requestPhoneConfirm(tool: string, detail: string, timeoutMs = 120_000): Promise<string> {
+    const sockets = [...this.wsSockets];
+    if (!sockets.length) return 'unavailable';
     const id = `confirm-${Date.now()}-${++this.confirmSeq}`;
     return await new Promise<string>((resolve) => {
       const timer = setTimeout(() => {
@@ -684,11 +684,14 @@ export class PetMcpServer {
         resolve('timeout');
       }, Math.max(1000, Math.min(300_000, timeoutMs)));
       this.pendingConfirms.set(id, { resolve, timer });
-      this.wsSendJson(socket, {
+      const payload = {
         jsonrpc: '2.0',
         method: 'pet/confirmRequest',
         params: { id, tool, detail, timeoutMs: Math.min(300_000, timeoutMs) },
-      });
+      };
+      for (const sock of sockets) {
+        try { this.wsSendJson(sock, payload); } catch { /* 单个连接异常忽略 */ }
+      }
     });
   }
 

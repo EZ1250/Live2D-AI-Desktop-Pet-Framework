@@ -536,7 +536,7 @@ export class ChatClient {
 
   constructor(
     settings: AppSettings,
-    private readonly handlers: ChatHandlers,
+    private handlers: ChatHandlers,
     private readonly knowledgeDir: string | null = null
   ) {
     // 桌宠名字（用户设置；启动时就要生效，不用等一次保存）
@@ -555,6 +555,15 @@ export class ChatClient {
       maxContextTokens: settings.maxContextTokens ?? 4000,
       showThinking: settings.showThinking !== false,
     };
+  }
+
+  /** 临时替换事件回调（手机对话复用同一 chat 实例时用；调用方负责恢复） */
+  getHandlers(): ChatHandlers {
+    return this.handlers;
+  }
+
+  setHandlers(handlers: ChatHandlers): void {
+    this.handlers = handlers;
   }
 
   /** 运行时应用新配置；取消旧请求并清理旧上下文，下一条消息使用新参数。 */
