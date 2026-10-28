@@ -731,6 +731,10 @@ let sdkFeedX = NaN;   // 逐帧插值后喂给 SDK 的实际坐标（消除低�
 let sdkFeedY = NaN;
 let sdkIdleReset = false; // 静止 3s 后只回正一次，避免反复覆盖 SDK 中性位
 let lastDriveAt = 0;
+/** 迟滞：连续成功/失败达阈值才切换驱动模式，避免 SDK 与项目管线逐帧交替写参数 */
+let sdkOkStreak = 0;
+let sdkFailStreak = 0;
+let lastGazeHandle: Any = null;
 let lastGlobalCursorAt = 0; // 最近一次全局光标推送时刻（performance.now 基准）
 
 /**
@@ -739,15 +743,26 @@ let lastGlobalCursorAt = 0; // 最近一次全局光标推送时刻（performanc
  */
 function trySdkFocus(clientX: number, clientY: number): boolean {
   const h = currentHandle;
-  if (!h || typeof h.focusAt !== 'function') { sdkFocusActive = false; return false; }
-  try {
-    const ok = h.focusAt(clientX, clientY);
-    sdkFocusActive = ok;
-    return ok;
-  } catch {
-    sdkFocusActive = false;
+  if (!h || typeof h.focusAt !== 'function') {
+    sdkFailStreak += 1;
+    if (sdkFailStreak >= 3) sdkFocusActive = false;
     return false;
   }
+  try {
+    const ok = h.focusAt(clientX, clientY);
+    if (ok) {
+      sdkOkStreak += 1;
+      sdkFailStreak = 0;
+      if (sdkOkStreak >= 3) sdkFocusActive = true;
+      return true;
+    }
+  } catch {
+    /* 按失败计，走迟滞 */
+  }
+  sdkOkStreak = 0;
+  sdkFailStreak += 1;
+  if (sdkFailStreak >= 3) sdkFocusActive = false;
+  return false;
 }
 
 function updateGazeFromPointer(clientX: number, clientY: number): void {
@@ -792,6 +807,14 @@ function installGazeTracking(): void {
 function driveGaze(nowMs: number): void {
   const h = currentHandle;
   if (!h || typeof h.setGaze !== 'function') return;
+  if (h !== lastGazeHandle) {
+    // 换模型：清掉旧模型的 SDK 插值状态，避免第一帧跳变
+    lastGazeHandle = h;
+    sdkFeedX = NaN;
+    sdkIdleReset = false;
+    sdkOkStreak = 0;
+    sdkFailStreak = 0;
+  }
   const stale = !lastGazeMoveAt || nowMs - lastGazeMoveAt > GAZE_IDLE_MS;
   if (sdkFocusActive) {
     if (stale) {
@@ -809,10 +832,10 @@ function driveGaze(nowMs: number): void {
     const ease = 1 - Math.exp(-(dtMs / 1000) * 20);
     sdkFeedX += (sdkTargetX - sdkFeedX) * ease;
     sdkFeedY += (sdkTargetY - sdkFeedY) * ease;
-    let ok = false;
-    try { ok = typeof h.focusAt === 'function' ? h.focusAt(sdkFeedX, sdkFeedY) : false; } catch { ok = false; }
+    const ok = trySdkFocus(sdkFeedX, sdkFeedY);
     if (ok) return; // SDK 模式：参数由 SDK 驱动，项目不再覆盖
-    sdkFocusActive = false; // SDK 中途失效 → 掉到下面的代码管线兜底
+    if (sdkFocusActive) return; // 未达失败阈值：继续等 SDK，避免双写者逐帧抖动
+    // 达到阈值 → 掉到下面的代码管线兜底
   }
   h.setGaze(stale ? 0 : gazeNX, stale ? 0 : gazeNY);
 }

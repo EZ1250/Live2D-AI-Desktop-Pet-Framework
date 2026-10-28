@@ -173,7 +173,7 @@ const TOOL_DEFS = [
   },
   {
     name: 'pet_chat_detail',
-    description: '让桌宠 AI 回复并同时返回思考过程（手机对话页用；会消耗模型额度）。',
+    description: '让桌宠 AI 回复；返回 JSON 文本 {"reply": string, "thinking": string}（手机对话页用；会消耗模型额度）。',
     inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
     annotations: { readOnlyHint: false },
   },
@@ -227,6 +227,9 @@ export class PetMcpServer {
   private readonly opts: PetMcpServerOptions;
   private readonly wsSockets = new Set<Duplex>();
   private readonly wsAvatarTimers = new Map<Duplex, { timer: NodeJS.Timeout | null; busy: boolean }>();
+  /** 头像帧连续失败计数与上次告警时刻（失败静默会让手机卡死无从排查） */
+  private avatarFrameFailures = 0;
+  private avatarWarnAt = 0;
   private readonly phoneTools = new Map<string, PhoneTool>();
   private readonly phoneQueue: PendingPhoneCall[] = [];
   private readonly phoneWaiters = new Set<(call: PendingPhoneCall | null) => void>();
@@ -625,18 +628,29 @@ export class PetMcpServer {
       if (socket.writableLength > 512 * 1024) return;
       if (!this.opts.deps.avatarFrame) return;
       state.busy = true;
+      let timeoutTimer: NodeJS.Timeout | null = null;
       try {
         // capturePage 在窗口隐藏/切模型等场景可能不 resolve：超时兜底，否则 busy 永久 true → 手机端画面卡死
         const frame = await Promise.race([
           this.opts.deps.avatarFrame(maxWidth),
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('avatar frame timeout')), 1500)),
+          new Promise<never>((_, reject) => {
+            timeoutTimer = setTimeout(() => reject(new Error('avatar frame timeout')), 1500);
+          }),
         ]);
+        this.avatarFrameFailures = 0;
         if (this.wsSockets.has(socket)) {
           this.wsSendJson(socket, { jsonrpc: '2.0', method: 'pet/avatarFrame', params: frame });
         }
-      } catch {
-        /* 单帧失败跳过 */
+      } catch (err) {
+        // 单帧失败可跳过，但必须留下限频日志，否则推流静默卡死无法排查
+        this.avatarFrameFailures += 1;
+        const now = Date.now();
+        if (now - this.avatarWarnAt > 5000) {
+          this.avatarWarnAt = now;
+          console.warn(`[mcp] 头像帧失败（连续 ${this.avatarFrameFailures} 次）：${(err as Error).message}`);
+        }
       } finally {
+        if (timeoutTimer) clearTimeout(timeoutTimer); // 成功路径也必须清，否则每帧泄漏一个 1.5s timer
         state.busy = false;
       }
     };
