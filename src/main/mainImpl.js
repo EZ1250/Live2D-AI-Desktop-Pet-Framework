@@ -3661,7 +3661,6 @@ function stripToolCallMarkers(text) {
 }
 
 async function askPetChatDetail(promptText) {
-    externalChatToolRepeat.clear();
     const raw = await askPetChat(promptText);
     const reply = stripToolCallMarkers(raw);
     const thinking = stripToolCallMarkers(externalChatThink.trim()).slice(0, 8000);
