@@ -195,6 +195,7 @@ let phoneHitPending = null; // 手机点击命中检测的一次性 resolver
 // 后台自主任务的工具调用预算（防失控/死循环；参考 DSH 的有界工具循环与重复调用保护）
 let autoTaskToolCount = 0;
 let externalChatToolCount = 0; // 手机对话工具次数（与自主任务分开计数）
+let builtinToolExecutor = null; // 主对话的内置工具执行器（手机对话复用，保证只读判定/路径校验一致）
 const externalChatToolRepeat = new Map();
 const autoTaskToolRepeat = new Map();
 let tickTimer = null;
@@ -2776,6 +2777,7 @@ async function bootstrap() {
         }
     };
     chat?.setToolExecutor(toolExecutor);
+    builtinToolExecutor = toolExecutor;
     // 7.2 MCP 服务端（可选）：把桌宠能力暴露成本机 MCP，供 DSH / QQ bridge 等外部 agent 调用
     petMcpServer = new mcpServer_1.PetMcpServer({
         configPath: path.join(electron_1.app.getPath('userData'), 'mcp-server.json'),
@@ -3767,20 +3769,40 @@ function autoTaskApprovedToolDefs() {
 /** 设置开启且存在允许工具时，才给静默 ChatClient 挂执行器（未开启时保持"无工具"原行为） */
 /** 手机对话工具执行器：只读白名单、最多 4 次、同工具+参数最多 2 次，避免烧钱/死循环 */
 async function externalChatToolExecutor(name, args) {
-    if (!mcpClient)
-        return 'MCP 客户端未就绪。';
-    if (!mcpClient.isAutoApprovedReadOnly(name))
-        return '该工具不允许手机对话调用（需要服务器 autoApprove 且工具声明只读）。';
-    if (externalChatToolCount >= 4)
-        return '手机对话工具调用次数已达上限（4 次）。';
-    const key = `${name}:${JSON.stringify(args ?? {})}`;
-    const repeat = (externalChatToolRepeat.get(key) || 0) + 1;
-    externalChatToolRepeat.set(key, repeat);
-    if (repeat > 2)
-        return '同一工具与参数重复调用过多，已拒绝（防止死循环）。';
-    externalChatToolCount += 1;
-    return await mcpClient.callTool(name, args);
+    // 内置工具：只放行"只读"工具，其余需要电脑端确认的走拒绝（手机端无法点确认）
+    if (builtinToolExecutor && phoneReadonlyToolAllowed(name)) {
+        if (externalChatToolCount >= 4) return '手机对话工具调用次数已达上限（4 次）。';
+        const key = `${name}:${JSON.stringify(args ?? {})}`;
+        const repeat = (externalChatToolRepeat.get(key) || 0) + 1;
+        externalChatToolRepeat.set(key, repeat);
+        if (repeat > 2) return '同一工具与参数重复调用过多，已拒绝（防止死循环）。';
+        externalChatToolCount += 1;
+        return await builtinToolExecutor(name, args);
+    }
+    // 外部 MCP 工具：沿用自主任务的只读白名单（服务器 autoApprove + 只读声明）
+    if (mcpClient && mcpClient.isMcpTool(name)) {
+        if (!mcpClient.isAutoApprovedReadOnly(name)) return '该工具不允许手机对话调用（需要服务器 autoApprove 且工具声明只读）。';
+        if (externalChatToolCount >= 4) return '手机对话工具调用次数已达上限（4 次）。';
+        externalChatToolCount += 1;
+        return await mcpClient.callTool(name, args);
+    }
+    return '该工具需要电脑端确认，手机对话暂不支持。';
 }
+
+/** 手机对话可自动执行的只读内置工具：优先看 catalog 的 readOnlyHint，active_window_get 兜底放行 */
+function phoneReadonlyToolAllowed(name) {
+    if (name === 'active_window_get') return true;
+    try {
+        const defs = chatClient_1.TOOL_DEFS || [];
+        const d = defs.find((x) => x.function && x.function.name === name);
+        if (!d) return false;
+        const a = d.function.annotations || {};
+        return a.readOnlyHint === true;
+    } catch {
+        return false;
+    }
+}
+
 
 /** 手机对话与自主任务共用"只读 MCP 工具"授权；未开启时保持原无工具行为 */
 function configureExternalChatTools(settings) {
@@ -3789,7 +3811,7 @@ function configureExternalChatTools(settings) {
     const cfg = settings ?? (0, chatClient_1.loadAppSettings)();
     const defs = cfg.autoTaskAllowMcp === true ? autoTaskApprovedToolDefs() : [];
     externalChat.setExternalToolDefs(defs);
-    externalChat.setToolExecutor(defs.length ? externalChatToolExecutor : null);
+    externalChat.setToolExecutor(externalChatToolExecutor);
 }
 
 function configureAutoTaskTools(settings) {
