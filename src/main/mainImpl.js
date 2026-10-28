@@ -1,4 +1,7 @@
 "use strict";
+const { AsyncLocalStorage } = require("async_hooks");
+/** 只给"手机发起的工具调用"用的一次性确认上下文；电脑端任务没有 store，行为完全不变 */
+const toolConfirmOverride = new AsyncLocalStorage();
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
     var desc = Object.getOwnPropertyDescriptor(m, k);
@@ -195,7 +198,8 @@ let phoneHitPending = null; // 手机点击命中检测的一次性 resolver
 // 后台自主任务的工具调用预算（防失控/死循环；参考 DSH 的有界工具循环与重复调用保护）
 let autoTaskToolCount = 0;
 let externalChatToolCount = 0; // 手机对话工具次数（与自主任务分开计数）
-let builtinToolExecutor = null; // 主对话的内置工具执行器（手机对话复用，保证只读判定/路径校验一致）
+let builtinToolExecutor = null;
+let phoneConfirmCount = 0; // 每次手机请求内允许的手机确认次数 // 主对话的内置工具执行器（手机对话复用，保证只读判定/路径校验一致）
 const externalChatToolRepeat = new Map();
 const autoTaskToolRepeat = new Map();
 let tickTimer = null;
@@ -1870,6 +1874,12 @@ const pendingAsks = new Map();
 let askSeq = 0;
 /** 推送一个问题给窗口并等待用户回答（点击选项或自由文本）；120s 超时。 */
 async function askUser(question, options) {
+    // 手机对话已确认过：本次工具执行内不再弹电脑端确认（作用域隔离；PC 任务无 store 不受影响）
+    const override = toolConfirmOverride.getStore();
+    if (override && override.remaining > 0) {
+        override.remaining -= 1;
+        return Promise.resolve(override.answer);
+    }
     const q = (question || '').trim();
     const opts = options
         .map((o) => ({
@@ -3769,25 +3779,41 @@ function autoTaskApprovedToolDefs() {
 /** 设置开启且存在允许工具时，才给静默 ChatClient 挂执行器（未开启时保持"无工具"原行为） */
 /** 手机对话工具执行器：只读白名单、最多 4 次、同工具+参数最多 2 次，避免烧钱/死循环 */
 async function externalChatToolExecutor(name, args) {
-    // 内置工具：只放行"只读"工具，其余需要电脑端确认的走拒绝（手机端无法点确认）
+    // 只读内置工具：直接执行
     if (builtinToolExecutor && phoneReadonlyToolAllowed(name)) {
-        if (externalChatToolCount >= 4) return '手机对话工具调用次数已达上限（4 次）。';
-        const key = `${name}:${JSON.stringify(args ?? {})}`;
-        const repeat = (externalChatToolRepeat.get(key) || 0) + 1;
-        externalChatToolRepeat.set(key, repeat);
-        if (repeat > 2) return '同一工具与参数重复调用过多，已拒绝（防止死循环）。';
-        externalChatToolCount += 1;
-        return await builtinToolExecutor(name, args);
+        return await runPhoneToolLimited(name, args, () => builtinToolExecutor(name, args));
     }
-    // 外部 MCP 工具：沿用自主任务的只读白名单（服务器 autoApprove + 只读声明）
-    if (mcpClient && mcpClient.isMcpTool(name)) {
-        if (!mcpClient.isAutoApprovedReadOnly(name)) return '该工具不允许手机对话调用（需要服务器 autoApprove 且工具声明只读）。';
-        if (externalChatToolCount >= 4) return '手机对话工具调用次数已达上限（4 次）。';
-        externalChatToolCount += 1;
-        return await mcpClient.callTool(name, args);
+    // 外部 MCP 只读工具：沿用服务器 autoApprove + 只读声明
+    if (mcpClient && mcpClient.isMcpTool(name) && mcpClient.isAutoApprovedReadOnly(name)) {
+        return await runPhoneToolLimited(name, args, () => mcpClient.callTool(name, args));
     }
-    return '该工具需要电脑端确认，手机对话暂不支持。';
+    // 其余需要电脑端确认的工具：先请手机确认；电脑端原有确认流程完全不动
+    if (!petMcpServer)
+        return '工具确认通道未就绪。';
+    if (phoneConfirmCount >= 3)
+        return '手机对话确认次数已达上限（3 次）。';
+    const choice = await petMcpServer.requestPhoneConfirm(name, `请求执行工具：${name}\n参数：${JSON.stringify(args ?? {}).slice(0, 300)}`);
+    if (choice === 'deny')
+        return '用户拒绝执行该操作。';
+    if (choice !== 'allow')
+        return '手机端未确认（超时/离线），已取消该操作。请到电脑端操作。';
+    phoneConfirmCount += 1;
+    // 用一次性覆盖回答工具内部的确认提问（AsyncLocalStorage 保证不泄露到电脑端并发任务）
+    const answer = '允许';
+    return await toolConfirmOverride.run({ answer, remaining: 3 }, () => builtinToolExecutor ? builtinToolExecutor(name, args) : '工具尚未就绪');
 }
+
+/** 手机工具限额：最多 4 次、同工具+参数最多 2 次 */
+async function runPhoneToolLimited(name, args, run) {
+    if (externalChatToolCount >= 4) return '手机对话工具调用次数已达上限（4 次）。';
+    const key = `${name}:${JSON.stringify(args ?? {})}`;
+    const repeat = (externalChatToolRepeat.get(key) || 0) + 1;
+    externalChatToolRepeat.set(key, repeat);
+    if (repeat > 2) return '同一工具与参数重复调用过多，已拒绝（防止死循环）。';
+    externalChatToolCount += 1;
+    return await run();
+}
+
 
 /** 手机对话可自动执行的只读内置工具：优先看 catalog 的 readOnlyHint，active_window_get 兜底放行 */
 function phoneReadonlyToolAllowed(name) {

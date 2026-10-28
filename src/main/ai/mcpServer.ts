@@ -227,6 +227,9 @@ export class PetMcpServer {
   private readonly opts: PetMcpServerOptions;
   private readonly wsSockets = new Set<Duplex>();
   private readonly wsAvatarTimers = new Map<Duplex, { timer: NodeJS.Timeout | null; busy: boolean }>();
+  /** 手机确认请求：id → resolve；socket 断开/超时会自动清算 */
+  private readonly pendingConfirms = new Map<string, { resolve: (choice: string) => void; timer: NodeJS.Timeout }>();
+  private confirmSeq = 0;
   /** 头像帧连续失败计数与上次告警时刻（失败静默会让手机卡死无从排查） */
   private avatarFrameFailures = 0;
   private avatarWarnAt = 0;
@@ -598,6 +601,17 @@ export class PetMcpServer {
     }
     try {
       const msg = parsed as { id?: unknown; method?: unknown; params?: Record<string, unknown> };
+      if (msg && msg.method === 'pet/confirmReply') {
+        const id = typeof msg.params?.id === 'string' ? msg.params.id : '';
+        const choice = typeof msg.params?.choice === 'string' ? msg.params.choice : 'deny';
+        const pending = this.pendingConfirms.get(id);
+        if (pending) {
+          this.pendingConfirms.delete(id);
+          clearTimeout(pending.timer);
+          pending.resolve(choice);
+        }
+        return;
+      }
       if (msg && (msg.method === 'pet/avatarStart' || msg.method === 'pet/avatarStop')) {
         const id = typeof msg.id === 'number' ? msg.id : null;
         if (msg.method === 'pet/avatarStart') {
@@ -657,6 +671,25 @@ export class PetMcpServer {
     state.timer = setInterval(() => void tick(), 50);
     state.timer.unref?.();
     void tick();
+  }
+
+  /** 请手机端确认一次操作（供手机对话工具使用）；返回 allow/deny/timeout/disconnect/unavailable */
+  async requestPhoneConfirm(tool: string, detail: string, timeoutMs = 60_000): Promise<string> {
+    const socket = [...this.wsSockets][0];
+    if (!socket) return 'unavailable';
+    const id = `confirm-${Date.now()}-${++this.confirmSeq}`;
+    return await new Promise<string>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingConfirms.delete(id);
+        resolve('timeout');
+      }, Math.max(1000, Math.min(300_000, timeoutMs)));
+      this.pendingConfirms.set(id, { resolve, timer });
+      this.wsSendJson(socket, {
+        jsonrpc: '2.0',
+        method: 'pet/confirmRequest',
+        params: { id, tool, detail, timeoutMs: Math.min(300_000, timeoutMs) },
+      });
+    });
   }
 
   private stopAvatarStream(socket: Duplex): void {
