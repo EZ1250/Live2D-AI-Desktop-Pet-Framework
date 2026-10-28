@@ -735,6 +735,8 @@ let lastDriveAt = 0;
 let sdkOkStreak = 0;
 let sdkFailStreak = 0;
 let lastGazeHandle: Any = null;
+/** SDK focus 调用失败次数（静默兜底时至少可自查，不刷 console） */
+let sdkFocusFailures = 0;
 let lastGlobalCursorAt = 0; // 最近一次全局光标推送时刻（performance.now 基准）
 
 /**
@@ -744,6 +746,7 @@ let lastGlobalCursorAt = 0; // 最近一次全局光标推送时刻（performanc
 function trySdkFocus(clientX: number, clientY: number): boolean {
   const h = currentHandle;
   if (!h || typeof h.focusAt !== 'function') {
+    sdkFocusFailures += 1;
     sdkFailStreak += 1;
     if (sdkFailStreak >= 3) sdkFocusActive = false;
     return false;
@@ -761,6 +764,7 @@ function trySdkFocus(clientX: number, clientY: number): boolean {
   }
   sdkOkStreak = 0;
   sdkFailStreak += 1;
+  sdkFocusFailures += 1;
   if (sdkFailStreak >= 3) sdkFocusActive = false;
   return false;
 }
@@ -5275,7 +5279,7 @@ function installDebugHooks(bridge: RendererBridge): void {
     // 追踪参数层（骨骼/表情/语音口型）：调试与自动化验证用
     tracking: () => currentTrackingApi?.state() ?? null,
     /** 视线驱动模式自查：sdkFocusActive=true 表示当前由 SDK focus 驱动，false=项目代码管线兜底 */
-    gazeMode: () => ({ sdkFocusActive, globalCursorPushes }),
+    gazeMode: () => ({ sdkFocusActive, globalCursorPushes, sdkFocusFailures }),
     pushTracking: (frame: TrackingInput, source = 'debug') => pushTrackingFrame(source, frame),
     emotion: (text: string) => applyEmotionFromText(text),
     speech: (openY: number, ttlMs = 400) => pushSpeechMouth({ openY }, ttlMs),
