@@ -556,8 +556,7 @@ function startCursorTracking() {
         if (!win || win.isDestroyed())
             return;
         const now = Date.now();
-        if (now < phoneTouchUntil)
-            return; // 手机触摸交互期间：保持手机合成的视线位置，不被真实鼠标轮询覆盖
+        const phoneTouchBypass = now < phoneTouchUntil; // 手机触摸期间：只暂停光标推送，不跳过穿透/鼠标状态维护
         const p = electron_1.screen.getCursorScreenPoint();
         try {
             let near = true;
@@ -592,7 +591,7 @@ function startCursorTracking() {
             // 光标推送：移动时实时推；鼠标静止时每 CURSOR_HEARTBEAT_MS 也补一次。
             // 为什么要有心跳：渲染层的视线目标 3s 没更新就会回正，只在"移动"时推的话，
             // 鼠标停在窗口外不动 → 宠物看一会儿就不看了（用户报的"窗口外不追踪"）。
-            if (moved || now - lastCursorPushAt >= CURSOR_HEARTBEAT_MS) {
+            if (!phoneTouchBypass && (moved || now - lastCursorPushAt >= CURSOR_HEARTBEAT_MS)) {
                 lastCursorPushAt = now;
                 sendToRenderer(contracts_1.IPC_GLOBAL_CURSOR, { x: p.x, y: p.y });
             }
@@ -3628,9 +3627,25 @@ async function askPetChat(promptText) {
 }
 
 /** 带思考过程的外部 AI 回复（手机对话页） */
+/** 去掉模型原生 tool-call 协议文本（Kimi/部分模型的 <|tool_call...|>），对话里不能直接展示 */
+function stripToolCallMarkers(text) {
+    if (typeof text !== 'string' || !text)
+        return text || '';
+    return text
+        .replace(/<\|tool_calls_section_begin\|>[\s\S]*?<\|tool_calls_section_end\|>/g, '')
+        .replace(/<\|tool_call_begin\|>[\s\S]*?<\|tool_call_end\|>/g, '')
+        .replace(/<\|tool_call_argument_begin\|>/g, '')
+        .replace(/<\|tool_call_end\|>/g, '')
+        .replace(/<\|tool_calls_section_begin\|>/g, '')
+        .replace(/<\|tool_calls_section_end\|>/g, '')
+        .trim();
+}
+
 async function askPetChatDetail(promptText) {
-    const reply = await askPetChat(promptText);
-    return { reply, thinking: externalChatThink.trim().slice(0, 8000) };
+    const raw = await askPetChat(promptText);
+    const reply = stripToolCallMarkers(raw);
+    const thinking = stripToolCallMarkers(externalChatThink.trim()).slice(0, 8000);
+    return { reply: reply || '（模型返回了工具调用，但当前对话通道未执行工具）', thinking };
 }
 
 /** 抓桌宠窗口一帧（手机 Live2D 头像，PNG base64） */
