@@ -194,6 +194,8 @@ let phoneTouchUntil = 0;
 let phoneHitPending = null; // 手机点击命中检测的一次性 resolver
 // 后台自主任务的工具调用预算（防失控/死循环；参考 DSH 的有界工具循环与重复调用保护）
 let autoTaskToolCount = 0;
+let externalChatToolCount = 0; // 手机对话工具次数（与自主任务分开计数）
+const externalChatToolRepeat = new Map();
 const autoTaskToolRepeat = new Map();
 let tickTimer = null;
 /** activate（macOS）重建窗口所需 */
@@ -3537,7 +3539,13 @@ function initAutoTask(settings, resolver) {
     externalChat = new chatClient_1.ChatClient(settings, {
         onChunk: () => undefined,
         onThink: (evt) => {
-            if (evt && evt.kind === 'reasoning' && typeof evt.text === 'string') externalChatThink += evt.text;
+            if (!evt) return;
+            if (evt.kind === 'reasoning' && typeof evt.text === 'string') externalChatThink += evt.text;
+            else if ((evt.kind === 'tool' || evt.kind === 'result') && typeof evt.text === 'string') {
+                // 把工具调用/结果一并当"思考步骤"回传手机（电脑对话思考面板同源）
+                externalChatThink += `
+[${evt.kind === 'tool' ? '工具' : '结果'}] ${evt.text}`;
+            }
         },
         onDone: (full) => {
             const resolve = externalChatResolve;
@@ -3557,6 +3565,7 @@ function initAutoTask(settings, resolver) {
     externalChat.setUserDataDir(electron_1.app.getPath('userData'));
     if (promptLibrary)
         externalChat.setPromptLibrary(promptLibrary);
+    configureExternalChatTools(settings);
     applyAutoTaskSettings(settings);
     configureAutoTaskTools();
 }
@@ -3642,6 +3651,8 @@ function stripToolCallMarkers(text) {
 }
 
 async function askPetChatDetail(promptText) {
+    externalChatToolCount = 0;
+    externalChatToolRepeat.clear();
     const raw = await askPetChat(promptText);
     const reply = stripToolCallMarkers(raw);
     const thinking = stripToolCallMarkers(externalChatThink.trim()).slice(0, 8000);
@@ -3754,6 +3765,33 @@ function autoTaskApprovedToolDefs() {
 }
 
 /** 设置开启且存在允许工具时，才给静默 ChatClient 挂执行器（未开启时保持"无工具"原行为） */
+/** 手机对话工具执行器：只读白名单、最多 4 次、同工具+参数最多 2 次，避免烧钱/死循环 */
+async function externalChatToolExecutor(name, args) {
+    if (!mcpClient)
+        return 'MCP 客户端未就绪。';
+    if (!mcpClient.isAutoApprovedReadOnly(name))
+        return '该工具不允许手机对话调用（需要服务器 autoApprove 且工具声明只读）。';
+    if (externalChatToolCount >= 4)
+        return '手机对话工具调用次数已达上限（4 次）。';
+    const key = `${name}:${JSON.stringify(args ?? {})}`;
+    const repeat = (externalChatToolRepeat.get(key) || 0) + 1;
+    externalChatToolRepeat.set(key, repeat);
+    if (repeat > 2)
+        return '同一工具与参数重复调用过多，已拒绝（防止死循环）。';
+    externalChatToolCount += 1;
+    return await mcpClient.callTool(name, args);
+}
+
+/** 手机对话与自主任务共用"只读 MCP 工具"授权；未开启时保持原无工具行为 */
+function configureExternalChatTools(settings) {
+    if (!externalChat)
+        return;
+    const cfg = settings ?? (0, chatClient_1.loadAppSettings)();
+    const defs = cfg.autoTaskAllowMcp === true ? autoTaskApprovedToolDefs() : [];
+    externalChat.setExternalToolDefs(defs);
+    externalChat.setToolExecutor(defs.length ? externalChatToolExecutor : null);
+}
+
 function configureAutoTaskTools(settings) {
     if (!autoTaskChat)
         return;
