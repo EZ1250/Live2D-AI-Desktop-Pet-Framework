@@ -461,7 +461,7 @@
    * 2048 的依据：即使按 DPR=2 且半身放大 2.5 倍，角色在屏上也不到 1200 设备像素，
    * 2048² 余量充足；而 8192²→2048² 把显存降到 1/16（640MB → 约 40MB）。
    */
-  const TEXTURE_MAX_EDGE = 2048;
+  const TEXTURE_MAX_EDGE = 1024; // 桌宠窗口实际显示约 500px；1024 足够，且能显著降低 4K/8K 贴图的显存/解码内存
 
   /**
    * 把模型贴图降采样到 TEXTURE_MAX_EDGE 以内（原地替换纹理的像素源）。
@@ -503,6 +503,12 @@
         if (typeof src.update === 'function') src.update();
         if (typeof src.resize === 'function') src.resize(dw, dh, 1);
         console.log(`[live2d] 贴图 #${i} 降采样 ${sw}x${sh} → ${dw}x${dh}`);
+        // 释放原图解码内存：8K 贴图解码后单张可达 ~256MB，替换纹理源后不释放会常驻
+        try {
+          const oldRes = res as Any;
+          if (oldRes && typeof oldRes.close === 'function') oldRes.close();
+          else if (oldRes && typeof oldRes.src === 'string') oldRes.src = '';
+        } catch { /* 释放失败不影像画面 */ }
       } catch (err) {
         console.warn(`[live2d] 贴图 #${i} 降采样异常（保持原图）`, err);
       }
