@@ -197,10 +197,8 @@ let phoneTouchUntil = 0;
 let phoneHitPending = null; // 手机点击命中检测的一次性 resolver
 // 后台自主任务的工具调用预算（防失控/死循环；参考 DSH 的有界工具循环与重复调用保护）
 let autoTaskToolCount = 0;
-let externalChatToolCount = 0; // 手机对话工具次数（与自主任务分开计数）
 let builtinToolExecutor = null;
 let phoneConfirmCount = 0; // 每次手机请求内允许的手机确认次数 // 主对话的内置工具执行器（手机对话复用，保证只读判定/路径校验一致）
-const externalChatToolRepeat = new Map();
 const autoTaskToolRepeat = new Map();
 let tickTimer = null;
 /** activate（macOS）重建窗口所需 */
@@ -3663,7 +3661,6 @@ function stripToolCallMarkers(text) {
 }
 
 async function askPetChatDetail(promptText) {
-    externalChatToolCount = 0;
     externalChatToolRepeat.clear();
     const raw = await askPetChat(promptText);
     const reply = stripToolCallMarkers(raw);
@@ -3790,8 +3787,6 @@ async function externalChatToolExecutor(name, args) {
     // 其余需要电脑端确认的工具：先请手机确认；电脑端原有确认流程完全不动
     if (!petMcpServer)
         return '工具确认通道未就绪。';
-    if (phoneConfirmCount >= 3)
-        return '手机对话确认次数已达上限（3 次）。';
     const choice = await petMcpServer.requestPhoneConfirm(name, `请求执行工具：${name}\n参数：${JSON.stringify(args ?? {}).slice(0, 300)}`);
     if (choice === 'deny')
         return '用户拒绝执行该操作。';
@@ -3803,14 +3798,8 @@ async function externalChatToolExecutor(name, args) {
     return await toolConfirmOverride.run({ answer, remaining: 3 }, () => builtinToolExecutor ? builtinToolExecutor(name, args) : '工具尚未就绪');
 }
 
-/** 手机工具限额：最多 4 次、同工具+参数最多 2 次 */
+/** 手机对话与电脑端同权限：不再限制次数（保留函数避免调用点分叉） */
 async function runPhoneToolLimited(name, args, run) {
-    if (externalChatToolCount >= 4) return '手机对话工具调用次数已达上限（4 次）。';
-    const key = `${name}:${JSON.stringify(args ?? {})}`;
-    const repeat = (externalChatToolRepeat.get(key) || 0) + 1;
-    externalChatToolRepeat.set(key, repeat);
-    if (repeat > 2) return '同一工具与参数重复调用过多，已拒绝（防止死循环）。';
-    externalChatToolCount += 1;
     return await run();
 }
 
