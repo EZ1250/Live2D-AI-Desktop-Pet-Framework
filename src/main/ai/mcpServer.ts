@@ -654,7 +654,7 @@ export class PetMcpServer {
         state.busy = false;
       }
     };
-    state.timer = setInterval(() => void tick(), 42);
+    state.timer = setInterval(() => void tick(), 50);
     state.timer.unref?.();
     void tick();
   }
