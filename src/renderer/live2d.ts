@@ -1404,6 +1404,14 @@
               target: { x: Math.round(gazeTX * 1000) / 1000, y: Math.round(gazeTY * 1000) / 1000 },
               current: { x: Math.round(gazeCX * 1000) / 1000, y: Math.round(gazeCY * 1000) / 1000 },
               head: { x: Math.round(headCX * 1000) / 1000, y: Math.round(headCY * 1000) / 1000 },
+              body: {
+                target: { x: Math.round(headCX * 0.8 * 1000) / 1000, y: Math.round(headCY * 0.8 * 1000) / 1000 },
+                params: {
+                  bodyX: readParam(paramIds.bodyX),
+                  bodyY: readParam(paramIds.bodyY),
+                  bodyZ: readParam(paramIds.bodyZ),
+                },
+              },
               headTrack: { x: headTrackX, y: headTrackY, z: headTrackZ, ok: headTrackOK },
               params: {
                 angleX: readParam(paramIds.angleX),
