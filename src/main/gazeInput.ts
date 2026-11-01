@@ -1,13 +1,15 @@
 /**
  * gazeInput —— 主进程「视线输入」：全局光标轮询
  *
- * 本文件的逻辑从 mainImpl.js 的 startCursorTracking() 原样迁出（行为不变）：
+ * 本文件的逻辑从 mainImpl.js 的 startCursorTracking() 原样迁出
+ * （除首轮"80ms 定时器 + 150ms 定时器并存"的 bug 修复外，行为不变）：
  *   1) 窗口外也轮询全局光标 → sendCursor() → IPC_GLOBAL_CURSOR（渲染层据此换算视线目标）；
  *      光标移动时实时推，鼠标静止时按 CURSOR_HEARTBEAT_MS 心跳补推
  *      （渲染层的视线目标 3s 没更新就回正，只在"移动"时推的话，鼠标停在窗口外不动就
  *      会看一会儿不看了 —— 用户报的"窗口外不追踪"）。
  *   2) 自适应降频：光标距窗口边界 CURSOR_NEAR_DISTANCE（DIP）内走 CURSOR_POLL_MS，
  *      远离窗口时退到 CURSOR_FAR_POLL_MS（DIP 距离，与主进程其它几何口径一致）。
+ *      换频一律 clearInterval 后重建 —— 任意时刻只有一个光标轮询定时器。
  *   3) 鼠标行为事件：由静止恢复 → onMouseMoved；静止超时 → onMouseIdle（场景文案在调用方）。
  *   4) 点击穿透探测：光标移动时把全局坐标交给调用方换算"相对客户区"坐标。
  *   5) 手机触摸（notifyPhoneTouch）：1500ms 内**只**暂停光标推送，
@@ -118,8 +120,18 @@ export function startGazeInput(opts: GazeInputOptions): void {
       /* screen 暂不可用等场景静默，下轮重试 */
     }
   };
-  poll();
+  // 先建 80ms 定时器，再跑首轮轮询：首轮若判定"远离窗口"，poll 内部会 clearInterval 后
+  // 重建 150ms 那个；反过来（先 poll 再 setInterval）的话，首轮内建的定时器会被外层赋值
+  // 直接覆盖而没被清掉 → 80ms + 150ms 两个定时器并存，轮询次数翻倍。
   cursorTimer = setInterval(poll, CURSOR_POLL_MS);
+  try {
+    poll();
+  } catch (err) {
+    // 首轮就抛（screen/窗口 getter 异常）：不留下无人管的定时器，保持"没启动成功"的原语义
+    if (cursorTimer !== null) clearInterval(cursorTimer);
+    cursorTimer = null;
+    throw err;
+  }
 }
 
 /** 停止轮询并清掉"已推送光标"记忆（下次启动第一轮必按移动处理） */
@@ -139,11 +151,6 @@ export function stopGazeInput(): void {
 export function notifyPhoneTouch(x?: number, y?: number): void {
   phoneTouchUntil = Date.now() + 1500;
   if (typeof x === 'number' && typeof y === 'number') lastCursorSent = { x, y };
-}
-
-/** 只读：当前是否处于"手机触摸暂停光标推送"窗口内 */
-export function isPhoneTouchSuppressed(): boolean {
-  return Date.now() < phoneTouchUntil;
 }
 
 /** 只读：鼠标是否已进入"静止"状态（长时间活跃计时等逻辑用它清零） */

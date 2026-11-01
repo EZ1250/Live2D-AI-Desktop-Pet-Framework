@@ -26,6 +26,7 @@ src/
 ├── main/                     主进程
 │   ├── main.ts               入口薄壳（只 import './mainImpl'）
 │   ├── mainImpl.js           编排实现（窗口/IPC/模型/静态服务/生命周期）
+│   ├── gazeInput.ts          视线输入：全局光标轮询/心跳/鼠标状态/穿透探测/手机触摸暂停
 │   ├── devDebug.js           PET_* 调试钩子（只在设了 PET_* 时 require）
 │   ├── ipc.ts                IPC 处理器（资产/设置/模型/对话/语音…）
 │   ├── PathResolver.ts       资源根与模型路径解析（开发/打包/便携 + 兜底）
@@ -46,6 +47,7 @@ src/
 │   └── plugin-system/registry.ts  插件注册表（无插件时降级 no-op）
 ├── renderer/                 渲染层（无打包器：全局脚本 + <script> 标签）
 │   ├── index.html / styles.css / renderer.ts / live2d.ts / emotion.ts / voicelab.ts
+│   ├── gazeController.ts     视线控制器（全局脚本 window.PetGaze：换算/SDK focus/兜底）
 │   └── lib/                  第三方运行库（pixi / Cubism Core / Live2D 引擎）——不要手改
 ├── preload/preload.ts        contextBridge 窄接口
 └── shared/contracts.ts       跨模块契约（IPC 通道、类型）——唯一真源
@@ -606,6 +608,13 @@ handle 跑真实 `init()`，从推送通道一路断到 `setExpression`）。
 自查：`__petDebug.gaze()` 给出渲染层换算值（nx/ny/是否过期/收到多少次全局推送）和模型实际参数
 （`ParamAngleX/Y`、`ParamEyeBallX/Y`），鼠标停在窗口外时应看到 `stale:false` 且参数非 0
 （半身取景：AngleX≈±24°、EyeBallX≈±1）。
+
+**实现位置**：轮询/推送/心跳/鼠标状态/穿透探测/手机触摸暂停都在 `src/main/gazeInput.ts`
+（`bootstrap` 里用 `startGazeInput` 注入窗口、IPC 推送、场景回调与穿透判定）；
+渲染层的视线状态、窗口内指针与全局光标的换算、SDK FocusController 迟滞与代码管线兜底在
+`src/renderer/gazeController.ts`（全局脚本 `window.PetGaze`，`renderer.ts` 只保留事件接线与取景/handle 注入）。
+光标轮询**任意时刻只有一个定时器**：先建 80ms 再跑首轮，首轮若判定远离窗口就 clearInterval 后重建 150ms；
+以前是"先 poll 再 setInterval"，首轮内新建的定时器会被外层赋值覆盖而不清理 → 两个定时器并存，窗口外轮询次数翻倍。
 
 **④ 窗口拖动**：拖动靠窗口四周的 CSS `app-region: drag` 条带（`#drag-top/bottom/left/right`，
 左/右 10px、上 12px、下 16px）。两个坑：
