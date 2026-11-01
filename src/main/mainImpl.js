@@ -86,6 +86,7 @@ const autonomy_1 = require("./ai/autonomy");
 const userAssets_1 = require("./assets/userAssets");
 const ipc_1 = require("./ipc");
 const gazeInput_1 = require("./gazeInput");
+const vtsService_1 = require("./vts/vtsService");
 // ------------------------------------------------------------------ 数据目录统一
 // app.getPath('userData') 默认是 %APPDATA%\<productName>：
 //   开发态 productName = package.json 的 name（pet-desktop-app）
@@ -105,6 +106,15 @@ try {
 catch (err) {
     // 失败不致命：沿用 Electron 默认目录，只是两种形态不互通
     console.warn('[main] 统一 userData 目录失败，沿用默认：', err && err.message);
+}
+// 自动播放策略：桌宠的语音由主进程合成后推给渲染层 new Audio(...).play()，
+// 而渲染层通常没有"用户手势"（用户可能刚启动什么都没点），Electron 默认会拒绝播放。
+// 必须在 app ready 之前 appendSwitch 才生效；浏览器里桌面端的等价物是 autoplay 权限。
+try {
+    electron_1.app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+}
+catch (err) {
+    console.warn('[main] 设置自动播放策略失败（语音可能需要先点一下页面）：', err && err.message);
 }
 const WINDOW_WIDTH = 360;
 const WINDOW_HEIGHT = 520;
@@ -169,6 +179,9 @@ let appResolver = null; // 模块级只读引用（供状态文本等辅助函�
 let settingsPanelOpen = false; // 设置面板是否展开（展开时桌宠主窗要压在对话/思考浮窗之上）
 let mcpClient = null; // MCP 外部工具客户端（可选：userData/mcp.json 存在才连接）
 let petMcpServer = null; // MCP 服务端（可选：设置页开启「反向接入」才启动）
+let vtsService = null; // VTube Studio 可选后端（设置里启用才连；不阻塞启动）
+/** VTS 的连接配置（设置里的开关/端口换算出来的；端口变了要重连） */
+let vtsConfig = { enabled: false, port: 8001, url: 'ws://127.0.0.1:8001', tokenStorePath: '' };
 // 定时自主任务（设置页驱动；默认关闭，规则见 ai/autonomy.ts）
 let autoTaskChat = null;
 let autoTaskTimer = null;
@@ -2080,6 +2093,122 @@ function installPermissionGate() {
         return false;
     });
 }
+/* ------------------------------------------------------------------ VTube Studio 可选后端 */
+/**
+ * 设置 → VTS 连接参数。token 路径固定为 userData/vts-token.json（设置里不暴露，用户不该关心）。
+ * 端口只认 1..65535 的整数，脏值退回 8001（与 AppSettings 的默认值一致）。
+ */
+function vtsConfigFromSettings(settings) {
+    const rawPort = settings ? settings.vtsPort : undefined;
+    const port = Number.isInteger(rawPort) && rawPort >= 1 && rawPort <= 65535 ? rawPort : 8001;
+    return {
+        enabled: settings ? settings.vtsEnabled === true : false,
+        port,
+        url: vtsService_1.vtsUrlForPort(port),
+        tokenStorePath: vtsService_1.vtsTokenPath(electron_1.app.getPath('userData')),
+    };
+}
+/** 建（只建一次）VTS 服务；日志只打 warn/error，避免刷屏 */
+function ensureVtsService() {
+    if (vtsService)
+        return vtsService;
+    vtsService = new vtsService_1.VtsService({
+        clientName: 'Pet',
+        developer: 'EZ1250',
+        logger: (level, message) => {
+            if (level === 'warn' || level === 'error')
+                console.warn(`[vts] ${message}`);
+        },
+    });
+    return vtsService;
+}
+/** 把 VTS 状态推给渲染层（设置页据此实时更新；推送失败不影响任何事） */
+function pushVtsStatus(status) {
+    if (!status)
+        return;
+    try {
+        pushToWindows(contracts_1.IPC_VTS_STATUS_PUSH, status);
+    }
+    catch {
+        /* 窗口还没建好/正在销毁：忽略 */
+    }
+}
+/**
+ * 按设置应用 VTS：开关或端口变了才重连，关掉就停。
+ *
+ * **不 await start()**：连接/授权在后台跑，失败只写 lastError —— 应用启动不被 VTS 拖住
+ * （VTS 没开、端口填错、token 失效都不会影响桌宠本身）。启动阶段只用已保存的 token，
+ * 不会弹 VTS 授权窗；真授权由用户在设置页点「授权」。
+ */
+function applyVtsSettings(settings) {
+    const cfg = vtsConfigFromSettings(settings);
+    const changed = cfg.enabled !== vtsConfig.enabled || cfg.port !== vtsConfig.port;
+    vtsConfig = cfg;
+    if (!cfg.enabled) {
+        vtsService?.stop();
+        return;
+    }
+    if (!changed && vtsService && vtsService.status().enabled)
+        return; // 已经在跑：不打断现有连接
+    const svc = ensureVtsService();
+    void svc.start({ enabled: true, url: cfg.url, tokenStorePath: cfg.tokenStorePath })
+        .then((status) => pushVtsStatus(status))
+        .catch((err) => console.warn('[vts] 启动失败（不影响桌宠）：', err && err.message));
+}
+/** 设置页的 VTS 操作（IPC_VTS_ACTION）：connect / disconnect / authorize / refresh / trigger-hotkey */
+async function runVtsAction(action, arg) {
+    const svc = ensureVtsService();
+    try {
+        switch (action) {
+            case 'connect': {
+                // arg 可以带端口（设置页可能刚改了端口还没保存）：合法就用它，否则用保存的设置
+                const port = Number.parseInt(arg, 10);
+                if (Number.isInteger(port) && port >= 1 && port <= 65535) {
+                    vtsConfig = { ...vtsConfig, port, url: vtsService_1.vtsUrlForPort(port) };
+                }
+                vtsConfig = { ...vtsConfig, enabled: true };
+                const status = await svc.start({ enabled: true, url: vtsConfig.url, tokenStorePath: vtsConfig.tokenStorePath });
+                pushVtsStatus(status);
+                return {
+                    ok: status.connected,
+                    status,
+                    ...(status.connected ? {} : { error: status.lastError || 'VTS 连接失败（VTS 开着吗？端口对吗？）' }),
+                };
+            }
+            case 'disconnect': {
+                svc.stop();
+                const status = svc.status();
+                pushVtsStatus(status);
+                return { ok: true, status, message: '已断开 VTS' };
+            }
+            case 'authorize': {
+                const status = await svc.authorize();
+                pushVtsStatus(status);
+                return status.authenticated
+                    ? { ok: true, status, message: status.modelName ? `已授权：${status.modelName}` : '已授权' }
+                    : { ok: false, status, error: status.lastError || 'VTS 授权未通过' };
+            }
+            case 'refresh': {
+                const status = await svc.refresh();
+                pushVtsStatus(status);
+                return { ok: true, status };
+            }
+            case 'trigger-hotkey': {
+                const message = await svc.triggerHotkeyByName(arg);
+                const status = svc.status();
+                pushVtsStatus(status);
+                return { ok: true, status, message };
+            }
+            default:
+                return { ok: false, status: svc.status(), error: `未知的 VTS 操作：${action}` };
+        }
+    }
+    catch (err) {
+        const status = svc.status();
+        pushVtsStatus(status);
+        return { ok: false, status, error: err && err.message ? err.message : String(err) };
+    }
+}
 async function bootstrap() {
     // 启动耗时观测（各阶段毫秒数写入控制台，便于定位“启动慢”在解包/主进程/模型哪一段）
     const bootT0 = Date.now();
@@ -2226,6 +2355,18 @@ async function bootstrap() {
         },
         autoRunNow: () => runAutoTask('manual'),
         autoTaskLastRound: () => autoTaskRoundDraft ?? autoTaskLastRound,
+        // VTube Studio 可选后端：状态/操作/追踪注入（桌面渲染仍是主后端，VTS 只是同步出去）
+        vtsStatus: () => (vtsService ? vtsService.status() : {
+            enabled: false,
+            connected: false,
+            authenticated: false,
+            modelName: '',
+            modelLoaded: false,
+            lastError: '',
+        }),
+        vtsAction: (action, arg) => runVtsAction(action, arg),
+        onVtsTracking: (values) => vtsService?.injectTracking(values),
+        onVtsMouth: (value) => vtsService?.injectTracking({ mouthOpen: value }),
         onSettingsSaved: (next) => {
             applyAutoTaskSettings(next);
             configureAutoTaskTools();
@@ -2238,9 +2379,12 @@ async function bootstrap() {
                 }
             }
             void petMcpServer?.reload();
+            applyVtsSettings(next); // VTS 开关/端口改了就重连（关掉就停）
         },
     });
     sendToRenderer = bridge.pushToRenderer;
+    // 7.05 VTube Studio（可选后端）：设置里启用才连；后台异步连，失败不影响启动
+    applyVtsSettings(settings);
     // 7.1 工具盒（待办/提醒闹钟）就绪：恢复持久化提醒并接管“到点提醒”气泡
     toolbox.init((text) => {
         if (mainWindow && !mainWindow.isDestroyed()) {
@@ -4078,6 +4222,8 @@ function shutdown() {
     autoTaskChat?.cancel();
     mcpClient?.dispose(); // 关闭 MCP 子进程/挂起请求
     petMcpServer?.dispose(); // 关闭 MCP 服务端监听
+    vtsService?.dispose(); // 断开 VTS（可选后端，没连就是空操作）
+    vtsService = null;
     clearPendingAsks('应用正在关闭');
     if (server) {
         const srv = server;

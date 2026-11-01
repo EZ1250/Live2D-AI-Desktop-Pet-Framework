@@ -82,6 +82,68 @@ export interface VtsParameterInfo {
   [key: string]: unknown;
 }
 
+/** 当前模型里的一个热键（HotkeysInCurrentModelRequest 的 availableHotkeys 条目） */
+export interface VtsHotkey {
+  /** 热键显示名（VTS 里配置的，如「My Animation 1」） */
+  name: string;
+  /** 触发时用的 ID（32 位十六进制） */
+  hotkeyID: string;
+  /** 热键类型，如 TriggerAnimation / ToggleExpression / RemoveAllExpressions */
+  type: string;
+  description?: string;
+  [key: string]: unknown;
+}
+
+/* ------------------------------------------------------------------ 追踪参数 */
+
+/**
+ * 逻辑字段名（本项目的叫法）。**不要**用模型参数名（ParamAngleX 之类）去注入：
+ * VTS 会以 #453「你想注入的参数不存在」拒绝，必须走它自己的追踪参数，由 VTS 再映射到模型参数。
+ */
+export type VtsTrackingField =
+  | 'faceAngleX'
+  | 'faceAngleY'
+  | 'faceAngleZ'
+  | 'eyeLeftX'
+  | 'eyeLeftY'
+  | 'eyeRightX'
+  | 'eyeRightY'
+  | 'mouthOpen';
+
+/** 逻辑字段 → VTS 追踪参数名（实测 VTS 1.35.10 的 InputParameterListRequest 默认参数表里都有） */
+export const VTS_TRACKING_PARAMETERS: Readonly<Record<VtsTrackingField, string>> = Object.freeze({
+  faceAngleX: 'FaceAngleX',
+  faceAngleY: 'FaceAngleY',
+  faceAngleZ: 'FaceAngleZ',
+  eyeLeftX: 'EyeLeftX',
+  eyeLeftY: 'EyeLeftY',
+  eyeRightX: 'EyeRightX',
+  eyeRightY: 'EyeRightY',
+  mouthOpen: 'MouthOpen',
+});
+
+/** 字段的取值区间（VTS 参数的 min/max；越界先夹住，别把脏值甩给 VTS） */
+export const VTS_TRACKING_RANGES: Readonly<Record<VtsTrackingField, readonly [number, number]>> = Object.freeze({
+  faceAngleX: [-30, 30] as const,
+  faceAngleY: [-30, 30] as const,
+  faceAngleZ: [-90, 90] as const,
+  eyeLeftX: [-1, 1] as const,
+  eyeLeftY: [-1, 1] as const,
+  eyeRightX: [-1, 1] as const,
+  eyeRightY: [-1, 1] as const,
+  mouthOpen: [0, 1] as const,
+});
+
+/** 全部逻辑字段（顺序即注入顺序，方便对比/日志） */
+export const VTS_TRACKING_FIELDS: readonly VtsTrackingField[] = Object.freeze([
+  'faceAngleX', 'faceAngleY', 'faceAngleZ',
+  'eyeLeftX', 'eyeLeftY', 'eyeRightX', 'eyeRightY',
+  'mouthOpen',
+] as VtsTrackingField[]);
+
+/** 一帧追踪值：**只注入传进来的字段**，没传的保持 VTS 原值 */
+export type VtsTrackingValues = Partial<Record<VtsTrackingField, number>>;
+
 export interface VtsAuthResult {
   authenticated: boolean;
   /** true=用的是磁盘上已保存的 token（没有弹授权窗） */
@@ -219,6 +281,38 @@ export function normalizeParameterValues(values: VtsParameterValue[]): VtsParame
     }
     return normalized;
   });
+}
+
+function isTrackingField(key: string): key is VtsTrackingField {
+  return (VTS_TRACKING_FIELDS as readonly string[]).includes(key);
+}
+
+/**
+ * 收窄并夹取一帧追踪值：只留已知字段、只留有限数字、按 VTS 参数区间夹住。
+ * 非对象/空对象返回 {}（调用方据此判断"这帧没有可注入的东西"）。
+ */
+export function normalizeTrackingValues(values: unknown): VtsTrackingValues {
+  const out: VtsTrackingValues = {};
+  if (!values || typeof values !== 'object') return out;
+  for (const [key, raw] of Object.entries(values as Record<string, unknown>)) {
+    if (!isTrackingField(key)) continue;
+    if (typeof raw !== 'number' || !Number.isFinite(raw)) continue;
+    const [min, max] = VTS_TRACKING_RANGES[key];
+    out[key] = Math.max(min, Math.min(max, raw));
+  }
+  return out;
+}
+
+/** 逻辑追踪值 → VTS parameterValues（只含传进来的字段；空对象 → []） */
+export function trackingToParameterValues(values: VtsTrackingValues | unknown): VtsParameterValue[] {
+  const normalized = normalizeTrackingValues(values);
+  const list: VtsParameterValue[] = [];
+  for (const field of VTS_TRACKING_FIELDS) {
+    const value = normalized[field];
+    if (typeof value !== 'number') continue;
+    list.push({ id: VTS_TRACKING_PARAMETERS[field], value });
+  }
+  return list;
 }
 
 function normalizeTimeout(value: number | undefined, fallback: number): number {
@@ -474,24 +568,30 @@ export class VtsClient {
    *  - 没有/失效：AuthenticationTokenRequest（VTS 弹窗等用户点允许）→ AuthenticationRequest →
    *    成功后把 token 落盘（tokenStorePath 存在时）。
    * @param options.force true=跳过缓存token，重新走一遍授权弹窗
+   * @param options.cachedOnly true=只用磁盘上已保存的 token，没有/失效就抛错
+   *        （应用启动时用：**绝不能在用户没点"授权"的时候弹 VTS 授权窗**）
    */
-  async authenticate(options: { force?: boolean; timeoutMs?: number } = {}): Promise<VtsAuthResult> {
+  async authenticate(options: { force?: boolean; timeoutMs?: number; cachedOnly?: boolean } = {}): Promise<VtsAuthResult> {
     const timeoutMs = normalizeTimeout(options.timeoutMs, this.authTimeoutMs);
+    const cached = options.force ? null : this.readToken();
+    if (options.cachedOnly === true && !cached) {
+      throw new Error('没有可用的 VTS token：请在设置页点「授权」让 VTS 弹窗确认一次');
+    }
 
-    if (!options.force) {
-      const cached = this.readToken();
-      if (cached) {
-        try {
-          const res = await this.request<{ authenticated?: boolean; reason?: string }>(
-            'AuthenticationRequest',
-            this.authPayload(cached),
-            { timeoutMs },
-          );
-          if (res.authenticated === true) return { authenticated: true, cachedToken: true };
-          this.log('warn', `已保存的 token 未通过认证（${res.reason ?? '无原因'}），重新申请授权`);
-        } catch (err) {
-          this.log('warn', `复用 token 认证失败：${normalizeError(err).message}`);
-        }
+    if (cached) {
+      try {
+        const res = await this.request<{ authenticated?: boolean; reason?: string }>(
+          'AuthenticationRequest',
+          this.authPayload(cached),
+          { timeoutMs },
+        );
+        if (res.authenticated === true) return { authenticated: true, cachedToken: true };
+        const reason = typeof res.reason === 'string' && res.reason ? res.reason : '无原因';
+        if (options.cachedOnly === true) throw new Error(`已保存的 VTS token 未通过认证：${reason}`);
+        this.log('warn', `已保存的 token 未通过认证（${reason}），重新申请授权`);
+      } catch (err) {
+        if (options.cachedOnly === true) throw normalizeError(err);
+        this.log('warn', `复用 token 认证失败：${normalizeError(err).message}`);
       }
     }
 
@@ -523,6 +623,11 @@ export class VtsClient {
       authenticationToken: token,
       faceFound: true,
     };
+  }
+
+  /** 磁盘上是否已有可复用的 token（不读 token 内容给外部，只回答"有没有"） */
+  hasCachedToken(): boolean {
+    return this.readToken() !== null;
   }
 
   private readToken(): string | null {
@@ -609,6 +714,112 @@ export class VtsClient {
       return !!item && typeof item === 'object' && typeof (item as { name?: unknown }).name === 'string';
     });
   }
+
+  /**
+   * 当前模型的热键列表。
+   *
+   * 实测（VTS 1.35.10）：官方叫 **HotkeysInCurrentModelRequest**，响应里的
+   * `availableHotkeys` 才是 {name, hotkeyID, type}；发 `HotkeyListRequest` 会直接
+   * 回 APIError #7「Unknown messageType」。为了兼容将来可能改名的服务端，
+   * 这里按顺序试两个消息类型，只有"未知消息类型"才换下一个，别的错误照常抛。
+   */
+  async listHotkeys(): Promise<VtsHotkey[]> {
+    let data: Record<string, unknown> | null = null;
+    let lastErr: Error | null = null;
+    for (const messageType of HOTKEY_LIST_MESSAGE_TYPES) {
+      try {
+        data = await this.request<Record<string, unknown>>(messageType, {});
+        lastErr = null;
+        break;
+      } catch (err) {
+        const normalized = normalizeError(err);
+        if (!isUnknownMessageType(normalized)) throw normalized;
+        lastErr = normalized;
+        this.log('warn', `VTS 不支持 ${messageType}，换下一个候选：${normalized.message}`);
+      }
+    }
+    if (!data) throw lastErr ?? new Error('VTS 热键列表请求失败');
+    return parseHotkeyList(data);
+  }
+
+  /**
+   * 按热键名触发热键。名字先精确匹配、再忽略大小写匹配。
+   * @throws Error 名字为空 / 模型没有热键 / 找不到这个名字（错误里列出可用热键）
+   */
+  async triggerHotkeyByName(name: string): Promise<Record<string, unknown>> {
+    const wanted = typeof name === 'string' ? name.trim() : '';
+    if (!wanted) throw new TypeError('triggerHotkeyByName 需要非空的热键名');
+    const hotkeys = await this.listHotkeys();
+    if (!hotkeys.length) {
+      throw new Error('当前 VTS 模型没有热键；先在 VTube Studio 里给模型的动捕/表情配一个热键');
+    }
+    const lower = wanted.toLowerCase();
+    const found = hotkeys.find((item) => item.name === wanted)
+      ?? hotkeys.find((item) => item.name.toLowerCase() === lower);
+    if (!found) {
+      const names = hotkeys.slice(0, 12).map((item) => item.name).join('、');
+      throw new Error(
+        `VTS 热键里没有「${wanted}」；当前模型共 ${hotkeys.length} 个可用热键：${names}${hotkeys.length > 12 ? '…' : ''}`,
+      );
+    }
+    return this.triggerHotkey(found.hotkeyID);
+  }
+
+  /**
+   * 注入一帧**追踪参数**（FaceAngleX / EyeLeftX / MouthOpen …，VTS 自己映射到模型参数）。
+   * 默认只注入传进来的字段；没有已知字段时抛 TypeError（调用方自己决定要不要为空时跳过）。
+   */
+  async injectTracking(
+    values: VtsTrackingValues,
+    options: { faceFound?: boolean; mode?: 'set' | 'add' } = {},
+  ): Promise<Record<string, unknown>> {
+    const parameterValues = trackingToParameterValues(values);
+    if (!parameterValues.length) {
+      throw new TypeError(`injectTracking 至少需要一个追踪字段（${VTS_TRACKING_FIELDS.join('/')}）`);
+    }
+    return this.injectParameters(parameterValues, options.faceFound !== false, options.mode ?? 'set');
+  }
+}
+
+/* ------------------------------------------------------------------ 热键列表解析 */
+
+/** 热键列表候选消息类型（官方实测顺序在前） */
+const HOTKEY_LIST_MESSAGE_TYPES = ['HotkeysInCurrentModelRequest', 'HotkeyListRequest'] as const;
+
+/** VTS 回「未知消息类型」（errorID #7）时才算"这条消息类型不被支持" */
+function isUnknownMessageType(err: Error): boolean {
+  if (err instanceof VtsApiError) {
+    if (err.errorID === 7) return true;
+    return /unknown message ?type/i.test(err.vtsMessage);
+  }
+  return false;
+}
+
+/** 从响应里取 {name, hotkeyID, type}（不同版本字段名可能不同，都试一遍） */
+export function parseHotkeyList(data: Record<string, unknown> | null | undefined): VtsHotkey[] {
+  if (!data || typeof data !== 'object') return [];
+  const raw = Array.isArray(data.availableHotkeys)
+    ? data.availableHotkeys
+    : Array.isArray(data.hotkeys)
+      ? data.hotkeys
+      : Array.isArray(data.hotkeyList)
+        ? data.hotkeyList
+        : [];
+  const list: VtsHotkey[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const entry = item as Record<string, unknown>;
+    const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+    const hotkeyID = typeof entry.hotkeyID === 'string' ? entry.hotkeyID.trim() : '';
+    if (!name || !hotkeyID) continue;
+    list.push({
+      ...entry,
+      name,
+      hotkeyID,
+      type: typeof entry.type === 'string' ? entry.type : '',
+    });
+  }
+  return list;
 }
 
 export default VtsClient;

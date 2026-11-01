@@ -198,6 +198,30 @@
           <span id="setting-voice-status" class="settings-status" role="status"></span>
         </div>
       </fieldset>
+      <!-- VTube Studio 可选后端：把桌宠的视线/口型同步到本机 VTS 里的模型。
+           不启用时完全不连 VTS，桌宠自己的渲染行为不变（VTS 只是"第二后端"）。 -->
+      <fieldset class="settings-fieldset">
+        <legend>VTube Studio（可选：让 VTS 里的模型跟着桌宠动）</legend>
+        <label class="settings-checkbox" title="启用后把桌宠的视线与口型（追踪参数 FaceAngleX / EyeLeftX / MouthOpen）注入本机 VTube Studio；关闭则完全不连">
+          <input id="setting-vts-enabled" name="vtsEnabled" type="checkbox" /> 启用 VTS 同步（视线 / 口型）
+        </label>
+        <label>VTS 插件 API 端口<input id="setting-vts-port" name="vtsPort" type="number" min="1" max="65535" step="1" placeholder="8001" /></label>
+        <div class="settings-inline">
+          <button id="setting-vts-connect" type="button" title="连接本机 VTube Studio 的插件 API（ws://127.0.0.1:端口）">连接</button>
+          <button id="setting-vts-authorize" type="button" title="让 VTS 弹一次授权窗（只需一次，token 会保存到本机）">授权</button>
+          <button id="setting-vts-disconnect" type="button">断开</button>
+          <button id="setting-vts-refresh" type="button" title="重新读取 VTS 当前模型名">刷新状态</button>
+        </div>
+        <p id="setting-vts-status" class="settings-status" role="status">读取 VTS 状态…</p>
+        <label class="settings-row">热键表情
+          <input id="setting-vts-hotkey" type="text" maxlength="60" placeholder="VTS 里的热键名，例如「开心」" autocomplete="off" spellcheck="false" />
+          <button id="setting-vts-hotkey-run" type="button" title="在当前 VTS 模型里按名字找到热键并触发">触发热键</button>
+        </label>
+        <div class="settings-inline">
+          <button id="setting-tts-speak" type="button" title="用 Edge TTS 合成一句话并播放（启用 VTS 时会同步张嘴）">🔊 试听语音</button>
+          <span id="setting-tts-status" class="settings-status" role="status"></span>
+        </div>
+      </fieldset>
       <label>Provider<input id="setting-provider" name="provider" placeholder="deepseek / openai / azure" /></label>
       <label>API 地址<input id="setting-base-url" name="baseUrl" placeholder="https://api.deepseek.com" /></label>
       <label>API Key<input id="setting-api-key" name="apiKey" type="password" placeholder="仅保存到本机" /></label>

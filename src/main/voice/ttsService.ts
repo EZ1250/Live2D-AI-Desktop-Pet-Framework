@@ -9,39 +9,22 @@
  * 本文件**不 import Electron**：只要求一个 `{ send(channel, payload) }` 的目标
  * （真实接线时传 `mainWindow.webContents`），这样能离线单测，主进程也随时可接。
  *
- * 未来接线（本次刻意不接 UI）：
- *   ipcMain.handle('pet:tts:speak', (_e, text) => speak(mainWindow?.webContents, text));
- *   渲染层：ipcRenderer.on('pet:tts:audio', (_e, p) => { if (p.ok) new Audio(p.dataUrl).play(); });
+ * 接线（已接）：
+ *   ipc.ts 注册 `IPC_TTS_SPEAK` handler → speak(mainWindow.webContents, text)；
+ *   渲染层收到 `IPC_TTS_AUDIO` 后 `new Audio(payload.dataUrl).play()` 播放；
+ *   主进程顺带在说话期间给 VTS 注入 MouthOpen（见 ipc.ts 的 VTS 段）。
+ *
+ * 频道名与载荷类型统一放在 `src/shared/contracts.ts`（preload 也要用同一份，避免字符串漂移），
+ * 这里再导出一次，保持 `require('../dist/main/voice/ttsService').IPC_TTS_AUDIO` 这类旧用法可用。
  */
 import { Buffer } from 'node:buffer';
+import { IPC_TTS_AUDIO, IPC_TTS_SPEAK, TTS_AUDIO_MIME } from '../../shared/contracts';
+import type { TtsAudioPayload } from '../../shared/contracts';
 import { DEFAULT_VOICE, synthesize as synthesizeEdge } from './edgeTts';
 import type { EdgeTtsSynthOptions } from './edgeTts';
 
-/** 主进程 → 渲染层：一段合成好的语音 */
-export const IPC_TTS_AUDIO = 'pet:tts:audio';
-/** 建议的「渲染层 → 主进程」请求频道（本次未注册 handler，留给后续接线） */
-export const IPC_TTS_SPEAK = 'pet:tts:speak';
-export const TTS_AUDIO_MIME = 'audio/mpeg';
-
-/** 推给渲染层的载荷（也用于失败回报，前端据此显示原因） */
-export interface TtsAudioPayload {
-  ok: boolean;
-  /** 调用方给的 id，用于前端把「播放」和「失败」对起来 */
-  requestId: string;
-  /** 原始文本（前端可用于字幕/日志） */
-  text: string;
-  /** 实际使用的声音短名 */
-  voice: string;
-  mime: typeof TTS_AUDIO_MIME;
-  /** `data:audio/mpeg;base64,...`；ok=false 时为空串 */
-  dataUrl: string;
-  /** mp3 字节数（不是 base64 长度） */
-  bytes: number;
-  /** 合成耗时（ms） */
-  ms: number;
-  /** ok=false 时的可读原因 */
-  error?: string;
-}
+export { IPC_TTS_AUDIO, IPC_TTS_SPEAK, TTS_AUDIO_MIME };
+export type { TtsAudioPayload };
 
 /** 只需要一个 send：真实场景传 webContents，测试传假的 */
 export interface TtsSendTarget {

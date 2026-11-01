@@ -59,6 +59,23 @@
 插件在受限注册表中运行，接收 `start`、`tick`、`windowChange`、`userInput` 事件；
 插件能力**不等于**应用的文件系统或命令权限。
 
+## VTube Studio（可选后端）
+
+桌宠自己的 Live2D 渲染是**主后端**；VTS 只是可选的第二后端（设置里启用才连，默认关闭）。
+边界：
+
+- 主进程 `src/main/vts/vtsService.ts` 持有唯一 `VtsClient`（`src/main/vts/vtsClient.ts`），
+  连接/授权失败只写 `lastError`，**不阻塞应用启动**，也不在启动阶段弹 VTS 授权窗
+  （只有设置页「授权」会走 `AuthenticationTokenRequest`）。
+- 只能注入 VTS 的**追踪参数**（`FaceAngleX`/`EyeLeftX`/`MouthOpen` …），由 VTS 映射到模型参数；
+  直接注入 `ParamAngleX` 这类模型参数会被 VTS 以 #453 拒绝。
+- 视线注入走 `IPC_VTS_TRACKING`（renderer→main，`ipcMain.on`，约 30fps，fire-and-forget）；
+  未连接/未授权时主进程静默丢弃，不抛回渲染层。
+- 热键列表用 `HotkeysInCurrentModelRequest`（VTS 1.35 实测；`HotkeyListRequest` 会被拒 #7）。
+- 语音由主进程用 Edge TTS 合成后经 `IPC_TTS_AUDIO` 推给渲染层 `new Audio(...).play()`；
+  主进程在 app ready 前 `appendSwitch('autoplay-policy', 'no-user-gesture-required')`，
+  否则渲染层没有用户手势时播放会被拒。说话期间顺带注入 `MouthOpen`。
+
 ## 第三方资源授权
 
 模型、角色资料、Live2D 运行库等第三方资源的授权**不由 MIT 覆盖**；发布前须逐项核验来源、

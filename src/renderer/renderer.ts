@@ -32,6 +32,9 @@ type ElectronAPI = import('../shared/contracts').ElectronAPI;
 type ModelManifest = import('../shared/contracts').ModelManifest;
 type WindowInfo = import('../shared/contracts').WindowInfo;
 type AppSettings = import('../shared/contracts').AppSettings;
+type VtsStatusDto = import('../shared/contracts').VtsStatusDto;
+type VtsTrackingValues = import('../shared/contracts').VtsTrackingValues;
+type TtsAudioPayload = import('../shared/contracts').TtsAudioPayload;
 
 /* ================================================================
    1. 内部类型与常量
@@ -676,6 +679,7 @@ function frameLoop(nowMs: number): void {
   accMs = 0;
   try {
     gazeApi()?.tick(nowMs); // 先喂视线目标，handle.update 内做平滑插值
+    pushVtsTracking(nowMs); // VTS 可选后端：把视线按 ~30fps 同步出去（未启用时零开销）
     currentHandle?.update?.(nowSec, deltaSec);
   } catch (err) {
     console.warn('[renderer] 帧更新失败', err);
@@ -761,6 +765,61 @@ function installGazeTracking(): void {
   window.addEventListener('pointermove', (e) => gazeApi()?.setPointer(e.clientX, e.clientY), { passive: true });
   // 鼠标离开窗口：视线不再更新，主循环里走“缓缓归零”分支
   window.addEventListener('mouseleave', () => { gazeApi()?.pause(); });
+}
+
+/* ================================================================
+   7.52 VTube Studio 可选后端：视线 → 追踪参数（~30fps 发给主进程）
+   —— 只发**追踪参数**（FaceAngleX/EyeLeftX...），由 VTS 自己映射到模型参数；
+      直接注入 ParamAngleX 这类模型参数会被 VTS 以 #453 拒绝。
+   —— 只在设置里启用 VTS 时才发；主进程那边未连接/未授权会静默丢弃。
+   ================================================================ */
+
+/** 注入节流：33ms ≈ 30fps（VTS 侧也只认"最新一帧"，再快没有意义） */
+const VTS_PUSH_INTERVAL_MS = 33;
+/** 视线 → 头部转角的增益（VTS 的 FaceAngleX/Y 范围是 -30..30 度） */
+const VTS_FACE_ANGLE_GAIN = 30;
+/** 视线 → 眼球位移的增益（EyeLeftX/Y 范围 -1..1；0.6 保留一点余量，别让眼球顶死） */
+const VTS_EYE_GAIN = 0.6;
+
+let vtsTrackingEnabled = false;
+let vtsTrackingBridge: RendererBridge | null = null;
+let lastVtsPushAt = 0;
+
+/** 打开/关闭 VTS 追踪推送（设置里勾「启用 VTS」并保存后生效；启动时按设置应用一次） */
+function setVtsTrackingEnabled(on: boolean): void {
+  vtsTrackingEnabled = on === true;
+  if (!vtsTrackingEnabled) lastVtsPushAt = 0;
+}
+
+/** 归一化视线 [-1,1] → 一帧 VTS 追踪值（只含可算的字段） */
+function gazeToVtsTracking(nx: number, ny: number): VtsTrackingValues {
+  const x = Math.max(-1, Math.min(1, Number.isFinite(nx) ? nx : 0));
+  const y = Math.max(-1, Math.min(1, Number.isFinite(ny) ? ny : 0));
+  return {
+    faceAngleX: x * VTS_FACE_ANGLE_GAIN,
+    faceAngleY: y * VTS_FACE_ANGLE_GAIN,
+    eyeLeftX: x * VTS_EYE_GAIN,
+    eyeLeftY: y * VTS_EYE_GAIN,
+    eyeRightX: x * VTS_EYE_GAIN,
+    eyeRightY: y * VTS_EYE_GAIN,
+  };
+}
+
+/** 主循环每帧调用：启用且到间隔就把当前视线换算成追踪参数发出去（fire-and-forget） */
+function pushVtsTracking(nowMs: number): void {
+  if (!vtsTrackingEnabled) return;
+  const bridge = vtsTrackingBridge;
+  if (!bridge || typeof bridge.sendVtsTracking !== 'function') return;
+  if (lastVtsPushAt && nowMs - lastVtsPushAt < VTS_PUSH_INTERVAL_MS) return;
+  lastVtsPushAt = nowMs;
+  const gaze = gazeApi()?.state();
+  if (!gaze) return;
+  // 静止归零与桌宠自己一致：鼠标停 3s 后视线回正，VTS 那边也别一直歪着头
+  try {
+    bridge.sendVtsTracking(gazeToVtsTracking(gaze.stale ? 0 : gaze.nx, gaze.stale ? 0 : gaze.ny));
+  } catch {
+    /* 高频通道：发失败不能影响主循环 */
+  }
 }
 
 /* ================================================================
@@ -2135,6 +2194,17 @@ function subscribeOptionalPushes(bridge: RendererBridge): void {
       if (chatOwnedByChatWindow) hideChatBar();
     });
   }
+  // VTS 状态推送（连接/授权/错误/模型变化）：设置页打开时同步刷新那一行
+  if (typeof bridge.onVtsStatus === 'function') {
+    bridge.onVtsStatus((status) => {
+      const panel = elementById<HTMLElement>('settings-panel');
+      if (panel && !panel.hidden) renderVtsStatus(status);
+    });
+  }
+  // TTS 音频：主进程合成好就推过来，这里直接播（autoplay 策略已在主进程放宽）
+  if (typeof bridge.onTtsAudio === 'function') {
+    bridge.onTtsAudio(playTtsAudio);
+  }
 }
 
 /* ================================================================
@@ -2994,6 +3064,11 @@ async function populateSettings(bridge: RendererBridge): Promise<void> {
   setInputValue('setting-autotask-event-match', settings.autoTaskEventMatch ?? '');
   setInputValue('setting-autotask-event-cooldown', String(settings.autoTaskEventCooldownMin ?? 15));
   setChecked('setting-autotask-allow-mcp', settings.autoTaskAllowMcp === true);
+  // VTube Studio（可选后端）：开关 + 端口；状态行单独异步刷
+  setChecked('setting-vts-enabled', settings.vtsEnabled === true);
+  setInputValue('setting-vts-port', String(settings.vtsPort ?? 8001));
+  setVtsTrackingEnabled(settings.vtsEnabled === true);
+  void refreshVtsStatus(bridge);
   void refreshMcpPanel(bridge);
   const values: Array<[string, string | number | undefined]> = [
     ['setting-provider', settings.provider],
@@ -3248,6 +3323,127 @@ async function runAutoTaskNowFromUi(bridge: RendererBridge): Promise<void> {
   }
 }
 
+/* ---------- 设置页：VTube Studio（可选后端）+ Edge TTS 试听 ---------- */
+
+/** VTS 状态行文本：连接/授权/模型/错误 */
+function describeVtsStatus(st: VtsStatusDto | null): string {
+  if (!st) return '当前版本不支持 VTS（主进程未接 VTS 服务）';
+  const link = st.connected ? (st.authenticated ? '已连接 · 已授权' : '已连接 · 未授权') : st.enabled ? '未连接' : '未启用';
+  const model = st.modelName ? ` · 模型：${st.modelName}` : st.modelLoaded ? '' : ' · 未加载模型';
+  const err = st.lastError ? `｜${st.lastError}` : '';
+  return `${link}${model}${err}`;
+}
+
+/** 渲染一行 VTS 状态 */
+function renderVtsStatus(st: VtsStatusDto | null): void {
+  const el = elementById<HTMLElement>('setting-vts-status');
+  if (el) el.textContent = describeVtsStatus(st);
+}
+
+/** 拉一次 VTS 状态（设置页打开/操作后调用） */
+async function refreshVtsStatus(bridge: RendererBridge): Promise<void> {
+  const el = elementById<HTMLElement>('setting-vts-status');
+  if (typeof bridge.vtsStatus !== 'function') {
+    if (el) el.textContent = '当前版本不支持 VTS（preload 未暴露 vtsStatus）';
+    return;
+  }
+  try {
+    renderVtsStatus(await bridge.vtsStatus());
+  } catch (err) {
+    if (el) el.textContent = `读取 VTS 状态失败：${(err as Error).message ?? String(err)}`;
+  }
+}
+
+/** 点「连接 / 授权 / 断开 / 刷新 / 触发热键」 */
+async function runVtsActionFromUi(bridge: RendererBridge, action: 'connect' | 'authorize' | 'disconnect' | 'refresh' | 'trigger-hotkey'): Promise<void> {
+  if (typeof bridge.vtsAction !== 'function') {
+    setSettingsStatus('当前版本不支持 VTS 操作（preload 未暴露 vtsAction）', true);
+    return;
+  }
+  const hotkeyInput = elementById<HTMLInputElement>('setting-vts-hotkey');
+  // connect 时把端口一起带过去（用户可能刚改了端口还没点保存）；其余操作用不到 arg
+  const arg = action === 'trigger-hotkey'
+    ? (hotkeyInput?.value.trim() ?? '')
+    : action === 'connect'
+      ? (elementById<HTMLInputElement>('setting-vts-port')?.value.trim() ?? '')
+      : '';
+  if (action === 'trigger-hotkey' && !arg) {
+    setSettingsStatus('先填一个 VTS 里的热键名再点「触发热键」', true);
+    return;
+  }
+  if (action === 'authorize') setSettingsStatus('等待 VTS 弹窗（去 VTS 里点「允许」）…');
+  else if (action === 'connect') setSettingsStatus('正在连接 VTS…');
+  try {
+    const result = await bridge.vtsAction(action, arg || undefined);
+    renderVtsStatus(result.status ?? null);
+    if (!result.ok) {
+      setSettingsStatus(result.error ?? describeVtsStatus(result.status ?? null), true);
+      return;
+    }
+    setSettingsStatus(result.message ?? '完成');
+    // 连接/授权成功后顺便勾上「启用」并开始发视线：用户点了连接显然是想用 VTS
+    if (action === 'connect' || action === 'authorize') {
+      const box = elementById<HTMLInputElement>('setting-vts-enabled');
+      if (box) box.checked = true;
+      setVtsTrackingEnabled(true);
+    }
+  } catch (err) {
+    setSettingsStatus(`VTS 操作失败：${(err as Error).message ?? String(err)}`, true);
+  }
+}
+
+/**
+ * 播放一段主进程合成的语音。
+ * 自动播放可能被拦（没有用户手势）：appendSwitch('autoplay-policy', ...) 已在主进程加上，
+ * 但仍可能在别的环境下失败 —— 失败要给出可操作的提示，不能静默没声音。
+ */
+let ttsAudioEl: HTMLAudioElement | null = null;
+function playTtsAudio(payload: TtsAudioPayload): void {
+  if (!payload || payload.ok !== true || typeof payload.dataUrl !== 'string' || !payload.dataUrl) {
+    if (payload && payload.error) setSettingsStatus(`语音合成失败：${payload.error}`, true);
+    return;
+  }
+  try {
+    ttsAudioEl?.pause();
+  } catch {
+    /* 旧元素已销毁 */
+  }
+  try {
+    const audio = new Audio(payload.dataUrl);
+    ttsAudioEl = audio;
+    const played = audio.play();
+    if (played && typeof played.catch === 'function') {
+      void played.catch((err: unknown) => {
+        setSettingsStatus('浏览器拦截了自动播放：先点一下桌宠再试', true);
+        console.warn('[renderer] TTS 播放失败', err);
+      });
+    }
+  } catch (err) {
+    setSettingsStatus(`播放失败：${(err as Error).message ?? String(err)}`, true);
+  }
+}
+
+/** 设置页「试听语音」：让主进程合成一句（启用 VTS 时同时驱动 MouthOpen） */
+async function speakSampleFromUi(bridge: RendererBridge): Promise<void> {
+  const btn = elementById<HTMLButtonElement>('setting-tts-speak');
+  const el = elementById<HTMLElement>('setting-tts-status');
+  if (typeof bridge.ttsSpeak !== 'function') {
+    if (el) el.textContent = '当前版本不支持语音合成';
+    return;
+  }
+  if (btn) btn.disabled = true;
+  if (el) el.textContent = '合成中…';
+  try {
+    const result = await bridge.ttsSpeak('你好，我是你的桌面宠物，语音已经接好了。');
+    if (el) el.textContent = result.ok ? `已合成 ${result.bytes ?? 0} 字节，开始播放` : `失败：${result.error ?? '未知原因'}`;
+    if (!result.ok) setSettingsStatus(`语音合成失败：${result.error ?? '未知原因'}`, true);
+  } catch (err) {
+    if (el) el.textContent = `失败：${(err as Error).message ?? String(err)}`;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 function openSettings(bridge: RendererBridge): void {
   const panel = elementById<HTMLElement>('settings-panel');
   if (!panel) return;
@@ -3312,6 +3508,9 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
     autoTaskEventMatch: value('setting-autotask-event-match').slice(0, 80),
     autoTaskEventCooldownMin: clampInt(readNumber('setting-autotask-event-cooldown', 15), 5, 120, 15),
     autoTaskAllowMcp: elementById<HTMLInputElement>('setting-autotask-allow-mcp')?.checked === true,
+    // VTube Studio 可选后端（默认关闭；端口 1..65535，脏值按 8001）
+    vtsEnabled: elementById<HTMLInputElement>('setting-vts-enabled')?.checked === true,
+    vtsPort: clampInt(readNumber('setting-vts-port', 8001), 1, 65535, 8001),
     motionTriggersByModel: (() => {
       const next = { ...motionTriggersByModel };
       const name = activeModelName || '';
@@ -3331,6 +3530,8 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
   applyPetName(settings.petName); // 名字立刻生效（输入框提示/问候语）
   applySfxSettings(settings); // 音效开关/音量立刻生效（无需重启）
   applyFraming(settings.displayMode === 'half' ? 'half' : 'full'); // 取景立刻生效
+  setVtsTrackingEnabled(settings.vtsEnabled === true); // VTS 视线同步随开关立刻生效
+  void refreshVtsStatus(bridge); // VTS 状态行跟着更新（主进程可能刚重连）
   void refreshVoiceStatus(bridge); // 语音状态行跟着更新
   void refreshMcpPanel(bridge); // MCP / 自主任务状态行跟着更新
   void refreshVoiceModelIndex(bridge, { autoFill: false }); // 转写模型体检（保存后重新校验一次）
@@ -4784,6 +4985,29 @@ function installSettingsUi(bridge: RendererBridge): void {
     event.preventDefault();
     void saveSettings(bridge).catch((err: unknown) => setSettingsStatus(`保存失败：${(err as Error).message ?? String(err)}`, true));
   });
+  // —— VTube Studio（可选后端）：连接 / 授权 / 断开 / 刷新 / 触发热键 / 试听语音 ——
+  elementById<HTMLButtonElement>('setting-vts-connect')?.addEventListener('click', () => {
+    void runVtsActionFromUi(bridge, 'connect');
+  });
+  elementById<HTMLButtonElement>('setting-vts-authorize')?.addEventListener('click', () => {
+    void runVtsActionFromUi(bridge, 'authorize');
+  });
+  elementById<HTMLButtonElement>('setting-vts-disconnect')?.addEventListener('click', () => {
+    void runVtsActionFromUi(bridge, 'disconnect');
+  });
+  elementById<HTMLButtonElement>('setting-vts-refresh')?.addEventListener('click', () => {
+    void runVtsActionFromUi(bridge, 'refresh');
+  });
+  elementById<HTMLButtonElement>('setting-vts-hotkey-run')?.addEventListener('click', () => {
+    void runVtsActionFromUi(bridge, 'trigger-hotkey');
+  });
+  elementById<HTMLButtonElement>('setting-tts-speak')?.addEventListener('click', () => {
+    void speakSampleFromUi(bridge);
+  });
+  // 「启用 VTS」勾上/取消：立刻决定要不要发视线（保存后配置才落盘，这里只控制发送开关）
+  elementById<HTMLInputElement>('setting-vts-enabled')?.addEventListener('change', (event) => {
+    setVtsTrackingEnabled((event.target as HTMLInputElement).checked === true);
+  });
   elementById<HTMLFormElement>('settings-form')?.addEventListener('submit', (event) => event.preventDefault());
   // 开发工作区：选择文件夹 / 打开
   elementById<HTMLButtonElement>('setting-dev-root-pick')?.addEventListener('click', () => {
@@ -5363,6 +5587,7 @@ async function init(): Promise<void> {
 
   subscribeWindowChanges(bridge);
   chatBridge = bridge; // 聊天记录持久化用
+  vtsTrackingBridge = bridge; // VTS 追踪推送目标（主循环里用；未启用时不会被调用）
   // 行为触发映射：**必须在这里载入**（不能只在打开设置面板时）——否则不打开设置/重启后，
   // 设置里配好的"动作或表情"永远不会播（退回 'auto' 时多数是看不出变化的 Idle）。
   await loadBehaviorTriggers(bridge);
@@ -5401,6 +5626,7 @@ async function init(): Promise<void> {
       applyFraming(chosen ?? (activeModelPreset?.framing === 'half' ? 'half' : 'full'));
       applyPetName(bootSettings.petName); // 设置里的桌宠名字：问候语/输入框提示立刻用上
       applySfxSettings(bootSettings);
+      setVtsTrackingEnabled(bootSettings.vtsEnabled === true); // 不打开设置页也要按设置同步 VTS
       // 模型已挂载完成 → 现在才知道它有哪些动作组/表情：把该模型自己的行为触发绑定套上
       applyBehaviorTriggersFromSettings(bootSettings);
       bootRecord('设置应用完成（角色可见）');

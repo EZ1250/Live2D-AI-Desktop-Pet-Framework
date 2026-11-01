@@ -386,6 +386,95 @@ export interface VoiceCheckResult {
   hint?: string;
 }
 
+// ---------------------------------------------------------------------------
+// VTube Studio（可选后端）+ Edge TTS 播放
+// 设计：桌宠自己的 Live2D 渲染仍是主后端；VTS 只是**可选**的第二后端——
+//       把视线/口型同步到用户另外开着的 VTube Studio 里的模型。
+//       注入的只能是 VTS 的**追踪参数**（FaceAngleX / EyeLeftX / MouthOpen …），
+//       由 VTS 自己映射到模型参数；直接注入 ParamAngleX 会以 #453 被拒。
+// ---------------------------------------------------------------------------
+
+/** invoke renderer→main：读取 VTS 状态（未接 VTS 时返回 null）。 */
+export const IPC_VTS_STATUS = 'vts:status';
+/** invoke renderer→main：VTS 操作（连接 / 断开 / 授权 / 刷新 / 触发热键）。 */
+export const IPC_VTS_ACTION = 'vts:action';
+/** renderer→main（send，高频 ~30fps）：把当前视线换算成追踪参数注入 VTS。 */
+export const IPC_VTS_TRACKING = 'vts:tracking';
+/** 主进程 push→renderer：VTS 状态变化（连接/授权/错误/模型）。 */
+export const IPC_VTS_STATUS_PUSH = 'vts:statusPush';
+/** invoke renderer→main：让主进程用 Edge TTS 合成一句话（音频经 IPC_TTS_AUDIO 推回）。 */
+export const IPC_TTS_SPEAK = 'pet:tts:speak';
+/** 主进程 push→renderer：一段合成好的语音（data URL，渲染层直接 new Audio 播放）。 */
+export const IPC_TTS_AUDIO = 'pet:tts:audio';
+
+/** VTS 操作名（IPC_VTS_ACTION 的第一个参数）。 */
+export type VtsActionName = 'connect' | 'disconnect' | 'authorize' | 'refresh' | 'trigger-hotkey';
+
+/** VTS 状态快照（设置页展示；不含 token 等敏感内容）。 */
+export interface VtsStatusDto {
+  /** 服务是否在跑（设置里启用 + 已启动） */
+  enabled: boolean;
+  connected: boolean;
+  authenticated: boolean;
+  /** VTS 里当前加载的模型名（未加载/未知时为空串） */
+  modelName: string;
+  modelLoaded: boolean;
+  /** 最近一次失败的可读原因（成功后清空） */
+  lastError: string;
+}
+
+/** VTS 操作结果：ok=false 时 error 可直接展示，status 始终是最新快照。 */
+export interface VtsActionResult {
+  ok: boolean;
+  status: VtsStatusDto | null;
+  /** 成功时的说明（例如「已触发 VTS 热键「开心」」） */
+  message?: string;
+  error?: string;
+}
+
+/**
+ * 一帧追踪值（渲染层 → 主进程）。字段名是**逻辑名**，主进程再翻译成 VTS 的参数名
+ * （见 src/main/vts/vtsClient.ts 的 VTS_TRACKING_PARAMETERS）；只发当前有值的字段。
+ */
+export interface VtsTrackingValues {
+  /** 头部左右转头，度（VTS 范围 -30..30） */
+  faceAngleX?: number;
+  /** 抬头/低头，度（-30..30） */
+  faceAngleY?: number;
+  /** 歪头，度（-90..90） */
+  faceAngleZ?: number;
+  /** 左右眼球，-1..1 */
+  eyeLeftX?: number;
+  eyeLeftY?: number;
+  eyeRightX?: number;
+  eyeRightY?: number;
+  /** 张嘴，0..1 */
+  mouthOpen?: number;
+}
+
+/** 合成语音的 MIME（Edge TTS 输出 mp3） */
+export const TTS_AUDIO_MIME = 'audio/mpeg';
+
+/** 主进程 → 渲染层的 TTS 载荷（ok=false 时 dataUrl 为空、error 有原因）。 */
+export interface TtsAudioPayload {
+  ok: boolean;
+  /** 调用方给的 id，用于把「播放」和「失败」对起来 */
+  requestId: string;
+  /** 原始文本（可用于字幕/日志） */
+  text: string;
+  /** 实际使用的声音短名 */
+  voice: string;
+  mime: typeof TTS_AUDIO_MIME;
+  /** `data:audio/mpeg;base64,...`；ok=false 时为空串 */
+  dataUrl: string;
+  /** mp3 字节数（不是 base64 长度） */
+  bytes: number;
+  /** 合成耗时（ms） */
+  ms: number;
+  /** ok=false 时的可读原因 */
+  error?: string;
+}
+
 /** 待办条目（渲染层可见形态） */
 export interface TodoDto {
   id: number;
@@ -570,6 +659,18 @@ export interface ElectronAPI {
   voiceModels?(): Promise<VoiceModelIndexResult>;
   /** 语音输入：自检（用内置合成音频分别打两条转写路由），设置页「自检」按钮用。 */
   voiceCheck?(): Promise<VoiceCheckResult>;
+  /** VTube Studio（可选后端）：读取连接/授权/模型状态；未接 VTS 时返回 null。 */
+  vtsStatus?(): Promise<VtsStatusDto | null>;
+  /** VTube Studio（可选后端）：连接 / 断开 / 授权 / 刷新 / 按名字触发热键。 */
+  vtsAction?(action: VtsActionName, arg?: string): Promise<VtsActionResult>;
+  /** 把当前视线换算出的追踪参数发给主进程注入 VTS（高频，fire-and-forget）。 */
+  sendVtsTracking?(values: VtsTrackingValues): void;
+  /** 订阅 VTS 状态推送（连接/授权/错误/模型变化）；返回取消订阅函数。 */
+  onVtsStatus?(cb: (status: VtsStatusDto) => void): () => void;
+  /** 让主进程用 Edge TTS 合成一句话；音频经 onTtsAudio 推回来。 */
+  ttsSpeak?(text: string): Promise<{ ok: boolean; error?: string; bytes?: number }>;
+  /** 订阅 TTS 合成结果（渲染层用 new Audio(payload.dataUrl).play() 播放）。 */
+  onTtsAudio?(cb: (payload: TtsAudioPayload) => void): () => void;
   /** 待办笔记本：读取列表（TodoDto[]）。 */
   todoList(): Promise<TodoDto[]>;
   /** 待办笔记本：新增一条，返回最新列表。 */
@@ -756,6 +857,13 @@ export interface AppSettings {
   autoTaskEventCooldownMin?: number;
   /** 自主任务是否允许调用"只读且服务器 autoApprove"的 MCP 工具（默认关闭） */
   autoTaskAllowMcp?: boolean;
+  /**
+   * VTube Studio 可选后端（默认关闭）：把视线/口型同步到本机 VTS 里的模型。
+   * 关闭时完全不连 VTS，桌宠自己的渲染行为不变。
+   */
+  vtsEnabled?: boolean;
+  /** VTS 插件 API 端口（默认 8001，地址固定 127.0.0.1）。 */
+  vtsPort?: number;
   /**
    * 行为触发映射（**按模型分开存**）。
    *

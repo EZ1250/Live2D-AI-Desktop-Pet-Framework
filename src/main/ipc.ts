@@ -55,17 +55,22 @@ import {
   IPC_TODO_GET,
   IPC_TODO_SHOW,
   IPC_TODO_TOGGLE,
+  IPC_TTS_SPEAK,
   IPC_VOICE_CHECK,
   IPC_VOICE_MODELS,
   IPC_VOICE_STATUS,
   IPC_VOICE_TRANSCRIBE,
+  IPC_VTS_ACTION,
+  IPC_VTS_STATUS,
+  IPC_VTS_TRACKING,
 } from '../shared/contracts';
 import type { PetEventType } from '../shared/contracts';
-import type { AiModelListResult, AppSettings, AssetImportResult, AssetKind, AssetPresetResult, AssetScanResult, ChatLogEntry, AutoTaskRound, ChatLogSnapshot, ChatWindowResult, ModelManifest, PluginManifest, VoiceCheckResult, VoiceModelIndexResult, VoiceStatusResult, VoiceTranscribeRequest, VoiceTranscribeResult } from '../shared/contracts';
+import type { AiModelListResult, AppSettings, AssetImportResult, AssetKind, AssetPresetResult, AssetScanResult, ChatLogEntry, AutoTaskRound, ChatLogSnapshot, ChatWindowResult, ModelManifest, PluginManifest, VoiceCheckResult, VoiceModelIndexResult, VoiceStatusResult, VoiceTranscribeRequest, VoiceTranscribeResult, VtsActionName, VtsActionResult, VtsStatusDto } from '../shared/contracts';
 import type { PathResolver } from './PathResolver';
 import { fetchAvailableModels, loadAppSettings, saveAppSettings, TOOL_DEFS } from './ai/chatClient';
 import { checkVoiceRoutes, indexVoiceModels, knownRoute, normalizeVoiceConfig, toBytes, transcribeAudio } from './ai/voice';
 import type { VoiceRoute } from './ai/voice';
+import { speak as speakTts } from './voice/ttsService';
 import {
   listUserModels,
   listUserPlugins,
@@ -144,6 +149,17 @@ export interface IpcDeps {
   onSettingsSaved?: (settings: AppSettings) => void;
   /** 设置面板展开/收起（主进程据此调整窗口层级） */
   onSettingsPanelOpen?: (open: boolean) => void;
+  /**
+   * VTS 状态快照（可选后端）。未接 VTS 时返回 null —— 设置页据此显示"当前版本不可用"，
+   * 所以老版本 main 不实现也安全。
+   */
+  vtsStatus?: () => VtsStatusDto | null;
+  /** VTS 操作（connect/disconnect/authorize/refresh/trigger-hotkey）；错误由 main 侧转成 ok=false。 */
+  vtsAction?: (action: VtsActionName, arg?: string) => Promise<VtsActionResult> | VtsActionResult;
+  /** VTS 追踪注入（renderer→main 高频、fire-and-forget）；未启用时由 main 侧静默丢弃。 */
+  onVtsTracking?: (values: unknown) => void;
+  /** 说话时的口型（0..1）——主进程把 TTS 与 VTS 的张嘴接在一起。 */
+  onVtsMouth?: (value: number) => void;
 }
 
 export interface IpcBridge {
@@ -835,6 +851,75 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
     }
   );
 
+  // ---- VTube Studio（可选后端）---------------------------------------------
+  // 状态：同步快照，不联网；未接 VTS 时返回 null（设置页据此显示"不可用"）
+  ipcMain.handle(IPC_VTS_STATUS, (): VtsStatusDto | null => {
+    try {
+      return deps.vtsStatus?.() ?? null;
+    } catch (err) {
+      console.warn('[ipc] 读取 VTS 状态失败：', err);
+      return null;
+    }
+  });
+
+  // 操作：connect / disconnect / authorize / refresh / trigger-hotkey
+  ipcMain.handle(IPC_VTS_ACTION, async (_event, rawAction: unknown, rawArg: unknown): Promise<VtsActionResult> => {
+    const action = typeof rawAction === 'string' ? rawAction.trim() : '';
+    if (!VTS_ACTIONS.includes(action as VtsActionName)) {
+      return { ok: false, status: safeVtsStatus(deps), error: `未知的 VTS 操作：${action || '(空)'}` };
+    }
+    if (!deps.vtsAction) {
+      return { ok: false, status: safeVtsStatus(deps), error: '主进程未接 VTS 服务' };
+    }
+    const arg = typeof rawArg === 'string' ? rawArg : '';
+    try {
+      return await deps.vtsAction(action as VtsActionName, arg);
+    } catch (err) {
+      return { ok: false, status: safeVtsStatus(deps), error: (err as Error).message ?? String(err) };
+    }
+  });
+
+  // 追踪注入：**高频**（~30fps），必须用 on 且不 await —— 不能让注入拖慢 IPC 队列
+  ipcMain.on(IPC_VTS_TRACKING, (_event, values: unknown): void => {
+    try {
+      deps.onVtsTracking?.(values);
+    } catch (err) {
+      // 注入失败不能反过来影响渲染层（它是 fire-and-forget）
+      console.warn('[ipc] VTS 追踪注入失败：', err);
+    }
+  });
+
+  // ---- Edge TTS：合成后经 IPC_TTS_AUDIO 推回渲染层播放 ----------------------
+  // 合成本身在 ttsService 里（不 import Electron，可离线测试）；这里只负责
+  // 1) 找窗口当推送目标 2) 说话期间给 VTS 注入 MouthOpen（张嘴 → 按音频时长归 0）
+  let ttsMouthTimer: NodeJS.Timeout | null = null;
+  ipcMain.handle(IPC_TTS_SPEAK, async (_event, rawText: unknown): Promise<{ ok: boolean; error?: string; bytes?: number }> => {
+    const text = typeof rawText === 'string' ? rawText.trim() : '';
+    if (!text) return { ok: false, error: '文本为空' };
+    const win = deps.getWindow();
+    const target = win && !win.isDestroyed() && !win.webContents.isDestroyed()
+      ? { send: (channel: string, payload: unknown): void => { win.webContents.send(channel, payload); } }
+      : null;
+    const result = await speakTts(target, text, { logger: (message) => console.warn(message) });
+    if (result.ok) {
+      // 简单口型：开始 0.7，按 mp3 码率（48kbps ≈ 6KB/s）粗估时长后归 0；太短给 400ms、太长封顶 15s
+      const durationMs = Math.min(15_000, Math.max(400, Math.round((result.bytes / 6000) * 1000)));
+      try {
+        deps.onVtsMouth?.(0.7);
+      } catch { /* 注入失败不影响播报 */ }
+      if (ttsMouthTimer) clearTimeout(ttsMouthTimer);
+      ttsMouthTimer = setTimeout(() => {
+        ttsMouthTimer = null;
+        try {
+          deps.onVtsMouth?.(0);
+        } catch { /* ignore */ }
+      }, durationMs);
+      if (typeof ttsMouthTimer.unref === 'function') ttsMouthTimer.unref();
+    }
+    return { ok: result.ok, bytes: result.bytes, ...(result.error ? { error: result.error } : {}) };
+  });
+
+
   ipcMain.handle(IPC_CHAT_WINDOW_OPEN, async (): Promise<ChatWindowResult> => {
     if (!deps.openChatWindow) return { ok: false, error: '主进程未实现聊天窗口' };
     try {
@@ -937,6 +1022,18 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
   };
 
   return { pushToRenderer, readChatHistory: readChatHistoryForPhone };
+}
+
+/** 允许的 VTS 操作名（与 contracts 的 VtsActionName 一一对应；白名单校验防脏字符串） */
+const VTS_ACTIONS: readonly VtsActionName[] = ['connect', 'disconnect', 'authorize', 'refresh', 'trigger-hotkey'];
+
+/** 读 VTS 状态，但绝不让它把 IPC 弄崩（状态只是展示用） */
+function safeVtsStatus(deps: IpcDeps): VtsStatusDto | null {
+  try {
+    return deps.vtsStatus?.() ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function sanitizeSettings(raw: unknown): AppSettings | null {
@@ -1179,6 +1276,16 @@ function sanitizeSettings(raw: unknown): AppSettings | null {
   if (input.autoTaskAllowMcp !== undefined) {
     if (typeof input.autoTaskAllowMcp !== 'boolean') return null;
     settings.autoTaskAllowMcp = input.autoTaskAllowMcp;
+  }
+  // VTube Studio 可选后端：开关布尔 + 端口 1..65535（默认 8001）
+  if (input.vtsEnabled !== undefined) {
+    if (typeof input.vtsEnabled !== 'boolean') return null;
+    settings.vtsEnabled = input.vtsEnabled;
+  }
+  if (input.vtsPort !== undefined) {
+    const port = input.vtsPort;
+    if (typeof port !== 'number' || !Number.isFinite(port) || port < 1 || port > 65535) return null;
+    settings.vtsPort = Math.round(port);
   }
   return settings;
 }

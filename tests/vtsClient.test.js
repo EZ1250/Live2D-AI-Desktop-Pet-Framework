@@ -8,6 +8,8 @@
  *   - 请求超时（服务端不回）
  *   - APIError 转 Error
  *   - 断线清理 pending
+ *   - 热键列表/按名字触发（含 VTS 1.35 真实消息类型与回退）
+ *   - 追踪参数映射（逻辑字段 → FaceAngleX/EyeLeftX/MouthOpen …）
  */
 'use strict';
 
@@ -18,7 +20,16 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { createMockVtsServer } = require('./helpers/mockVtsServer');
-const { VtsClient, VtsApiError, normalizeParameterValues } = require('../dist/main/vts/vtsClient');
+const {
+  VtsClient,
+  VtsApiError,
+  normalizeParameterValues,
+  normalizeTrackingValues,
+  trackingToParameterValues,
+  parseHotkeyList,
+  VTS_TRACKING_PARAMETERS,
+  VTS_TRACKING_FIELDS,
+} = require('../dist/main/vts/vtsClient');
 
 const silent = () => {};
 
@@ -294,4 +305,253 @@ test('构造参数校验：url 必须是 ws:// 或 wss://', () => {
   const client = new VtsClient();
   assert.equal(client.url, 'ws://127.0.0.1:8001');
   assert.equal(client.clientName, 'Pet');
+});
+
+/* ==========================================================================
+ * 热键（列表 / 按名字触发）
+ * ========================================================================== */
+
+/** 假的热键列表响应（VTS 1.35 实测字段：availableHotkeys[{name,hotkeyID,type}]） */
+function hotkeyListEnvelope(message, hotkeys) {
+  return envelope(message, 'HotkeysInCurrentModelResponse', {
+    modelLoaded: true,
+    modelName: 'mock-model',
+    availableHotkeys: hotkeys,
+  });
+}
+
+const MOCK_HOTKEYS = [
+  { name: 'My Animation 1', type: 'TriggerAnimation', hotkeyID: 'e5d3e7ef6a944c17b3ce58d3066fcd2b', file: 'm03.motion3.json' },
+  { name: '开心', type: 'ToggleExpression', hotkeyID: '2932bbd33d1b44fb9d947439fac75874' },
+];
+
+test('listHotkeys：用 HotkeysInCurrentModelRequest 解析出 {name, hotkeyID, type}', async (t) => {
+  const server = await createMockVtsServer((message) => {
+    if (message.messageType === 'HotkeysInCurrentModelRequest') return hotkeyListEnvelope(message, MOCK_HOTKEYS);
+    return envelope(message, 'APIError', { errorID: 7, message: `Unknown messageType: ${message.messageType}` });
+  });
+  const client = new VtsClient({ url: server.url, logger: silent });
+  t.after(async () => { client.disconnect(); await server.close(); });
+  await client.connect();
+
+  const hotkeys = await client.listHotkeys();
+  assert.equal(hotkeys.length, 2);
+  assert.deepEqual(
+    hotkeys.map((h) => ({ name: h.name, hotkeyID: h.hotkeyID, type: h.type })),
+    [
+      { name: 'My Animation 1', hotkeyID: 'e5d3e7ef6a944c17b3ce58d3066fcd2b', type: 'TriggerAnimation' },
+      { name: '开心', hotkeyID: '2932bbd33d1b44fb9d947439fac75874', type: 'ToggleExpression' },
+    ],
+  );
+  // 实测的官方消息类型排在第一个；不该发用户原始要求里的 HotkeyListRequest（VTS 不认识）
+  const types = server.requests.map((r) => r.messageType);
+  assert.deepEqual(types, ['HotkeysInCurrentModelRequest']);
+});
+
+test('listHotkeys：服务端只认 HotkeyListRequest 时自动回退（兼容将来改名）', async (t) => {
+  const server = await createMockVtsServer((message) => {
+    if (message.messageType === 'HotkeyListRequest') {
+      // 老/新版本的字段名也要能吃（hotkeys 而非 availableHotkeys）
+      return envelope(message, 'HotkeyListResponse', { hotkeys: MOCK_HOTKEYS, hotkeyCount: 2 });
+    }
+    return envelope(message, 'APIError', { errorID: 7, message: `Unknown messageType: ${message.messageType}` });
+  });
+  const client = new VtsClient({ url: server.url, logger: silent });
+  t.after(async () => { client.disconnect(); await server.close(); });
+  await client.connect();
+
+  const hotkeys = await client.listHotkeys();
+  assert.equal(hotkeys.length, 2);
+  assert.equal(hotkeys[1].name, '开心');
+  assert.deepEqual(
+    server.requests.map((r) => r.messageType),
+    ['HotkeysInCurrentModelRequest', 'HotkeyListRequest'],
+    '第一个类型不被支持时才换第二个',
+  );
+});
+
+test('listHotkeys：非"未知消息类型"的错误直接抛出（不做无意义的回退）', async (t) => {
+  const server = await createMockVtsServer((message) => envelope(message, 'APIError', {
+    errorID: 301,
+    message: '插件未获得授权',
+  }));
+  const client = new VtsClient({ url: server.url, logger: silent });
+  t.after(async () => { client.disconnect(); await server.close(); });
+  await client.connect();
+
+  await assert.rejects(() => client.listHotkeys(), /插件未获得授权/);
+  assert.equal(server.requests.length, 1, '不该为了回退再发一条');
+});
+
+test('triggerHotkeyByName：按名字找到 hotkeyID 后触发；大小写不敏感', async (t) => {
+  const server = await createMockVtsServer((message) => {
+    if (message.messageType === 'HotkeysInCurrentModelRequest') return hotkeyListEnvelope(message, MOCK_HOTKEYS);
+    if (message.messageType === 'HotkeyTriggerRequest') {
+      return envelope(message, 'HotkeyTriggerResponse', { hotkeyID: message.data.hotkeyID });
+    }
+    return envelope(message, 'APIError', { errorID: 7, message: `Unknown messageType: ${message.messageType}` });
+  });
+  const client = new VtsClient({ url: server.url, logger: silent });
+  t.after(async () => { client.disconnect(); await server.close(); });
+  await client.connect();
+
+  await client.triggerHotkeyByName('My Animation 1');
+  const triggers = server.requests.filter((r) => r.messageType === 'HotkeyTriggerRequest');
+  assert.equal(triggers.length, 1);
+  assert.equal(triggers[0].data.hotkeyID, 'e5d3e7ef6a944c17b3ce58d3066fcd2b');
+
+  await client.triggerHotkeyByName('my animation 1'); // 大小写不同也该命中
+  assert.equal(server.requests.filter((r) => r.messageType === 'HotkeyTriggerRequest').length, 2);
+
+  await client.triggerHotkeyByName('开心'); // 中文名原样匹配
+  const last = server.requests.filter((r) => r.messageType === 'HotkeyTriggerRequest').at(-1);
+  assert.equal(last.data.hotkeyID, '2932bbd33d1b44fb9d947439fac75874');
+});
+
+test('triggerHotkeyByName：名字找不到时报明确错误并列出可用热键，且不会发触发请求', async (t) => {
+  const server = await createMockVtsServer((message) => {
+    if (message.messageType === 'HotkeysInCurrentModelRequest') return hotkeyListEnvelope(message, MOCK_HOTKEYS);
+    return envelope(message, 'HotkeyTriggerResponse', {});
+  });
+  const client = new VtsClient({ url: server.url, logger: silent });
+  t.after(async () => { client.disconnect(); await server.close(); });
+  await client.connect();
+
+  await assert.rejects(
+    () => client.triggerHotkeyByName('不存在的热键'),
+    (err) => {
+      assert.match(err.message, /没有「不存在的热键」/);
+      assert.match(err.message, /My Animation 1/); // 要告诉用户有哪些
+      assert.match(err.message, /开心/);
+      return true;
+    },
+  );
+  assert.equal(server.requests.filter((r) => r.messageType === 'HotkeyTriggerRequest').length, 0);
+});
+
+test('triggerHotkeyByName：空名字/没有热键都给出可读的错误', async (t) => {
+  const emptyServer = await createMockVtsServer((message) => hotkeyListEnvelope(message, []));
+  const emptyClient = new VtsClient({ url: emptyServer.url, logger: silent });
+  t.after(async () => { emptyClient.disconnect(); await emptyServer.close(); });
+  await emptyClient.connect();
+
+  await assert.rejects(() => emptyClient.triggerHotkeyByName('  '), /非空的热键名/);
+  await assert.rejects(() => emptyClient.triggerHotkeyByName('任意'), /没有热键/);
+});
+
+test('parseHotkeyList：脏数据被丢掉，字段缺失用空串兜底', () => {
+  assert.deepEqual(parseHotkeyList(null), []);
+  assert.deepEqual(parseHotkeyList({}), []);
+  const list = parseHotkeyList({
+    availableHotkeys: [
+      { name: 'ok', hotkeyID: 'abc' }, // 没有 type
+      { name: '   ', hotkeyID: 'def' }, // 名字空 → 丢
+      { name: 'no-id' }, // 没有 hotkeyID → 丢
+      null,
+      'x',
+      { name: ' spaced ', hotkeyID: ' ghi ' },
+    ],
+  });
+  assert.deepEqual(list.map((h) => [h.name, h.hotkeyID, h.type]), [['ok', 'abc', ''], ['spaced', 'ghi', '']]);
+});
+
+/* ==========================================================================
+ * 追踪参数（VTS 只能注入 FaceAngleX / EyeLeftX / MouthOpen 这一套）
+ * ========================================================================== */
+
+test('追踪参数字段常量：逻辑名 → VTS 实际追踪参数名', () => {
+  assert.deepEqual(
+    { ...VTS_TRACKING_PARAMETERS },
+    {
+      faceAngleX: 'FaceAngleX',
+      faceAngleY: 'FaceAngleY',
+      faceAngleZ: 'FaceAngleZ',
+      eyeLeftX: 'EyeLeftX',
+      eyeLeftY: 'EyeLeftY',
+      eyeRightX: 'EyeRightX',
+      eyeRightY: 'EyeRightY',
+      mouthOpen: 'MouthOpen',
+    },
+  );
+  assert.deepEqual([...VTS_TRACKING_FIELDS], [
+    'faceAngleX', 'faceAngleY', 'faceAngleZ',
+    'eyeLeftX', 'eyeLeftY', 'eyeRightX', 'eyeRightY',
+    'mouthOpen',
+  ]);
+});
+
+test('normalizeTrackingValues：只留已知字段的有限数字，并按 VTS 区间夹取', () => {
+  assert.deepEqual(normalizeTrackingValues(null), {});
+  assert.deepEqual(normalizeTrackingValues('x'), {});
+  assert.deepEqual(
+    normalizeTrackingValues({
+      faceAngleX: 15,
+      mouthOpen: 2,        // 越界 → 夹到 1
+      eyeLeftX: -3,        // 越界 → 夹到 -1
+      faceAngleZ: -120,    // 越界 → 夹到 -90
+      ParamAngleX: 5,      // 不是追踪字段 → 丢
+      eyeRightY: Number.NaN, // 非有限 → 丢
+      eyeLeftY: '0.5',     // 字符串 → 丢
+    }),
+    { faceAngleX: 15, faceAngleZ: -90, eyeLeftX: -1, mouthOpen: 1 },
+  );
+});
+
+test('trackingToParameterValues：只生成传进来的字段（默认不注入未传的）', () => {
+  assert.deepEqual(trackingToParameterValues({}), []);
+  assert.deepEqual(trackingToParameterValues({ faceAngleX: 15 }), [{ id: 'FaceAngleX', value: 15 }]);
+  assert.deepEqual(
+    trackingToParameterValues({ eyeLeftX: 0.6, eyeLeftY: -0.3, eyeRightX: 0.6, eyeRightY: -0.3, mouthOpen: 0.7 }),
+    [
+      { id: 'EyeLeftX', value: 0.6 },
+      { id: 'EyeLeftY', value: -0.3 },
+      { id: 'EyeRightX', value: 0.6 },
+      { id: 'EyeRightY', value: -0.3 },
+      { id: 'MouthOpen', value: 0.7 },
+    ],
+  );
+});
+
+test('injectTracking：把追踪值发成 InjectParameterDataRequest（参数名是追踪参数，不是模型参数）', async (t) => {
+  const server = await createMockVtsServer((message) => envelope(message, 'InjectParameterDataResponse', {}));
+  const client = new VtsClient({ url: server.url, logger: silent });
+  t.after(async () => { client.disconnect(); await server.close(); });
+  await client.connect();
+
+  await client.injectTracking({ faceAngleX: 15, faceAngleY: -8 });
+  const first = server.requests.filter((r) => r.messageType === 'InjectParameterDataRequest')[0];
+  assert.deepEqual(first.data, {
+    faceFound: true,
+    mode: 'set',
+    parameterValues: [{ id: 'FaceAngleX', value: 15 }, { id: 'FaceAngleY', value: -8 }],
+  });
+
+  // 空 / 全未知字段：在发请求之前就抛错（不能把空数组甩给 VTS）
+  await assert.rejects(() => client.injectTracking({}), /至少需要一个追踪字段/);
+  await assert.rejects(() => client.injectTracking({ ParamAngleX: 1 }), /至少需要一个追踪字段/);
+  assert.equal(server.requests.filter((r) => r.messageType === 'InjectParameterDataRequest').length, 1);
+});
+
+test('authenticate({cachedOnly:true})：没有缓存 token 时直接失败，绝不弹授权窗', async (t) => {
+  const tokenFile = tempTokenPath();
+  const server = await createMockVtsServer(createAuthHandler('tok-should-not-be-requested'));
+  t.after(async () => { await server.close(); tokenFile.cleanup(); });
+  const client = new VtsClient({ url: server.url, tokenStorePath: tokenFile.file, logger: silent });
+  t.after(() => client.disconnect());
+  await client.connect();
+
+  assert.equal(client.hasCachedToken(), false);
+  await assert.rejects(() => client.authenticate({ cachedOnly: true }), /没有可用的 VTS token/);
+  assert.equal(
+    server.requests.filter((r) => r.messageType === 'AuthenticationTokenRequest').length,
+    0,
+    '启动阶段不应该触发 VTS 授权弹窗',
+  );
+
+  // 有 token 时走缓存认证（不弹窗）
+  fs.mkdirSync(path.dirname(tokenFile.file), { recursive: true });
+  fs.writeFileSync(tokenFile.file, JSON.stringify({ version: 1, token: 'tok-cached', url: server.url, pluginName: 'Pet', savedAt: new Date().toISOString() }));
+  assert.equal(client.hasCachedToken(), true);
+  assert.deepEqual(await client.authenticate({ cachedOnly: true }), { authenticated: true, cachedToken: true });
+  assert.equal(server.requests.filter((r) => r.messageType === 'AuthenticationTokenRequest').length, 0);
 });

@@ -68,11 +68,17 @@ import {
   IPC_TODO_GET,
   IPC_TODO_SHOW,
   IPC_TODO_TOGGLE,
+  IPC_TTS_AUDIO,
+  IPC_TTS_SPEAK,
   IPC_UI_BUBBLE,
   IPC_VOICE_CHECK,
   IPC_VOICE_MODELS,
   IPC_VOICE_STATUS,
   IPC_VOICE_TRANSCRIBE,
+  IPC_VTS_ACTION,
+  IPC_VTS_STATUS,
+  IPC_VTS_STATUS_PUSH,
+  IPC_VTS_TRACKING,
   IPC_WINDOW_DRAG,
   IPC_WINDOW_DRAG_END,
 } from '../shared/contracts';
@@ -86,11 +92,16 @@ import type {
   ChatLogSnapshot,
   ChatWindowResult,
   TodoDto,
+  TtsAudioPayload,
   VoiceCheckResult,
   VoiceModelIndexResult,
   VoiceStatusResult,
   VoiceTranscribeRequest,
   VoiceTranscribeResult,
+  VtsActionName,
+  VtsActionResult,
+  VtsStatusDto,
+  VtsTrackingValues,
   WindowInfo,
 } from '../shared/contracts';
 
@@ -319,6 +330,41 @@ const api: ElectronAPI = {
   /** 语音自检：用内置合成音频分别打两条转写路由，返回逐条报告（设置页「自检」按钮用）。 */
   voiceCheck(): Promise<VoiceCheckResult> {
     return ipcRenderer.invoke(IPC_VOICE_CHECK);
+  },
+
+  /* ---- VTube Studio（可选后端）---- */
+
+  /** 读取 VTS 连接/授权/模型状态（未接 VTS 时主进程返回 null）。 */
+  vtsStatus(): Promise<VtsStatusDto | null> {
+    return ipcRenderer.invoke(IPC_VTS_STATUS);
+  },
+
+  /** VTS 操作：connect / disconnect / authorize / refresh / trigger-hotkey（arg=热键名）。 */
+  vtsAction(action: VtsActionName, arg?: string): Promise<VtsActionResult> {
+    return ipcRenderer.invoke(IPC_VTS_ACTION, action, arg ?? '');
+  },
+
+  /** 把当前视线换算出的追踪参数发给主进程注入 VTS（高频，无回执）。 */
+  sendVtsTracking(values: VtsTrackingValues): void {
+    if (!values || typeof values !== 'object') return;
+    ipcRenderer.send(IPC_VTS_TRACKING, values);
+  },
+
+  /** 订阅 VTS 状态推送（连接/授权/错误/模型变化）。 */
+  onVtsStatus(cb: (status: VtsStatusDto) => void): () => void {
+    return subscribeChannel<VtsStatusDto>(IPC_VTS_STATUS_PUSH, cb);
+  },
+
+  /* ---- Edge TTS 播放 ---- */
+
+  /** 让主进程合成一句话；音频经 onTtsAudio 推回来（失败时 ok=false + error）。 */
+  ttsSpeak(text: string): Promise<{ ok: boolean; error?: string; bytes?: number }> {
+    return ipcRenderer.invoke(IPC_TTS_SPEAK, text);
+  },
+
+  /** 订阅 TTS 合成结果：渲染层用 new Audio(payload.dataUrl).play() 播放。 */
+  onTtsAudio(cb: (payload: TtsAudioPayload) => void): () => void {
+    return subscribeChannel<TtsAudioPayload>(IPC_TTS_AUDIO, cb);
   },
 
   /** 聊天记录：读取快照（当前会话记录 + 会话摘要）。 */

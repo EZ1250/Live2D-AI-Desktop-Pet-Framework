@@ -261,6 +261,13 @@ export function loadAppSettings(): AppSettings {
       autoTaskEventMatch: (str('autoTaskEventMatch') ?? '').slice(0, 80),
       autoTaskEventCooldownMin: Math.round(Math.min(120, Math.max(5, num(15, 'autoTaskEventCooldownMin')))),
       autoTaskAllowMcp: bool(false, 'autoTaskAllowMcp'),
+      // VTube Studio 可选后端：开关 + 端口。**必须在这里读回来**，否则"设置里勾了启用、
+      // 重启又不连"（写入侧支持、读取侧漏了 —— 这个坑本项目踩过好几次，见上面的注释）。
+      vtsEnabled: bool(false, 'vtsEnabled'),
+      vtsPort: ((): number => {
+        const p = num(8001, 'vtsPort');
+        return Number.isInteger(p) && p >= 1 && p <= 65535 ? p : 8001;
+      })(),
     };
   } catch (err) {
     console.warn('[chatClient] settings.json 解析失败，回退环境变量：', (err as Error).message);

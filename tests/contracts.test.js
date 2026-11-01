@@ -109,3 +109,69 @@ test('语音状态条：标记、绝对定位、以及跨进程一致的高度',
   assert.ok(cssH && mainH, '两边都应显式声明状态条高度');
   assert.equal(cssH[1], mainH[1], `状态条高度必须一致：CSS=${cssH[1]}px，主进程=${mainH[1]}px`);
 });
+
+/**
+ * VTube Studio（可选后端）：契约 / preload / 主进程 / 渲染层四处必须同步。
+ * 高频追踪通道漏接的表现最隐蔽：设置里"看起来开了"，但 VTS 里的模型一动不动。
+ */
+test('VTS IPC：契约、preload、主进程、渲染层四处都接上了', () => {
+  assert.equal(contracts.IPC_VTS_STATUS, 'vts:status');
+  assert.equal(contracts.IPC_VTS_ACTION, 'vts:action');
+  assert.equal(contracts.IPC_VTS_TRACKING, 'vts:tracking');
+  assert.equal(contracts.IPC_VTS_STATUS_PUSH, 'vts:statusPush');
+
+  // 通道名：契约 → preload → 主进程
+  for (const name of ['IPC_VTS_STATUS', 'IPC_VTS_ACTION', 'IPC_VTS_TRACKING']) {
+    for (const file of ['src/shared/contracts.ts', 'src/preload/preload.ts', 'src/main/ipc.ts']) {
+      assert.ok(readSrc(file).includes(name), `${file} 应当引用 ${name}`);
+    }
+  }
+  // 高频追踪必须是 ipcMain.on（不能 await），否则 30fps 注入会堵住 IPC 队列
+  const ipc = readSrc('src/main/ipc.ts');
+  assert.ok(/ipcMain\.on\(\s*IPC_VTS_TRACKING/.test(ipc), 'ipc.ts 应使用 ipcMain.on 接收高频追踪');
+
+  // 渲染层调用面：preload 暴露 + renderer 调用
+  for (const method of ['vtsStatus', 'vtsAction', 'sendVtsTracking', 'onVtsStatus']) {
+    for (const file of ['src/shared/contracts.ts', 'src/preload/preload.ts']) {
+      assert.ok(readSrc(file).includes(method), `${file} 应当提供 ${method}`);
+    }
+  }
+  const renderer = readSrc('src/renderer/renderer.ts');
+  for (const method of ['sendVtsTracking', 'vtsAction', 'vtsStatus']) {
+    assert.ok(renderer.includes(method), `renderer.ts 应当调用 ${method}`);
+  }
+  // 设置页要真有这些控件（否则代码接好了、用户点不到）
+  const html = readSrc('src/renderer/index.html');
+  for (const id of ['setting-vts-enabled', 'setting-vts-port', 'setting-vts-connect', 'setting-vts-authorize', 'setting-vts-status']) {
+    assert.ok(html.includes(`id="${id}"`), `index.html 应包含 #${id}`);
+  }
+
+  // 主进程：ipc.ts 声明依赖 → mainImpl 注入并实现（未接 VTS 时也要能安全降级）
+  assert.ok(ipc.includes('vtsStatus?:'), 'ipc.ts 应声明 vtsStatus 依赖');
+  assert.ok(ipc.includes('vtsAction?:'), 'ipc.ts 应声明 vtsAction 依赖');
+  assert.ok(ipc.includes('onVtsTracking?:'), 'ipc.ts 应声明 onVtsTracking 依赖');
+  const main = readSrc('src/main/mainImpl.js');
+  for (const piece of ['vtsStatus:', 'vtsAction:', 'onVtsTracking:', 'VtsService', 'applyVtsSettings']) {
+    assert.ok(main.includes(piece), `mainImpl.js 应包含 ${piece}`);
+  }
+});
+
+/** TTS 播放：主进程合成（pet:tts:speak）→ 渲染层 new Audio 播放（pet:tts:audio） */
+test('Edge TTS 播放接线：speak handler + 渲染层播放 + 说话时 VTS 张嘴', () => {
+  assert.equal(contracts.IPC_TTS_SPEAK, 'pet:tts:speak');
+  assert.equal(contracts.IPC_TTS_AUDIO, 'pet:tts:audio');
+  assert.equal(contracts.TTS_AUDIO_MIME, 'audio/mpeg');
+  for (const file of ['src/shared/contracts.ts', 'src/preload/preload.ts', 'src/main/ipc.ts']) {
+    assert.ok(readSrc(file).includes('IPC_TTS_SPEAK'), `${file} 应当引用 IPC_TTS_SPEAK`);
+    assert.ok(readSrc(file).includes('IPC_TTS_AUDIO'), `${file} 应当引用 IPC_TTS_AUDIO`);
+  }
+  assert.ok(/ipcMain\.handle\(\s*IPC_TTS_SPEAK/.test(readSrc('src/main/ipc.ts')), 'ipc.ts 应注册 speak handler');
+  const renderer = readSrc('src/renderer/renderer.ts');
+  assert.ok(renderer.includes('new Audio('), '渲染层应真的用 new Audio(...) 播放');
+  assert.ok(renderer.includes('onTtsAudio'), '渲染层应订阅 onTtsAudio');
+  assert.ok(readSrc('src/main/ipc.ts').includes('onVtsMouth'), '说话时应向 VTS 注入 MouthOpen');
+  assert.ok(
+    readSrc('src/main/mainImpl.js').includes("appendSwitch('autoplay-policy'"),
+    '主进程应在 app ready 前放宽自动播放策略（否则渲染层没有用户手势时 play() 被拒）',
+  );
+});
