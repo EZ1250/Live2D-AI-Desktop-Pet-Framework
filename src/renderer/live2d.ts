@@ -431,6 +431,56 @@
       const json = (await res.json()) as Any;
       if (!json || typeof json !== 'object' || Array.isArray(json)) throw new Error('顶层不是对象');
       json.url = url; // 运行库要求：设置对象必须带 url，用来解析贴图/动作的相对路径
+
+      // VTube Studio hotkeys merge (Exp3/Animation -> Motions/Expressions), otherwise model menu is empty
+      try {
+        const slash = url.lastIndexOf('/');
+        const base = slash >= 0 ? url.slice(0, slash) : '';
+        const vtubeUrl = url.replace(/\.model3\.json$/i, '.vtube.json');
+        const vres = await fetch(vtubeUrl, { cache: 'no-cache' });
+        if (vres.ok) {
+          const vjson = (await vres.json()) as Any;
+          const hotkeys = Array.isArray(vjson.Hotkeys) ? vjson.Hotkeys : [];
+          const enc = (rel: string): string => rel.split('/').map((x) => encodeURIComponent(x)).join('/');
+          const exists = async (rel: string): Promise<boolean> => {
+            try {
+              const r = await fetch(base + '/' + enc(rel), { method: 'GET', cache: 'no-cache' });
+              return r.ok;
+            } catch {
+              return false;
+            }
+          };
+          const pick = async (file: string, dirs: string[]): Promise<string | null> => {
+            for (const dir of dirs) {
+              const rel = dir ? dir + '/' + file : file;
+              if (await exists(rel)) return enc(rel);
+            }
+            return null;
+          };
+          const refs = (json.FileReferences = json.FileReferences && typeof json.FileReferences === 'object' ? json.FileReferences : {});
+          const expressions: Any[] = Array.isArray(refs.Expressions) ? refs.Expressions : [];
+          const motions: Record<string, Any[]> = refs.Motions && typeof refs.Motions === 'object' && !Array.isArray(refs.Motions) ? refs.Motions : {};
+          const hotkeyMotions: Any[] = [];
+          for (const h of hotkeys) {
+            const file = h && typeof h.File === 'string' ? h.File : '';
+            if (!file) continue;
+            if (h.Action === 'ToggleExpression') {
+              const p = await pick(file, ['Exp3', 'Expressions', '']);
+              if (p) expressions.push({ Name: String(h.Name || file).replace(/\.exp3\.json$/i, ''), File: p });
+            } else if (h.Action === 'TriggerAnimation') {
+              const p = await pick(file, ['Animation', 'Motions', '']);
+              if (p) hotkeyMotions.push({ File: p });
+            }
+          }
+          const idle = await pick('IDLE.motion3.json', ['Animation', 'Motions', '']);
+          if (idle && !Array.isArray(motions.Idle)) motions.Idle = [{ File: idle }];
+          if (hotkeyMotions.length) motions.Hotkey = hotkeyMotions;
+          refs.Expressions = expressions;
+          refs.Motions = motions;
+        }
+      } catch (err) {
+        console.warn('[live2d] VTube hotkeys merge failed, keep original model3.json', err);
+      }
       if (!Array.isArray(json.HitAreas)) json.HitAreas = [];
       if (json.Groups !== undefined && !Array.isArray(json.Groups)) json.Groups = [];
       const refs = json.FileReferences;
