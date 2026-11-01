@@ -770,10 +770,13 @@ function trySdkFocus(clientX: number, clientY: number): boolean {
 }
 
 function updateGazeFromPointer(clientX: number, clientY: number): void {
-  const cx = window.innerWidth / 2 || 0.5;
-  const cy = window.innerHeight / 2 || 0.5;
-  gazeNX = Math.max(-1, Math.min(1, (clientX - cx) / cx));
-  gazeNY = Math.max(-1, Math.min(1, (cy - clientY) / cy)); // 屏幕下方 → 负（低头）
+  const vw = window.innerWidth || 1;
+  const vh = window.innerHeight || 1;
+  // Half framing: gaze origin at the neck (head lives in the upper part of the window).
+  const cx = vw / 2;
+  const cy = currentFraming === 'half' ? vh * 0.38 : vh / 2;
+  gazeNX = Math.max(-1, Math.min(1, (clientX - cx) / (vw / 2)));
+  gazeNY = Math.max(-1, Math.min(1, (cy - clientY) / (vh / 2))); // screen down -> negative (look down)
   lastGazeMoveAt = performance.now();
   sdkTargetX = clientX;
   sdkTargetY = clientY;
@@ -785,8 +788,9 @@ function updateGazeFromPointer(clientX: number, clientY: number): void {
 function updateGazeFromGlobal(screenX: number, screenY: number): void {
   const w = window.innerWidth || 1;
   const h = window.innerHeight || 1;
-  const cx = window.screenX + w / 2; // 宠物窗口中心的屏幕坐标（DIP）
-  const cy = window.screenY + h / 2;
+  const oy = currentFraming === 'half' ? h * 0.38 : h / 2; // neck origin in half framing
+  const cx = window.screenX + w / 2;
+  const cy = window.screenY + oy;
   // 分母含 220px 软区：鼠标在窗口附近时视线按比例细腻跟动，远离则平滑趋于极限
   // 窗口外光标相对坐标可能到 -2/3，不能 clamp 到 [-1,1]（否则视线卡在边缘）；tanh 平滑饱和
   const scaleX = w / 2 + 220;
@@ -796,7 +800,7 @@ function updateGazeFromGlobal(screenX: number, screenY: number): void {
   lastGazeMoveAt = performance.now();
   // 喂给 SDK：画布局部坐标（可超出画布），方向交给 SDK 内部换算 → 窗口外也能生效
   sdkTargetX = w / 2 + gazeNX * (w / 2);
-  sdkTargetY = h / 2 - gazeNY * (h / 2);
+  sdkTargetY = (currentFraming === 'half' ? h * 0.38 : h / 2) - gazeNY * (h / 2);
   sdkIdleReset = false;
   // 不在这里直接 focus：交给 driveGaze 每帧插值，避免低频输入一卡一卡
   if (!sdkFocusActive) trySdkFocus(sdkTargetX, sdkTargetY);
