@@ -50,6 +50,8 @@
     setGaze?(nx: number, ny: number): void;
     /** 该模型半身取景的视线原点（窗口高度比例，0..1）；null=用默认脖颈 0.38 */
     gazeOriginRatio?(): number | null;
+    /** 调试：直接写模型参数并返回读回值（验证某参数是否驱动网格） */
+    debugSetParam?(id: string, value: number): number | null;
     /** 喂给 SDK 内置 FocusController 的指针坐标（画布局部坐标，可在窗口外）；成功返回 true */
     focusAt?(clientX: number, clientY: number): boolean;
     /** 让 SDK 内置视线回正（静止超时兜底）；成功返回 true */
@@ -1254,6 +1256,9 @@
           baseParams.set(id, value);
           setParam(id, value);
         };
+        let bodyBeforeUpdate: { x: number | null; y: number | null; z: number | null } = { x: null, y: null, z: null };
+        let bodyAfterUpdate: { x: number | null; y: number | null; z: number | null } = { x: null, y: null, z: null };
+        let bodyAfterDrive: { x: number | null; y: number | null; z: number | null } = { x: null, y: null, z: null };
         const mixer = new ParamMixer();
         let lastFrameSource = 'none';
         let lastFrameAt = 0;
@@ -1334,6 +1339,10 @@
           gazeOriginRatio(): number | null {
             return activeGazeOriginRatio;
           },
+          debugSetParam(id: string, value: number): number | null {
+            setParam(id, Number(value));
+            return readParam(id);
+          },
           /** 交给 SDK 内置 FocusController：画布局部坐标（可超出画布=窗口外），方向由 SDK 换算 */
           focusAt(clientX: number, clientY: number): boolean {
             try {
@@ -1405,7 +1414,7 @@
               current: { x: Math.round(gazeCX * 1000) / 1000, y: Math.round(gazeCY * 1000) / 1000 },
               head: { x: Math.round(headCX * 1000) / 1000, y: Math.round(headCY * 1000) / 1000 },
               body: {
-                target: { x: Math.round(headCX * 0.8 * 1000) / 1000, y: Math.round(headCY * 0.8 * 1000) / 1000 },
+                target: { x: Math.round(headCX * 0.55 * 1000) / 1000, y: Math.round(headCY * 0.55 * 1000) / 1000 },
                 params: {
                   bodyX: readParam(paramIds.bodyX),
                   bodyY: readParam(paramIds.bodyY),
@@ -1418,6 +1427,11 @@
                 angleY: readParam(paramIds.angleY),
                 eyeballX: readParam(paramIds.eyeBallX),
                 eyeballY: readParam(paramIds.eyeBallY),
+              },
+              physicsProbe: {
+                beforeUpdate: bodyBeforeUpdate,
+                afterUpdate: bodyAfterUpdate,
+                afterDrive: bodyAfterDrive,
               },
             };
           },
@@ -1721,7 +1735,17 @@
               }
               // 身体摆动·第二层预案：模型没有身体参数时，靠整体倾斜补偿，保证"一定在动"
               if (!bodyTrackOK) model.rotation = (swayDeg * Math.PI) / 180;
+              bodyBeforeUpdate = {
+                x: readParam(paramIds.bodyX),
+                y: readParam(paramIds.bodyY),
+                z: readParam(paramIds.bodyZ),
+              };
               if (typeof model.update === 'function') model.update(deltaSec * 1000);
+              bodyAfterUpdate = {
+                x: readParam(paramIds.bodyX),
+                y: readParam(paramIds.bodyY),
+                z: readParam(paramIds.bodyZ),
+              };
 
               // —— 视线跟踪（moc3，明显跟随）：写在 model.update 之后（避免被 Idle 动作帧覆盖）；
               //    眼球快（k≈dt*12）、头部慢（dt*4 独立滞后）→ 眼先头后的自然延迟 ——
@@ -1762,6 +1786,11 @@
               if (breathParamOK) {
                 setBaseParam(paramIds.breath, (Math.sin(nowSec * 1.22 + phase * 2.1) * 0.5 + 0.5) * 0.8 + 0.1);
               }
+              bodyAfterDrive = {
+                x: readParam(paramIds.bodyX),
+                y: readParam(paramIds.bodyY),
+                z: readParam(paramIds.bodyZ),
+              };
               // 内容锚点标定（每个模型只跑一次；状态机见 calibPhase 的注释）
               if (calibPhase !== 'done' && renderedThisFrame && !maskRefreshQueued) {
                 const measured = measureContentFromMask();

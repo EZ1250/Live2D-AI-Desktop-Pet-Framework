@@ -58,6 +58,7 @@ interface RenderHandle {
   /** 视线目标 nx/ny ∈[-1,1]，向右/向上为正；0 = 归位 */
   setGaze?(nx: number, ny: number): void;
   gazeOriginRatio?(): number | null;
+  debugSetParam?(id: string, value: number): number | null;
   /** SDK 内置 FocusController 指针喂入（画布局部坐标，可窗口外） */
   focusAt?(clientX: number, clientY: number): boolean;
   /** SDK 视线回正 */
@@ -5300,6 +5301,9 @@ function installDebugHooks(bridge: RendererBridge): void {
     tracking: () => currentTrackingApi?.state() ?? null,
     /** 视线驱动模式自查：sdkFocusActive=true 表示当前由 SDK focus 驱动，false=项目代码管线兜底 */
     gazeMode: () => ({ sdkFocusActive, globalCursorPushes, sdkFocusFailures }),
+    /** 调试：直接写模型参数，验证该参数是否真的驱动网格 */
+    setParam: (id: string, value: number) =>
+      currentHandle && typeof currentHandle.debugSetParam === 'function' ? currentHandle.debugSetParam(id, value) : null,
     pushTracking: (frame: TrackingInput, source = 'debug') => pushTrackingFrame(source, frame),
     emotion: (text: string) => applyEmotionFromText(text),
     speech: (openY: number, ttlMs = 400) => pushSpeechMouth({ openY }, ttlMs),
