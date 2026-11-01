@@ -1,3 +1,5 @@
+[English](README.en.md) | **简体中文**
+
 # Pet
 
 基于 Electron 的 Live2D 桌面宠物，支持模型切换、对话、语音转写、待办和插件。
@@ -13,20 +15,51 @@
 > Windows 可能拦截从 `Desktop` 目录直接运行的未签名程序。遇到双击无响应时，
 > 请安装到 `%LOCALAPPDATA%\Programs\`，或把 `win-unpacked` 拷到其他目录运行。
 
-## 开发
+## 开发（进阶命令）
 
-```bash
-npm install
-npm start
+> 日常安装/启动/打包见上面的「怎么启动」，这里只列排查和本桌宠专属模块的验证命令。
+
+### 打开渲染层 Console（排查 UI / 视线 / 点击 / 头像流）
+
+```powershell
+# 方式一：自动弹出 DevTools
+$env:DEVTOOLS=1
+& "$env:LOCALAPPDATA\Programs\Pet\Pet.exe"
+
+# 方式二：远程调试（浏览器打开 http://127.0.0.1:9222）
+& "$env:LOCALAPPDATA\Programs\Pet\Pet.exe" --remote-debugging-port=9222
 ```
 
-常用命令：
+### 本桌宠专属模块的功能测试
 
-| 命令 | 用途 |
-| --- | --- |
-| `npm test` | 编译并运行测试 |
-| `npm run check:privacy --all` | 检查打包隐私边界 |
-| `npm run dist` | 生成安装包和便携版 |
+```bash
+# 全部测试（tsc + 装配 + node:test）
+npm test
+
+# CI 同款（tsc + node --test）
+npm run check
+
+# 单模块测试（按需）
+node --test tests/mcpServerPhone.test.js          # 手机桥接/轮询/超时
+node --test tests/mcpServerPhoneContracts.test.js # 手机接口 JSON 契约
+node --test tests/mcpServerRemote.test.js         # MCP 远程访问/WS
+node --test tests/live2dPlacement.test.js         # 半身/全身取景、头部锚点
+node --test tests/behaviorTriggers.test.js        # 视线跟随、点击/拖拽互动
+node --test tests/autonomy.test.js                # 自主任务规则
+node --test tests/promptLayers.test.js            # 四层提示词
+node --test tests/toolLoopGuard.test.js           # 工具循环守卫
+node --test tests/mcpClient.test.js               # MCP 客户端
+node --test tests/voiceInput.test.js              # 语音输入
+node --test tests/contracts.test.js               # 跨进程契约
+```
+
+### 打包与验收
+
+```bash
+npm run check:privacy --all   # 打包隐私边界（模型/密钥不进包）
+npm run dist                  # 安装包 + 便携版
+npm run build:all             # 只编译装配，不打包
+```
 
 ## 当前功能
 
