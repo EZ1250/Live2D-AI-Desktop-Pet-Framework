@@ -826,6 +826,7 @@ function driveGaze(nowMs: number): void {
         sdkIdleReset = true;
         sdkFeedX = NaN; // 下次移动重新起步
         if (typeof h.resetFocus === 'function') h.resetFocus();
+        h.setGaze(0, 0); // 静止回正也要走项目管线，避免 SDK 头部参数被 Idle 卡住
       }
       return;
     }
@@ -837,7 +838,13 @@ function driveGaze(nowMs: number): void {
     sdkFeedX += (sdkTargetX - sdkFeedX) * ease;
     sdkFeedY += (sdkTargetY - sdkFeedY) * ease;
     const ok = trySdkFocus(sdkFeedX, sdkFeedY);
-    if (ok) return; // SDK 模式：参数由 SDK 驱动，项目不再覆盖
+    if (ok) {
+      // SDK 的 FocusController 在 model.update 内部写参数，但模型 Idle 动作会在其后覆盖
+      // AngleX/Y（眼球参数不被 Idle 覆盖）→ 表现为"只有眼睛动、头不动"。
+      // 这里在 update 之后再补写一次（头部+眼球），让头和眼睛一起跟。
+      h.setGaze(gazeNX, gazeNY);
+      return;
+    }
     if (sdkFocusActive) return; // 未达失败阈值：继续等 SDK，避免双写者逐帧抖动
     // 达到阈值 → 掉到下面的代码管线兜底
   }
