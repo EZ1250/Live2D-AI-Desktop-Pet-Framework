@@ -27,8 +27,12 @@ const {
   normalizeTrackingValues,
   trackingToParameterValues,
   parseHotkeyList,
+  parseVtsEvent,
   VTS_TRACKING_PARAMETERS,
   VTS_TRACKING_FIELDS,
+  VTS_EVENT_HOTKEY_TRIGGERED,
+  VTS_EVENT_MODEL_LOADED,
+  VTS_SUBSCRIBED_EVENTS,
 } = require('../dist/main/vts/vtsClient');
 
 const silent = () => {};
@@ -554,4 +558,206 @@ test('authenticate({cachedOnly:true})：没有缓存 token 时直接失败，绝
   assert.equal(client.hasCachedToken(), true);
   assert.deepEqual(await client.authenticate({ cachedOnly: true }), { authenticated: true, cachedToken: true });
   assert.equal(server.requests.filter((r) => r.messageType === 'AuthenticationTokenRequest').length, 0);
+});
+
+/* ==========================================================================
+ * 事件订阅（VTS → 桌宠反向同步的协议层）
+ * ========================================================================== */
+
+const EVENT_WAIT_MS = 2000;
+/** 等事件到达（VTS 事件是异步推回来的） */
+async function waitFor(predicate, timeoutMs = EVENT_WAIT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return predicate();
+}
+
+/** VTS 事件信封（实测/文档：事件消息不保证带 requestID；这里分别用空串 / 缺省测两条路径） */
+function eventEnvelope(messageType, data, requestID = '') {
+  return {
+    apiName: 'VTubeStudioPublicAPI',
+    apiVersion: '1.0',
+    timestamp: Date.now(),
+    requestID,
+    messageType,
+    data,
+  };
+}
+
+test('subscribeEvents：按事件协议发 EventSubscriptionRequest，VTS 推来的热键/模型事件被回调', async (t) => {
+  const logs = [];
+  let liveConn = null;
+  const server = await createMockVtsServer((message, conn) => {
+    if (message.messageType === 'EventSubscriptionRequest') {
+      liveConn = conn;
+      return envelope(message, 'EventSubscriptionResponse', {
+        subscribedEventCount: 2,
+        subscribedEvents: [VTS_EVENT_HOTKEY_TRIGGERED, VTS_EVENT_MODEL_LOADED],
+      });
+    }
+    return envelope(message, 'CurrentModelResponse', { modelLoaded: true, modelName: 'mock-model' });
+  });
+  const client = new VtsClient({ url: server.url, logger: (level, message) => logs.push(`${level}:${message}`) });
+  const received = [];
+  const off = client.onEvent((event) => received.push(event));
+  t.after(async () => { off(); client.disconnect(); await server.close(); });
+  await client.connect();
+
+  const subscribed = await client.subscribeEvents();
+  assert.deepEqual(subscribed, [VTS_EVENT_HOTKEY_TRIGGERED, VTS_EVENT_MODEL_LOADED]);
+  assert.equal(client.eventListenerCount, 1);
+
+  const requests = server.requests.filter((r) => r.messageType === 'EventSubscriptionRequest');
+  assert.equal(requests.length, 2, '默认订阅两个事件（热键 + 模型加载）');
+  for (const request of requests) {
+    assert.deepEqual(Object.keys(request.data).sort(), ['config', 'eventName', 'subscribe']);
+    assert.equal(request.data.subscribe, true, '必须显式 subscribe: true');
+    assert.deepEqual(request.data.config, {});
+  }
+  assert.deepEqual(requests.map((r) => r.data.eventName), [VTS_EVENT_HOTKEY_TRIGGERED, VTS_EVENT_MODEL_LOADED]);
+  assert.deepEqual([...VTS_SUBSCRIBED_EVENTS], [VTS_EVENT_HOTKEY_TRIGGERED, VTS_EVENT_MODEL_LOADED]);
+
+  // 模拟 VTS 主动推事件：热键事件带空 requestID，模型事件干脆不带 requestID
+  liveConn.send(eventEnvelope(VTS_EVENT_HOTKEY_TRIGGERED, {
+    hotkeyID: '21bf7ade9e664f3ec29d05156e4ce5c1',
+    hotkeyName: '开心',
+    hotkeyAction: 'ToggleExpression',
+    hotkeyFile: 'happy.exp3.json',
+    hotkeyTriggeredByAPI: false,
+    modelID: 'd8ee771d2909873b1aa0226d03ef4f51',
+    modelName: 'mock-model',
+    isLive2DItem: false,
+  }, ''));
+  liveConn.send({
+    apiName: 'VTubeStudioPublicAPI',
+    apiVersion: '1.0',
+    messageType: VTS_EVENT_MODEL_LOADED,
+    data: { modelLoaded: true, modelName: '大肥鱼', modelID: 'mid-2' },
+  });
+
+  assert.equal(await waitFor(() => received.length >= 2), true, `只收到 ${received.length} 条事件：${JSON.stringify(received)}`);
+  const hotkey = received.find((event) => event.kind === 'hotkeyTriggered');
+  const model = received.find((event) => event.kind === 'modelLoaded');
+  assert.ok(hotkey, '必须收到 HotkeyTriggeredEvent');
+  assert.equal(hotkey.hotkeyName, '开心');
+  assert.equal(hotkey.hotkeyID, '21bf7ade9e664f3ec29d05156e4ce5c1');
+  assert.equal(hotkey.hotkeyAction, 'ToggleExpression');
+  assert.equal(hotkey.hotkeyTriggeredByAPI, false);
+  assert.equal(hotkey.modelName, 'mock-model');
+  assert.match(hotkey.at, /^\d{4}-\d{2}-\d{2}T/, '事件要带收到时刻（ISO）');
+  assert.ok(model, '必须收到 ModelLoadedEvent');
+  assert.equal(model.modelLoaded, true);
+  assert.equal(model.modelName, '大肥鱼');
+  assert.equal(model.modelID, 'mid-2');
+
+  // 事件不该被当成"无主消息"丢掉（以前 handleMessage 只认 pending requestID）
+  assert.deepEqual(
+    logs.filter((line) => line.includes('无主消息')),
+    [],
+    `事件被当成无主消息丢掉了：${logs.join(' | ')}`,
+  );
+  assert.ok(logs.some((line) => line.includes('收到 VTS 事件')), '事件应有 debug 日志（排障用）');
+});
+
+test('onEvent：取消订阅后不再回调；一个监听器抛错不影响其它监听器与后续请求', async (t) => {
+  let liveConn = null;
+  const logs = [];
+  const server = await createMockVtsServer((message, conn) => {
+    if (message.messageType === 'EventSubscriptionRequest') {
+      liveConn = conn;
+      return envelope(message, 'EventSubscriptionResponse', { subscribedEventCount: 1, subscribedEvents: [VTS_EVENT_HOTKEY_TRIGGERED] });
+    }
+    return envelope(message, 'CurrentModelResponse', { modelLoaded: true, modelName: 'mock-model' });
+  });
+  const client = new VtsClient({ url: server.url, logger: (level, message) => logs.push(`${level}:${message}`) });
+  t.after(async () => { client.disconnect(); await server.close(); });
+  await client.connect();
+
+  const received = [];
+  const offRemoved = client.onEvent(() => { throw new Error('监听器故意抛错'); });
+  const offKept = client.onEvent((event) => received.push(event));
+  await client.subscribeEvents([VTS_EVENT_HOTKEY_TRIGGERED]);
+
+  liveConn.send(eventEnvelope(VTS_EVENT_HOTKEY_TRIGGERED, { hotkeyID: 'id-1', hotkeyName: '第一条' }));
+  assert.equal(await waitFor(() => received.length === 1), true, '抛错的监听器不能打断后面的监听器');
+  assert.ok(logs.some((line) => line.includes('事件监听器抛错')), '监听器抛错要留痕（warn）');
+
+  offRemoved();
+  assert.equal(client.eventListenerCount, 1);
+  liveConn.send(eventEnvelope(VTS_EVENT_HOTKEY_TRIGGERED, { hotkeyID: 'id-2', hotkeyName: '第二条' }));
+  assert.equal(await waitFor(() => received.length === 2), true);
+
+  offKept();
+  assert.equal(client.eventListenerCount, 0);
+  liveConn.send(eventEnvelope(VTS_EVENT_HOTKEY_TRIGGERED, { hotkeyID: 'id-3', hotkeyName: '第三条' }));
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(received.length, 2, '取消订阅后不该再收到事件');
+
+  // 事件处理不能把连接/请求机制搞坏
+  const model = await client.getModel();
+  assert.equal(model.modelName, 'mock-model');
+});
+
+test('subscribeEvents：单个事件被 VTS 拒绝只记 warn，不影响已成功的事件', async (t) => {
+  const logs = [];
+  const server = await createMockVtsServer((message) => {
+    if (message.messageType === 'EventSubscriptionRequest') {
+      if (message.data.eventName === VTS_EVENT_MODEL_LOADED) {
+        return envelope(message, 'APIError', { errorID: 7, message: 'Unknown event' });
+      }
+      return envelope(message, 'EventSubscriptionResponse', { subscribedEventCount: 1, subscribedEvents: [VTS_EVENT_HOTKEY_TRIGGERED] });
+    }
+    return envelope(message, 'CurrentModelResponse', {});
+  });
+  const client = new VtsClient({ url: server.url, logger: (level, message) => logs.push(`${level}:${message}`) });
+  t.after(async () => { client.disconnect(); await server.close(); });
+  await client.connect();
+
+  const subscribed = await client.subscribeEvents();
+  assert.deepEqual(subscribed, [VTS_EVENT_HOTKEY_TRIGGERED], '只返回 VTS 确认成功的那个');
+  assert.ok(logs.some((line) => line.includes('订阅 VTS 事件 ModelLoadedEvent 失败')), '失败要记 warn（不抛给调用方）');
+});
+
+test('subscribeEvents：未连接时直接报错（不会被当成订阅成功）', async () => {
+  const client = new VtsClient({ url: 'ws://127.0.0.1:1', logger: silent });
+  assert.equal(client.isConnected, false);
+  await assert.rejects(() => client.subscribeEvents(), /VTS 未连接/);
+  await assert.rejects(() => client.subscribeEvents([]), /VTS 未连接/);
+  client.disconnect();
+});
+
+test('parseVtsEvent：事件载荷收窄（脏数据/未知类型/没名字的热键都返回 null）', () => {
+  assert.equal(parseVtsEvent('NotAnEvent', {}), null);
+  assert.equal(parseVtsEvent(123, {}), null);
+  assert.equal(parseVtsEvent(VTS_EVENT_HOTKEY_TRIGGERED, null), null, '没有名字也没有 ID 的热键事件没法用');
+  assert.equal(parseVtsEvent(VTS_EVENT_HOTKEY_TRIGGERED, { hotkeyName: '   ' }), null);
+
+  const hotkey = parseVtsEvent(VTS_EVENT_HOTKEY_TRIGGERED, {
+    hotkeyID: ' id-1 ',
+    hotkeyName: ' 开心 ',
+    hotkeyAction: 'ToggleExpression',
+    hotkeyTriggeredByAPI: 'yes', // 非 true 的脏值一律按 false
+  }, '2026-01-01T00:00:00.000Z');
+  assert.deepEqual(hotkey, {
+    kind: 'hotkeyTriggered',
+    hotkeyID: 'id-1',
+    hotkeyName: '开心',
+    hotkeyAction: 'ToggleExpression',
+    hotkeyTriggeredByAPI: false,
+    modelID: '',
+    modelName: '',
+    at: '2026-01-01T00:00:00.000Z',
+  });
+
+  const model = parseVtsEvent(VTS_EVENT_MODEL_LOADED, { modelLoaded: false, modelName: 'B' }, '2026-01-01T00:00:00.000Z');
+  assert.deepEqual(model, {
+    kind: 'modelLoaded',
+    modelLoaded: false,
+    modelName: 'B',
+    modelID: '',
+    at: '2026-01-01T00:00:00.000Z',
+  });
 });

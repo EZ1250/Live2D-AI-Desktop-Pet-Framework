@@ -402,6 +402,11 @@ export const IPC_VTS_ACTION = 'vts:action';
 export const IPC_VTS_TRACKING = 'vts:tracking';
 /** 主进程 push→renderer：VTS 状态变化（连接/授权/错误/模型）。 */
 export const IPC_VTS_STATUS_PUSH = 'vts:statusPush';
+/**
+ * 主进程 push→renderer：VTS 事件（订阅 `HotkeyTriggeredEvent` / `ModelLoadedEvent`）。
+ * 渲染层据此把 VTS 里的动作/表情**反向**同步到桌宠本地模型（只本地应用，绝不回写 VTS）。
+ */
+export const IPC_VTS_EVENT_PUSH = 'vts:eventPush';
 /** invoke renderer→main：让主进程用 Edge TTS 合成一句话（音频经 IPC_TTS_AUDIO 推回）。 */
 export const IPC_TTS_SPEAK = 'pet:tts:speak';
 /** 主进程 push→renderer：一段合成好的语音（data URL，渲染层直接 new Audio 播放）。 */
@@ -445,6 +450,39 @@ export interface VtsActionResult {
   message?: string;
   error?: string;
 }
+
+/**
+ * VTS 推来的事件（`EventSubscriptionRequest` 订阅后由 VTS 主动发）。
+ * 目前只订阅两类：
+ *   - `HotkeyTriggeredEvent`：用户在 VTS UI 里触发热键，或我们/别的插件经 API 触发；
+ *   - `ModelLoadedEvent`：VTS 里换了模型（顺便刷新状态里的模型名）。
+ * 字段名保持 VTS 原样（hotkeyName / modelName …），方便排障时和 VTS 日志对照。
+ */
+export interface VtsHotkeyTriggeredEventDto {
+  kind: 'hotkeyTriggered';
+  /** 热键 ID（32 位十六进制；VTS 一定给，但格式坏了也不丢事件） */
+  hotkeyID: string;
+  /** 热键显示名（VTS 里配的名字；本地按它匹配同名表情/动作组） */
+  hotkeyName: string;
+  /** 热键类型，如 TriggerAnimation / ToggleExpression */
+  hotkeyAction: string;
+  /** true = 由插件 API（例如我们自己的按钮）触发；false = 用户在 VTS 里手动触发 */
+  hotkeyTriggeredByAPI: boolean;
+  modelID: string;
+  modelName: string;
+  /** 收到事件的时刻（ISO 字符串） */
+  at: string;
+}
+
+export interface VtsModelLoadedEventDto {
+  kind: 'modelLoaded';
+  modelLoaded: boolean;
+  modelName: string;
+  modelID: string;
+  at: string;
+}
+
+export type VtsEventDto = VtsHotkeyTriggeredEventDto | VtsModelLoadedEventDto;
 
 /**
  * 一帧追踪值（渲染层 → 主进程）。字段名是**逻辑名**，主进程再翻译成 VTS 的参数名
@@ -681,6 +719,12 @@ export interface ElectronAPI {
   sendVtsTracking?(values: VtsTrackingValues): void;
   /** 订阅 VTS 状态推送（连接/授权/错误/模型变化）；返回取消订阅函数。 */
   onVtsStatus?(cb: (status: VtsStatusDto) => void): () => void;
+  /**
+   * 订阅 VTS 事件（热键触发 / 模型加载）；返回取消订阅函数。
+   * 渲染层收到 `hotkeyTriggered` 后按名字在本地模型上找同名表情/动作组，**只本地应用**，
+   * 不再回写 VTS（否则热键事件会在 VTS ↔ 桌宠之间来回触发）。
+   */
+  onVtsEvent?(cb: (event: VtsEventDto) => void): () => void;
   /** 让主进程用 Edge TTS 合成一句话；音频经 onTtsAudio 推回来。 */
   ttsSpeak?(text: string): Promise<{ ok: boolean; error?: string; bytes?: number }>;
   /** 订阅 TTS 合成结果（渲染层用 new Audio(payload.dataUrl).play() 播放）。 */

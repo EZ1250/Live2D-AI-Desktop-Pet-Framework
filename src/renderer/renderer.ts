@@ -34,6 +34,7 @@ type WindowInfo = import('../shared/contracts').WindowInfo;
 type AppSettings = import('../shared/contracts').AppSettings;
 type VtsStatusDto = import('../shared/contracts').VtsStatusDto;
 type VtsTrackingValues = import('../shared/contracts').VtsTrackingValues;
+type VtsEventDto = import('../shared/contracts').VtsEventDto;
 type TtsAudioPayload = import('../shared/contracts').TtsAudioPayload;
 
 /* ================================================================
@@ -953,7 +954,20 @@ function pushTrackingFrame(sourceId: string, frame: TrackingInput): boolean {
 
 /** 语音口型：给"说话中"的时序用（打字机/Motion/外部 TTS 都调它） */
 function pushSpeechMouth(mouth: { openY?: number; form?: number }, ttlMs = 220): void {
+  // TTS 音频播放期间由 ttsMouth.ts 独占口型层：否则打字机每 90ms 的写入会和音频节拍互相覆盖。
+  if (ttsMouthActive()) return;
   trackingHandle()?.applySpeech?.(mouth, ttlMs);
+}
+
+/** TTS 本地口型是否正在播（ttsMouth.ts 不存在时恒为 false） */
+function ttsMouthActive(): boolean {
+  const driver = ttsMouthDriver;
+  if (!driver) return false;
+  try {
+    return driver.state().active;
+  } catch {
+    return false;
+  }
 }
 
 /** 文本 → 情绪 → 表情；返回实际应用的表情名（没有对应表情/未就绪 → null） */
@@ -2247,6 +2261,10 @@ function subscribeOptionalPushes(bridge: RendererBridge): void {
       if (panel && !panel.hidden) renderVtsStatus(status);
     });
   }
+  // VTS 事件推送（热键触发 / 模型加载）：反向同步到本地模型（只在本地应用，不回写 VTS）
+  if (typeof bridge.onVtsEvent === 'function') {
+    bridge.onVtsEvent(applyVtsEvent);
+  }
   // TTS 音频：主进程合成好就推过来，这里直接播（autoplay 策略已在主进程放宽）
   if (typeof bridge.onTtsAudio === 'function') {
     bridge.onTtsAudio(playTtsAudio);
@@ -3419,6 +3437,63 @@ async function refreshVtsStatus(bridge: RendererBridge): Promise<void> {
   }
 }
 
+/* ---------------------------------------------------------------- VTS → 桌宠反向同步 */
+
+/** 最近一次 VTS 事件（自查用；与 status 推送分开，事件可能很频繁） */
+let vtsEventCount = 0;
+let lastVtsEvent: VtsEventDto | null = null;
+/** 最近一条事件在本地做了什么：expression:<名字> / motion:<名字> / ignored:<原因> / modelLoaded */
+let lastVtsEventAction = '';
+
+/** 在当前模型的名字表里找匹配项：先精确、再忽略大小写（VTS 热键名大小写不敏感） */
+function matchLocalName(names: string[], wanted: string): string | null {
+  if (!wanted) return null;
+  if (names.includes(wanted)) return wanted;
+  const lower = wanted.toLowerCase();
+  return names.find((name) => name.toLowerCase() === lower) ?? null;
+}
+
+/**
+ * VTS 事件 → 桌宠本地同步（**单向**：VTS → 本地，绝不回写 VTS）。
+ *
+ * 热键名先当表情（setExpression）、再当动作组（playMotion）；本地模型都没有就忽略并记一条 info。
+ * 注意：**不要**在这里调用 VTS 操作或触发热键，否则 VTS 的热键事件会回环触发自己。
+ * 我们自己按钮触发的热键也会经 VTS 事件回到这里 —— 这是有意的：两边看到同一件事。
+ */
+function applyVtsEvent(event: VtsEventDto | null): void {
+  if (!event || typeof event !== 'object') return;
+  vtsEventCount += 1;
+  lastVtsEvent = event;
+  if (event.kind !== 'hotkeyTriggered') {
+    lastVtsEventAction = event.kind;
+    return;
+  }
+  const wanted = typeof event.hotkeyName === 'string' ? event.hotkeyName.trim() : '';
+  const h = currentHandle;
+  const expression = wanted ? matchLocalName(listCurrentExpressions(), wanted) : null;
+  if (h && expression && typeof h.setExpression === 'function') {
+    try {
+      h.setExpression(expression);
+      lastVtsEventAction = `expression:${expression}`;
+      return;
+    } catch {
+      /* 表情失败：继续试同名动作组 */
+    }
+  }
+  const motion = wanted ? matchLocalName(listCurrentMotions(), wanted) : null;
+  if (h && motion && typeof h.playMotion === 'function') {
+    try {
+      h.playMotion(motion);
+      lastVtsEventAction = `motion:${motion}`;
+      return;
+    } catch {
+      /* 动作失败：按忽略处理 */
+    }
+  }
+  lastVtsEventAction = `ignored:${wanted || '(空)'}`;
+  console.info(`[renderer] VTS 热键「${wanted || '(空)'}」在本地模型上没有同名表情/动作组，已忽略`);
+}
+
 /** 点「连接 / 授权 / 断开 / 刷新 / 触发热键」 */
 async function runVtsActionFromUi(bridge: RendererBridge, action: 'connect' | 'authorize' | 'disconnect' | 'refresh' | 'trigger-hotkey'): Promise<void> {
   if (typeof bridge.vtsAction !== 'function') {
@@ -3504,6 +3579,38 @@ let ttsAudioContext: AudioContext | null = null;
 let ttsLastError = '';
 
 /**
+ * 本地口型驱动（ttsMouth.ts 的 window.PetTtsMouth；缺这个脚本时安静降级为"只出声不动嘴"）。
+ * 播放期间按 90~120ms 随机节拍写 openY 0.15~0.75（TTL 150ms），ended/error/pause 时 stop() 归零。
+ */
+interface TtsMouthDriverLike {
+  start(): void;
+  stop(): boolean;
+  state(): { active: boolean; ticks: number; lastOpenY: number; timerRunning: boolean };
+}
+let ttsMouthDriver: TtsMouthDriverLike | null = null;
+
+/** 懒创建（模型 handle 可能还没挂载；driver 内部每次取当前 handle） */
+function ttsMouth(): TtsMouthDriverLike | null {
+  if (ttsMouthDriver) return ttsMouthDriver;
+  const factory = (window as Any).PetTtsMouth as
+    | { createDriver?: (options: { getHandle: () => RenderHandle | null }) => TtsMouthDriverLike }
+    | undefined;
+  if (!factory || typeof factory.createDriver !== 'function') return null;
+  try {
+    ttsMouthDriver = factory.createDriver({ getHandle: () => currentHandle });
+  } catch (err) {
+    console.warn('[renderer] TTS 本地口型驱动创建失败（只出声，不动嘴）', err);
+    ttsMouthDriver = null;
+  }
+  return ttsMouthDriver;
+}
+
+/** 停止 TTS 本地口型并归零（音频结束/出错/暂停、开始播下一段时调用） */
+function stopTtsMouth(): void {
+  ttsMouth()?.stop();
+}
+
+/**
  * 音频解锁：必须在**用户手势的同一个调用栈里**跑。
  *
  * 为什么要它：主进程合成 TTS 是异步的（IPC 回来时手势早已失效），如果运行环境的
@@ -3559,6 +3666,8 @@ function ttsDebugState(): Any {
     duration: ttsAudioEl && Number.isFinite(ttsAudioEl.duration) ? ttsAudioEl.duration : null,
     volume: ttsAudioEl ? ttsAudioEl.volume : null,
     muted: ttsAudioEl ? ttsAudioEl.muted : null,
+    /** 本地桌宠口型驱动：active=true 表示正在按音频时长打拍子（ticks 应持续增长） */
+    mouth: ttsMouthDriver ? ttsMouthDriver.state() : null,
   };
 }
 
@@ -3578,6 +3687,8 @@ function playTtsAudio(payload: TtsAudioPayload): void {
     return;
   }
   try {
+    // 换下一段语音：先把上一段的本地口型停下并归零（旧音频的 pause 事件也可能触发，stop 幂等）
+    stopTtsMouth();
     ttsAudioEl?.pause();
   } catch {
     /* 旧元素已销毁 */
@@ -3590,10 +3701,22 @@ function playTtsAudio(payload: TtsAudioPayload): void {
       const code = audio.error ? audio.error.code : '?';
       const message = audio.error ? audio.error.message : '';
       ttsLastError = `媒体加载失败（code=${code}${message ? `，${message}` : ''}）`;
+      if (ttsAudioEl === audio) stopTtsMouth(); // 播不出来就别让嘴一直动
+    });
+    // 本地口型跟音频生命周期走：结束/出错/暂停都要停并归零（音频时长就是节拍的上限）
+    audio.addEventListener('ended', () => {
+      if (ttsAudioEl === audio) stopTtsMouth();
+    });
+    audio.addEventListener('pause', () => {
+      // ended 也会触发 pause；stop 幂等，这里统一收口
+      if (ttsAudioEl === audio) stopTtsMouth();
     });
     const played = audio.play();
+    // 开始按音频时长驱动本地桌宠嘴部（VTS 那条 MouthOpen 注入仍在主进程，互不干扰）
+    ttsMouth()?.start();
     if (played && typeof played.catch === 'function') {
       void played.catch((err: unknown) => {
+        stopTtsMouth(); // 自动播放被拦/解码失败：立刻闭嘴
         const name = (err as Error)?.name ?? 'Error';
         const message = (err as Error)?.message ?? String(err);
         ttsLastError = `${name}: ${message}`;
@@ -3610,6 +3733,7 @@ function playTtsAudio(payload: TtsAudioPayload): void {
       });
     }
   } catch (err) {
+    stopTtsMouth();
     ttsLastError = (err as Error)?.message ?? String(err);
     setSettingsStatus(`播放失败：${ttsLastError}`, true);
   }
@@ -5624,6 +5748,12 @@ function installDebugHooks(bridge: RendererBridge): void {
      * 若 enabled=true 但 sentCount 不涨 → bridge 没接上（bridgeOk/timerRunning 里能看出来）。
      */
     vts: () => vtsDebugState(),
+    /**
+     * VTS 事件反向同步自查（Console 里 `__petDebug.vtsEvents()`）：
+     * count 每次 VTS 热键/换模型都应增长；action 说明最近一条事件在本地做了什么
+     * （expression:名字 / motion:名字 / ignored:名字 / modelLoaded）。
+     */
+    vtsEvents: () => ({ count: vtsEventCount, action: lastVtsEventAction, last: lastVtsEvent }),
     /** TTS 自查：有没有解锁音频通道、最近一次播放失败的原始错误、当前音频进度 */
     tts: () => ttsDebugState(),
     /** 视线驱动模式自查：sdkFocusActive=true 表示当前由 SDK focus 驱动，false=项目代码管线兜底 */

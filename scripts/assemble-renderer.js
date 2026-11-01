@@ -8,7 +8,7 @@
  * 复制内容：
  *   - src/renderer/index.html / styles.css（静态）
  *   - src/renderer/lib/（pixi / live2dcubismcore / cubism4）
- *   - dist/renderer/renderer.js / live2d.js / gazeController.js 等（tsc 编译产物，见 build:tsc）
+ *   - dist/renderer/renderer.js / live2d.js / gazeController.js / ttsMouth.js 等（tsc 编译产物，见 build:tsc）
  *   - dist/renderer/ 再补一份 index.html / styles.css / lib/：主进程最后一层兜底
  *     loadFile(dist/renderer/index.html) 必须是一个"完整可用"的入口，而不是没样式没 Pixi 的裸页。
  *
@@ -70,7 +70,7 @@ function main() {
     }
   }
   // 3) tsc 产物（都是全局脚本：renderer 主逻辑 / Live2D 层 / 情感判定 / 声纹显示 / 视线控制器）
-  for (const f of ['renderer.js', 'live2d.js', 'emotion.js', 'voicelab.js', 'gazeController.js']) {
+  for (const f of ['renderer.js', 'live2d.js', 'emotion.js', 'voicelab.js', 'gazeController.js', 'ttsMouth.js']) {
     if (copyFile(path.join(DIST, f), path.join(DST, f))) ok.push(f);
   }
 
@@ -94,7 +94,7 @@ function main() {
 
   // 硬性校验：渲染层必须是「全局脚本」，一旦被编译成 CommonJS（出现 exports/require 垫片），
   // 浏览器里会立刻抛 "exports is not defined"，窗口直接白屏。这里宁可失败也不许装配出去。
-  for (const f of ['renderer.js', 'live2d.js', 'emotion.js', 'voicelab.js', 'gazeController.js']) {
+  for (const f of ['renderer.js', 'live2d.js', 'emotion.js', 'voicelab.js', 'gazeController.js', 'ttsMouth.js']) {
     const p = path.join(DST, f);
     if (!fs.existsSync(p)) continue;
     const src = fs.readFileSync(p, 'utf8');

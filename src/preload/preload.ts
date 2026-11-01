@@ -76,6 +76,7 @@ import {
   IPC_VOICE_STATUS,
   IPC_VOICE_TRANSCRIBE,
   IPC_VTS_ACTION,
+  IPC_VTS_EVENT_PUSH,
   IPC_VTS_STATUS,
   IPC_VTS_STATUS_PUSH,
   IPC_VTS_TRACKING,
@@ -100,6 +101,7 @@ import type {
   VoiceTranscribeResult,
   VtsActionName,
   VtsActionResult,
+  VtsEventDto,
   VtsStatusDto,
   VtsTrackingValues,
   WindowInfo,
@@ -353,6 +355,11 @@ const api: ElectronAPI = {
   /** 订阅 VTS 状态推送（连接/授权/错误/模型变化）。 */
   onVtsStatus(cb: (status: VtsStatusDto) => void): () => void {
     return subscribeChannel<VtsStatusDto>(IPC_VTS_STATUS_PUSH, cb);
+  },
+
+  /** 订阅 VTS 事件（热键触发 / 模型加载）→ 渲染层把事件本地应用到桌宠模型。 */
+  onVtsEvent(cb: (event: VtsEventDto) => void): () => void {
+    return subscribeChannel<VtsEventDto>(IPC_VTS_EVENT_PUSH, cb);
   },
 
   /* ---- Edge TTS 播放 ---- */

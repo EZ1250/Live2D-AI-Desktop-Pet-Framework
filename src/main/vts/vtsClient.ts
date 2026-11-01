@@ -22,10 +22,24 @@ import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { Buffer } from 'node:buffer';
+import type { VtsEventDto } from '../../shared/contracts';
 
 export const DEFAULT_VTS_URL = 'ws://127.0.0.1:8001';
 export const VTS_API_NAME = 'VTubeStudioPublicAPI';
 export const VTS_API_VERSION = '1.0';
+
+/** VTS 事件名（EventSubscriptionRequest 的 eventName） */
+export const VTS_EVENT_HOTKEY_TRIGGERED = 'HotkeyTriggeredEvent';
+export const VTS_EVENT_MODEL_LOADED = 'ModelLoadedEvent';
+
+/**
+ * 默认订阅的事件。**顺序有意义**：热键事件最要紧，模型加载事件只用于刷新状态。
+ * 订阅是幂等的：重复订阅会用新 config 覆盖旧 config，不会收到两份。
+ */
+export const VTS_SUBSCRIBED_EVENTS: readonly string[] = Object.freeze([
+  VTS_EVENT_HOTKEY_TRIGGERED,
+  VTS_EVENT_MODEL_LOADED,
+] as string[]);
 
 /** 普通请求默认超时 */
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -34,6 +48,8 @@ const DEFAULT_AUTH_TIMEOUT_MS = 120_000;
 
 export type VtsLogLevel = 'debug' | 'info' | 'warn' | 'error';
 export type VtsLogger = (level: VtsLogLevel, message: string) => void;
+/** VTS 事件监听器（VtsService 用它把事件转发给主进程 → 渲染层） */
+export type VtsEventListener = (event: VtsEventDto) => void;
 
 export interface VtsClientOptions {
   /** 默认 ws://127.0.0.1:8001 */
@@ -320,6 +336,57 @@ function normalizeTimeout(value: number | undefined, fallback: number): number {
   return fallback;
 }
 
+/* ------------------------------------------------------------------ 事件解析 */
+
+function textField(data: Record<string, unknown>, key: string): string {
+  const value = data[key];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+/**
+ * 把 VTS 发来的事件消息（`messageType` + `data`）收窄成 `VtsEventDto`。
+ *
+ * 实测/文档（Events/README.md）里的载荷：
+ *   - `HotkeyTriggeredEvent` → { hotkeyID, hotkeyName, hotkeyAction, hotkeyTriggeredByAPI, modelID, modelName, … }
+ *   - `ModelLoadedEvent`    → { modelLoaded, modelName, modelID }
+ * 不认识的 messageType / 脏数据返回 null（调用方保持"无主消息"的处理方式）。
+ * 事件消息不保证带 requestID（VTS 事件通常是空串），所以这里**不看 requestID**。
+ */
+export function parseVtsEvent(
+  messageType: unknown,
+  data: unknown,
+  at: string = new Date().toISOString(),
+): VtsEventDto | null {
+  const type = typeof messageType === 'string' ? messageType : '';
+  const payload = data && typeof data === 'object' ? data as Record<string, unknown> : {};
+  if (type === VTS_EVENT_HOTKEY_TRIGGERED) {
+    const hotkeyID = textField(payload, 'hotkeyID');
+    const hotkeyName = textField(payload, 'hotkeyName');
+    // 名字和 ID 都没有 → 不是可用事件（本地按名字匹配，没名字也做不了什么）
+    if (!hotkeyID && !hotkeyName) return null;
+    return {
+      kind: 'hotkeyTriggered',
+      hotkeyID,
+      hotkeyName,
+      hotkeyAction: textField(payload, 'hotkeyAction'),
+      hotkeyTriggeredByAPI: payload.hotkeyTriggeredByAPI === true,
+      modelID: textField(payload, 'modelID'),
+      modelName: textField(payload, 'modelName'),
+      at,
+    };
+  }
+  if (type === VTS_EVENT_MODEL_LOADED) {
+    return {
+      kind: 'modelLoaded',
+      modelLoaded: payload.modelLoaded === true,
+      modelName: textField(payload, 'modelName'),
+      modelID: textField(payload, 'modelID'),
+      at,
+    };
+  }
+  return null;
+}
+
 const defaultLogger: VtsLogger = (level, message) => {
   if (level === 'warn' || level === 'error') console.warn(`[vts] ${message}`);
 };
@@ -350,6 +417,8 @@ export class VtsClient {
   private connecting: Promise<void> | null = null;
   private requestSeq = 0;
   private readonly pending = new Map<string, PendingRequest>();
+  /** 事件订阅者（VtsService 一个；测试可挂多个） */
+  private readonly eventListeners = new Set<VtsEventListener>();
 
   constructor(options: VtsClientOptions = {}) {
     const url = typeof options.url === 'string' && options.url.trim() ? options.url.trim() : DEFAULT_VTS_URL;
@@ -380,6 +449,23 @@ export class VtsClient {
   /** 目前挂着的未完成请求数（测试/诊断用） */
   get pendingCount(): number {
     return this.pending.size;
+  }
+
+  /**
+   * 订阅 VTS 事件（`EventSubscriptionRequest` 之后 VTS 主动发来的消息）。
+   * 返回取消订阅函数；同一个回调重复挂只会收到一次。
+   */
+  onEvent(listener: VtsEventListener): () => void {
+    if (typeof listener !== 'function') throw new TypeError('onEvent 需要回调函数');
+    this.eventListeners.add(listener);
+    return () => {
+      this.eventListeners.delete(listener);
+    };
+  }
+
+  /** 目前挂着的事件监听器数量（测试/诊断用） */
+  get eventListenerCount(): number {
+    return this.eventListeners.size;
   }
 
   /** 建连；重复调用幂等。不做自动重连——断了要调用方自己再 connect()。 */
@@ -517,6 +603,14 @@ export class VtsClient {
       return;
     }
     const message = parsed as { requestID?: unknown; messageType?: unknown; data?: unknown };
+    // 事件消息没有对应的 pending 请求（requestID 常常是空串），必须在"无主消息"判断**之前**处理，
+    // 否则订阅到的事件会被当成无主消息整条丢掉（表现为"VTS 里点了热键，桌宠毫无反应"）。
+    const event = parseVtsEvent(message.messageType, message.data);
+    if (event) {
+      this.log('debug', `收到 VTS 事件 ${String(message.messageType)}${event.kind === 'hotkeyTriggered' ? `（${event.hotkeyName}）` : ''}`);
+      this.dispatchEvent(event);
+      return;
+    }
     const requestID = typeof message.requestID === 'string' ? message.requestID : '';
     const entry = requestID ? this.pending.get(requestID) : undefined;
     if (!entry) {
@@ -544,6 +638,18 @@ export class VtsClient {
     for (const entry of entries) {
       clearTimeout(entry.timer);
       entry.reject(err);
+    }
+  }
+
+  /** 分发一条事件；单个监听器抛错不能打断其它监听器（更不能打断 socket 的读循环） */
+  private dispatchEvent(event: VtsEventDto): void {
+    if (this.eventListeners.size === 0) return;
+    for (const listener of Array.from(this.eventListeners)) {
+      try {
+        listener(event);
+      } catch (err) {
+        this.log('warn', `VTS 事件监听器抛错：${normalizeError(err).message}`);
+      }
     }
   }
 
@@ -704,6 +810,43 @@ export class VtsClient {
   /** 当前加载的模型 */
   async getModel(): Promise<VtsCurrentModel> {
     return this.request<VtsCurrentModel>('CurrentModelRequest', {});
+  }
+
+  /**
+   * 订阅 VTS 事件（默认 `HotkeyTriggeredEvent` + `ModelLoadedEvent`）。
+   *
+   * 返回 VTS 确认订阅成功的事件名列表。单个事件订阅失败只记 warn、不抛错：
+   * 反向同步是"锦上添花"，不能因为它把已成功的连接/授权搞成失败状态。
+   * 订阅会在下次连接时随新会话重新建立（VTS 断线会清空该插件的订阅）。
+   */
+  async subscribeEvents(eventNames: readonly string[] = VTS_SUBSCRIBED_EVENTS): Promise<string[]> {
+    if (!this.socket || !this.connected) throw new Error('VTS 未连接：先调用 connect()');
+    const wanted = Array.from(new Set(
+      (Array.isArray(eventNames) ? eventNames : [])
+        .filter((name): name is string => typeof name === 'string')
+        .map((name) => name.trim())
+        .filter(Boolean),
+    ));
+    if (wanted.length === 0) throw new TypeError('subscribeEvents 至少需要一个事件名');
+    const subscribed: string[] = [];
+    for (const eventName of wanted) {
+      try {
+        const res = await this.request<{ subscribedEvents?: unknown }>('EventSubscriptionRequest', {
+          eventName,
+          subscribe: true,
+          config: {},
+        });
+        const confirmed = Array.isArray(res.subscribedEvents)
+          ? res.subscribedEvents.filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
+          : [eventName];
+        for (const name of confirmed) {
+          if (!subscribed.includes(name)) subscribed.push(name);
+        }
+      } catch (err) {
+        this.log('warn', `订阅 VTS 事件 ${eventName} 失败：${normalizeError(err).message}`);
+      }
+    }
+    return subscribed;
   }
 
   /** 当前模型的 Live2D 参数列表（VTS 里的参数名与范围） */

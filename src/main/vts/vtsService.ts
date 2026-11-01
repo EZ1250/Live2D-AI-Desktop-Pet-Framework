@@ -16,6 +16,7 @@
 import * as path from 'node:path';
 import { DEFAULT_VTS_URL, VtsClient, normalizeTrackingValues } from './vtsClient';
 import type { VtsClientOptions, VtsHotkey, VtsLogger, VtsTrackingValues } from './vtsClient';
+import type { VtsEventDto } from '../../shared/contracts';
 
 /** VTS 插件 API 默认端口 */
 export const DEFAULT_VTS_PORT = 8001;
@@ -78,6 +79,12 @@ export interface VtsServiceOptions {
   logger?: VtsLogger;
   /** 授权超时（首次弹窗要等用户点「允许」），默认交给 VtsClient */
   authTimeoutMs?: number;
+  /**
+   * VTS 事件回调（订阅成功后的热键触发 / 模型加载）。
+   * 主进程把它转成 `IPC_VTS_EVENT_PUSH` 推给渲染层，做 VTS → 桌宠的反向同步。
+   * 回调抛错只记 warn，不影响连接与注入。
+   */
+  onEvent?: (event: VtsEventDto) => void;
   /** 测试注入：替换 VtsClient 的构造（默认 new VtsClient） */
   createClient?: (options: VtsClientOptions) => VtsClient;
 }
@@ -104,6 +111,7 @@ function errorMessage(err: unknown): string {
 export class VtsService {
   private readonly options: VtsServiceOptions;
   private readonly log: VtsLogger;
+  private readonly eventHandler: ((event: VtsEventDto) => void) | null;
 
   private client: VtsClient | null = null;
   private current: VtsStatus = emptyStatus();
@@ -115,6 +123,7 @@ export class VtsService {
 
   constructor(options: VtsServiceOptions = {}) {
     this.options = options;
+    this.eventHandler = typeof options.onEvent === 'function' ? options.onEvent : null;
     this.log = typeof options.logger === 'function'
       ? options.logger
       : (level, message) => {
@@ -159,6 +168,8 @@ export class VtsService {
       return this.status();
     }
     this.client = client;
+    // 事件监听器挂在客户端上（每次 start 都是新客户端；停止时旧客户端直接丢弃）
+    client.onEvent((event) => this.handleClientEvent(client, event));
     this.setStatus({ enabled: true });
 
     try {
@@ -410,10 +421,42 @@ export class VtsService {
         authenticated: result.authenticated === true,
         lastError: result.authenticated === true ? '' : '授权未通过',
       });
+      if (result.authenticated === true) await this.subscribeEventsOn(gen, client);
     } catch (err) {
       if (!this.isCurrent(gen)) return;
       this.setStatus({ connected: client.isConnected, authenticated: false, lastError: `VTS 授权失败：${errorMessage(err)}` });
       this.log('warn', `授权失败：${errorMessage(err)}`);
+    }
+  }
+
+  /**
+   * 授权后订阅反向同步需要的事件（热键 / 模型加载）。
+   * 失败只记 warn：连接与注入仍可用，只是 VTS → 桌宠这条方向暂时没有事件。
+   */
+  private async subscribeEventsOn(gen: number, client: VtsClient): Promise<void> {
+    try {
+      const names = await client.subscribeEvents();
+      if (!this.isCurrent(gen) || client !== this.client) return;
+      if (names.length) this.log('info', `已订阅 VTS 事件：${names.join('、')}`);
+      else this.log('warn', 'VTS 事件订阅没有成功（VTS → 桌宠的反向同步不可用）');
+    } catch (err) {
+      if (!this.isCurrent(gen)) return;
+      this.log('warn', `订阅 VTS 事件失败：${errorMessage(err)}`);
+    }
+  }
+
+  /** VTS 事件 → 状态更新 + 转发给主进程（反向同步入口） */
+  private handleClientEvent(client: VtsClient, event: VtsEventDto): void {
+    if (client !== this.client) return; // 旧连接/已停止的客户端：事件作废
+    if (event.kind === 'modelLoaded') {
+      // VTS 里换了模型：顺手把状态里的模型名刷新（不需要额外请求）
+      this.setStatus({ modelName: event.modelName, modelLoaded: event.modelLoaded });
+    }
+    if (!this.eventHandler) return;
+    try {
+      this.eventHandler(event);
+    } catch (err) {
+      this.log('warn', `转发 VTS 事件失败：${errorMessage(err)}`);
     }
   }
 

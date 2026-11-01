@@ -48,6 +48,7 @@ src/
 ├── renderer/                 渲染层（无打包器：全局脚本 + <script> 标签）
 │   ├── index.html / styles.css / renderer.ts / live2d.ts / emotion.ts / voicelab.ts
 │   ├── gazeController.ts     视线控制器（全局脚本 window.PetGaze：换算/SDK focus/兜底）
+│   ├── ttsMouth.ts           TTS 本地口型节拍器（全局脚本 window.PetTtsMouth：90~120ms 打拍/停止归零）
 │   └── lib/                  第三方运行库（pixi / Cubism Core / Live2D 引擎）——不要手改
 ├── preload/preload.ts        contextBridge 窄接口
 └── shared/contracts.ts       跨模块契约（IPC 通道、类型）——唯一真源

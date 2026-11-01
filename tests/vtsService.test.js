@@ -51,6 +51,11 @@ function createHandler(overrides = {}) {
         return envelope(message, 'HotkeysInCurrentModelResponse', { modelLoaded: true, availableHotkeys: HOTKEYS });
       case 'HotkeyTriggerRequest':
         return envelope(message, 'HotkeyTriggerResponse', { hotkeyID: message.data.hotkeyID });
+      case 'EventSubscriptionRequest':
+        return envelope(message, 'EventSubscriptionResponse', {
+          subscribedEventCount: 2,
+          subscribedEvents: ['HotkeyTriggeredEvent', 'ModelLoadedEvent'],
+        });
       case 'InjectParameterDataRequest':
         return envelope(message, 'InjectParameterDataResponse', {});
       default:
@@ -366,4 +371,125 @@ test('testInject：VTS 拒绝注入时把原因写进 lastError（不吞错）',
   assert.equal(result.ok, false);
   assert.match(result.error, /测试注入失败/);
   assert.match(service.status().lastError, /#453/);
+});
+
+/* ---------------------------------------------------------------- 反向同步：VTS 事件转发 */
+
+/** VTS 事件信封（事件消息常常没有 requestID，甚至缺字段） */
+function eventEnvelope(messageType, data) {
+  return {
+    apiName: 'VTubeStudioPublicAPI',
+    apiVersion: '1.0',
+    timestamp: Date.now(),
+    requestID: '',
+    messageType,
+    data,
+  };
+}
+
+async function waitFor(predicate, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await wait(10);
+  }
+  return predicate();
+}
+
+test('授权成功后自动订阅 HotkeyTriggeredEvent / ModelLoadedEvent（反向同步的前提）', async (t) => {
+  const server = await createMockVtsServer(createHandler());
+  const token = tempTokenFile('tok-service-1');
+  const service = new VtsService({ url: server.url, tokenStorePath: token.file, logger: silent });
+  t.after(async () => { service.dispose(); await server.close(); token.cleanup(); });
+
+  const status = await service.start({ enabled: true });
+  assert.equal(status.authenticated, true);
+
+  const requests = server.requests.filter((r) => r.messageType === 'EventSubscriptionRequest');
+  assert.equal(requests.length, 2, '热键事件 + 模型加载事件都要订阅（VTS 断开后订阅会清空，所以每次连接都订一次）');
+  assert.deepEqual(requests.map((r) => r.data.eventName), ['HotkeyTriggeredEvent', 'ModelLoadedEvent']);
+  assert.deepEqual(requests.map((r) => r.data.subscribe), [true, true]);
+});
+
+test('VTS 事件转发给 onEvent：热键事件原样带上名字；模型事件顺带刷新 status', async (t) => {
+  let liveConn = null;
+  const server = await createMockVtsServer((message, conn) => {
+    liveConn = conn;
+    return createHandler()(message);
+  });
+  const token = tempTokenFile('tok-service-1');
+  const received = [];
+  const service = new VtsService({
+    url: server.url,
+    tokenStorePath: token.file,
+    logger: silent,
+    onEvent: (event) => received.push(event),
+  });
+  t.after(async () => { service.dispose(); await server.close(); token.cleanup(); });
+  await service.start({ enabled: true });
+  assert.ok(liveConn, 'mock 服务端应记录到连接');
+
+  liveConn.send(eventEnvelope('HotkeyTriggeredEvent', {
+    hotkeyID: 'e5d3e7ef6a944c17b3ce58d3066fcd2b',
+    hotkeyName: '开心',
+    hotkeyAction: 'ToggleExpression',
+    hotkeyTriggeredByAPI: false,
+    modelID: 'mid',
+    modelName: 'mock-model',
+  }));
+  assert.equal(await waitFor(() => received.length >= 1), true, '热键事件必须转发给上层（渲染层反向同步的输入）');
+  assert.equal(received[0].kind, 'hotkeyTriggered');
+  assert.equal(received[0].hotkeyName, '开心');
+
+  liveConn.send(eventEnvelope('ModelLoadedEvent', { modelLoaded: true, modelName: '大肥鱼', modelID: 'mid-2' }));
+  assert.equal(await waitFor(() => received.length >= 2), true);
+  const model = received.find((event) => event.kind === 'modelLoaded');
+  assert.ok(model);
+  assert.equal(model.modelName, '大肥鱼');
+  assert.equal(service.status().modelName, '大肥鱼', 'ModelLoadedEvent 应顺手刷新 status 里的模型名');
+  assert.equal(service.status().modelLoaded, true);
+});
+
+test('事件订阅失败不影响连接/授权（反向同步没了，但注入照常）', async (t) => {
+  const server = await createMockVtsServer((message) => {
+    if (message.messageType === 'EventSubscriptionRequest') {
+      return envelope(message, 'APIError', { errorID: 7, message: 'Unknown event' });
+    }
+    return createHandler()(message);
+  });
+  const token = tempTokenFile('tok-service-1');
+  const service = new VtsService({ url: server.url, tokenStorePath: token.file, logger: silent });
+  t.after(async () => { service.dispose(); await server.close(); token.cleanup(); });
+
+  const status = await service.start({ enabled: true });
+  assert.equal(status.authenticated, true, '订阅失败不能把授权状态搞坏');
+  assert.equal(status.lastError, '');
+  service.injectTracking({ faceAngleX: 10 });
+  await wait(80);
+  assert.equal(server.requests.filter((r) => r.messageType === 'InjectParameterDataRequest').length, 1);
+});
+
+test('onEvent 回调抛错也不会影响 VTS 连接与后续注入', async (t) => {
+  let liveConn = null;
+  const server = await createMockVtsServer((message, conn) => {
+    liveConn = conn;
+    return createHandler()(message);
+  });
+  const token = tempTokenFile('tok-service-1');
+  const service = new VtsService({
+    url: server.url,
+    tokenStorePath: token.file,
+    logger: silent,
+    onEvent: () => { throw new Error('渲染层那边炸了'); },
+  });
+  t.after(async () => { service.dispose(); await server.close(); token.cleanup(); });
+  const status = await service.start({ enabled: true });
+  assert.equal(status.authenticated, true);
+
+  liveConn.send(eventEnvelope('HotkeyTriggeredEvent', { hotkeyID: 'id', hotkeyName: '任意' }));
+  await wait(80);
+  service.injectTracking({ mouthOpen: 0.5 });
+  await wait(80);
+  assert.equal(server.requests.filter((r) => r.messageType === 'InjectParameterDataRequest').length, 1);
+  assert.equal(service.status().authenticated, true);
 });

@@ -72,9 +72,26 @@
 - 视线注入走 `IPC_VTS_TRACKING`（renderer→main，`ipcMain.on`，约 30fps，fire-and-forget）；
   未连接/未授权时主进程静默丢弃，不抛回渲染层。
 - 热键列表用 `HotkeysInCurrentModelRequest`（VTS 1.35 实测；`HotkeyListRequest` 会被拒 #7）。
+- **反向同步（VTS → 桌宠）**：授权成功后主进程用 `EventSubscriptionRequest` 订阅
+  `HotkeyTriggeredEvent`（热键触发，含用户在 VTS UI 里手动触发和我们按钮经 API 触发）与
+  `ModelLoadedEvent`（换模型）。VTS 推来的事件经 `IPC_VTS_EVENT_PUSH`（main→renderer，
+  `vts:eventPush`）交给渲染层 `onVtsEvent` → `applyVtsEvent`：
+  热键名先按同名**表情** `setExpression(name)`，没有再按同名**动作组** `playMotion(name)`，
+  都没有就忽略并记日志（不弹窗、不报错）。**这条方向只改本地模型，绝不回写 VTS**，
+  否则热键事件会在 VTS ↔ 桌宠之间回环触发。VTS 断线会清空该插件的订阅，所以每次
+  连接/授权成功后都重新订阅一次；订阅失败只记 warn，不影响连接与注入。
+- 热键事件的载荷字段（VTS 原样）：`hotkeyID` / `hotkeyName` / `hotkeyAction` /
+  `hotkeyTriggeredByAPI` / `modelID` / `modelName`；事件消息通常**没有 requestID**，
+  VtsClient 在"无主消息"判断之前解析，不能因为拿不到 pending 就丢掉。
 - 语音由主进程用 Edge TTS 合成后经 `IPC_TTS_AUDIO` 推给渲染层 `new Audio(...).play()`；
   主进程在 app ready 前 `appendSwitch('autoplay-policy', 'no-user-gesture-required')`，
-  否则渲染层没有用户手势时播放会被拒。说话期间顺带注入 `MouthOpen`。
+  否则渲染层没有用户手势时播放会被拒。说话期间主进程顺带向 VTS 注入 `MouthOpen`
+  （`onVtsMouth`；与本地口型是两条独立链路，保持不变）。
+- **本地 TTS 口型**：渲染层 `src/renderer/ttsMouth.ts`（全局脚本 `window.PetTtsMouth`，
+  `index.html` 里先于 `renderer.js` 加载）在 `playTtsAudio` 播放期间每 90~120ms 用
+  随机 `openY`（0.15~0.75，TTL 150ms）驱动当前 handle：有 `applySpeech` 走语音层，
+  没有则退回 `applyTrackingFrame({ mouth: { openY } })`；音频 `ended`/`error`/`pause`
+  时停止并归零。
 
 ## 第三方资源授权
 

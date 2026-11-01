@@ -119,6 +119,7 @@ test('VTS IPC：契约、preload、主进程、渲染层四处都接上了', () 
   assert.equal(contracts.IPC_VTS_ACTION, 'vts:action');
   assert.equal(contracts.IPC_VTS_TRACKING, 'vts:tracking');
   assert.equal(contracts.IPC_VTS_STATUS_PUSH, 'vts:statusPush');
+  assert.equal(contracts.IPC_VTS_EVENT_PUSH, 'vts:eventPush');
 
   // 通道名：契约 → preload → 主进程
   for (const name of ['IPC_VTS_STATUS', 'IPC_VTS_ACTION', 'IPC_VTS_TRACKING']) {
@@ -154,6 +155,23 @@ test('VTS IPC：契约、preload、主进程、渲染层四处都接上了', () 
   for (const piece of ['vtsStatus:', 'vtsAction:', 'onVtsTracking:', 'VtsService', 'applyVtsSettings']) {
     assert.ok(main.includes(piece), `mainImpl.js 应包含 ${piece}`);
   }
+
+  // ---- VTS → 桌宠反向同步（事件通道）----
+  assert.ok(readSrc('src/shared/contracts.ts').includes('IPC_VTS_EVENT_PUSH'), 'contracts.ts 应定义 IPC_VTS_EVENT_PUSH');
+  assert.ok(readSrc('src/preload/preload.ts').includes('IPC_VTS_EVENT_PUSH'), 'preload 应订阅 IPC_VTS_EVENT_PUSH');
+  assert.ok(readSrc('src/preload/preload.ts').includes('onVtsEvent'), 'preload 应暴露 onVtsEvent');
+  assert.ok(main.includes('pushVtsEvent'), 'mainImpl.js 应把 VTS 事件推给渲染层');
+  assert.ok(main.includes('IPC_VTS_EVENT_PUSH'), 'mainImpl.js 应使用 IPC_VTS_EVENT_PUSH 推送');
+  assert.ok(renderer.includes('onVtsEvent'), 'renderer 应订阅 onVtsEvent');
+  assert.ok(renderer.includes('function applyVtsEvent('), 'renderer 应有 applyVtsEvent（事件 → 本地表情/动作）');
+  // 反向同步只本地应用：热键事件里绝不能调 vtsAction（否则 VTS ↔ 桌宠来回触发）
+  const applyAt = renderer.indexOf('function applyVtsEvent(');
+  const applyEnd = renderer.indexOf('\n}\n', applyAt);
+  assert.ok(applyAt >= 0 && applyEnd > applyAt, '找不到 applyVtsEvent 的完整函数体');
+  const applyBody = renderer.slice(applyAt, applyEnd);
+  assert.ok(!applyBody.includes('vtsAction'), 'applyVtsEvent 里不得回写 VTS（会形成事件回环）');
+  assert.ok(/setExpression/.test(applyBody) && /playMotion/.test(applyBody), '热键名应能落到 setExpression / playMotion');
+  assert.ok(renderer.includes('vtsEvents:'), '__petDebug.vtsEvents() 用于自查事件是否到达');
 });
 
 /** TTS 播放：主进程合成（pet:tts:speak）→ 渲染层 new Audio 播放（pet:tts:audio） */

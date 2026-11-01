@@ -2126,6 +2126,8 @@ function ensureVtsService() {
             if (level === 'warn' || level === 'error')
                 console.warn(`[vts] ${message}`);
         },
+        // VTS → 桌宠反向同步：订阅到的热键/模型事件原样推给渲染层（只本地应用，不回写 VTS）
+        onEvent: (event) => pushVtsEvent(event),
     });
     return vtsService;
 }
@@ -2135,6 +2137,17 @@ function pushVtsStatus(status) {
         return;
     try {
         pushToWindows(contracts_1.IPC_VTS_STATUS_PUSH, status);
+    }
+    catch {
+        /* 窗口还没建好/正在销毁：忽略 */
+    }
+}
+/** 把 VTS 事件推给渲染层（反向同步：VTS 热键 → 桌宠本地表情/动作）；推送失败不影响 VTS */
+function pushVtsEvent(event) {
+    if (!event)
+        return;
+    try {
+        pushToWindows(contracts_1.IPC_VTS_EVENT_PUSH, event);
     }
     catch {
         /* 窗口还没建好/正在销毁：忽略 */
