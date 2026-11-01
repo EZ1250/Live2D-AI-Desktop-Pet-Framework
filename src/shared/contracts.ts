@@ -407,8 +407,14 @@ export const IPC_TTS_SPEAK = 'pet:tts:speak';
 /** 主进程 push→renderer：一段合成好的语音（data URL，渲染层直接 new Audio 播放）。 */
 export const IPC_TTS_AUDIO = 'pet:tts:audio';
 
-/** VTS 操作名（IPC_VTS_ACTION 的第一个参数）。 */
-export type VtsActionName = 'connect' | 'disconnect' | 'authorize' | 'refresh' | 'trigger-hotkey';
+/**
+ * VTS 操作名（IPC_VTS_ACTION 的第一个参数）。
+ *
+ * `test-inject` 是**诊断**用：主进程直接注入一帧固定的追踪值
+ * （faceAngleX=15 / eyeLeftX=0.6 / mouthOpen=0.7），1 秒后归零；
+ * 它不经过渲染层，用来区分"主进程→VTS 通不通"和"渲染层有没有在发"。
+ */
+export type VtsActionName = 'connect' | 'disconnect' | 'authorize' | 'refresh' | 'trigger-hotkey' | 'test-inject';
 
 /** VTS 状态快照（设置页展示；不含 token 等敏感内容）。 */
 export interface VtsStatusDto {
@@ -421,6 +427,14 @@ export interface VtsStatusDto {
   modelLoaded: boolean;
   /** 最近一次失败的可读原因（成功后清空） */
   lastError: string;
+  /** 已成功注入 VTS 的追踪帧数（连接重置清零）——0 说明渲染层根本没发或全被丢弃 */
+  injectedCount: number;
+  /** 最近一次成功注入的时刻（ISO 字符串；从未注入过为空串） */
+  lastInjectedAt: string;
+  /** 最近一次成功注入的追踪值（逻辑字段名，与 VtsTrackingValues 一致） */
+  lastTracking: VtsTrackingValues | null;
+  /** 因未启用/未连接/未授权而丢弃的追踪帧数（诊断"静默丢"用，不逐帧打日志） */
+  droppedCount: number;
 }
 
 /** VTS 操作结果：ok=false 时 error 可直接展示，status 始终是最新快照。 */

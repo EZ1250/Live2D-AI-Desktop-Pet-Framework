@@ -1,4 +1,8 @@
 "use strict";
+// 自动播放策略必须比**任何 app ready / 创建窗口**更早落到命令行上；这里（文件第一行之后、
+// 其余 require 之前）是整个主进程最早能执行的位置。具体开关与幂等逻辑在 earlySwitches 里，
+// main.ts 也会在 import mainImpl 之前先 require 它（两条入口都能保证时序）。
+require("./earlySwitches");
 const { AsyncLocalStorage } = require("async_hooks");
 /** 只给"手机发起的工具调用"用的一次性确认上下文；电脑端任务没有 store，行为完全不变 */
 const toolConfirmOverride = new AsyncLocalStorage();
@@ -108,14 +112,11 @@ catch (err) {
     console.warn('[main] 统一 userData 目录失败，沿用默认：', err && err.message);
 }
 // 自动播放策略：桌宠的语音由主进程合成后推给渲染层 new Audio(...).play()，
-// 而渲染层通常没有"用户手势"（用户可能刚启动什么都没点），Electron 默认会拒绝播放。
-// 必须在 app ready 之前 appendSwitch 才生效；浏览器里桌面端的等价物是 autoplay 权限。
-try {
-    electron_1.app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
-}
-catch (err) {
-    console.warn('[main] 设置自动播放策略失败（语音可能需要先点一下页面）：', err && err.message);
-}
+// 而渲染层通常没有"用户手势"（用户可能刚启动什么都没点），Chromium 默认会拒绝播放。
+// 开关本身已提前到文件最顶部（require("./earlySwitches")）——**不能**在这里再补一次就算：
+// 那时其余 require 已经跑过一遍，只有"最早"的位置才是可靠时序。
+// 另外每个窗口的 webPreferences.autoplayPolicy 也显式写上（见 createWindow / panelWindowOptions），
+// 命令行开关与 per-window 策略双保险。
 const WINDOW_WIDTH = 360;
 const WINDOW_HEIGHT = 520;
 /** 对话气泡窗：小、无边框、透明，浮在桌宠上方（不是一个大窗口） */
@@ -914,6 +915,9 @@ function createWindow(resolver, srv) {
             contextIsolation: true,
             nodeIntegration: false,
             sandbox: false, // preload 用 contextBridge；契约以 contextIsolation:true + nodeIntegration:false 为准
+            // 桌宠会在"用户没有任何点击"的时候播 TTS/音效：显式声明免手势自动播放
+            // （命令行侧由 earlySwitches 兜底，这里按窗口再钉一次）
+            autoplayPolicy: 'no-user-gesture-required',
         },
     });
     mainWindow = win;
@@ -1281,6 +1285,9 @@ function panelWindowOptions(width, height, title) {
             contextIsolation: true,
             nodeIntegration: false,
             sandbox: false,
+            // 语音/音效都走 new Audio().play()：浮窗也显式声明不需要用户手势（默认值也是它，
+            // 写出来是为了"策略被收紧时"仍能一眼看出这里依赖什么）
+            autoplayPolicy: 'no-user-gesture-required',
         },
     };
 }
@@ -2155,7 +2162,36 @@ function applyVtsSettings(settings) {
         .then((status) => pushVtsStatus(status))
         .catch((err) => console.warn('[vts] 启动失败（不影响桌宠）：', err && err.message));
 }
-/** 设置页的 VTS 操作（IPC_VTS_ACTION）：connect / disconnect / authorize / refresh / trigger-hotkey */
+/** VTS 追踪丢帧的限频日志：10s 一条，别把 console 刷满 */
+const VTS_DROP_LOG_INTERVAL_MS = 10000;
+let vtsDropLogAt = 0;
+/**
+ * 渲染层 → 主进程的追踪帧入口（IPC_VTS_TRACKING）。
+ *
+ * **不静默丢**：未启用/未连接/未授权时除了让 VtsService 记 lastError + droppedCount，
+ * 这里再补一条限频 warning —— 否则"渲染层在发、主进程扔掉"会表现为"VTS 完全不动"且毫无线索。
+ */
+function onVtsTracking(values) {
+    const svc = vtsService;
+    const now = Date.now();
+    if (!svc) {
+        if (now - vtsDropLogAt > VTS_DROP_LOG_INTERVAL_MS) {
+            vtsDropLogAt = now;
+            console.warn('[vts] 收到渲染层追踪，但 VTS 服务还没建（未启用）：先在设置页勾「启用 VTS」→ 保存，再点「连接」');
+        }
+        return;
+    }
+    const status = svc.status();
+    if (!status.enabled || !status.connected || !status.authenticated) {
+        if (now - vtsDropLogAt > VTS_DROP_LOG_INTERVAL_MS) {
+            vtsDropLogAt = now;
+            const why = !status.enabled ? '未启用' : !status.connected ? '未连接' : '未授权';
+            console.warn(`[vts] 追踪帧被丢弃（${why}；本条日志 ${VTS_DROP_LOG_INTERVAL_MS / 1000}s 限频一次）：`, JSON.stringify(values));
+        }
+    }
+    svc.injectTracking(values);
+}
+/** 设置页的 VTS 操作（IPC_VTS_ACTION）：connect / disconnect / authorize / refresh / trigger-hotkey / test-inject */
 async function runVtsAction(action, arg) {
     const svc = ensureVtsService();
     try {
@@ -2173,6 +2209,20 @@ async function runVtsAction(action, arg) {
                     ok: status.connected,
                     status,
                     ...(status.connected ? {} : { error: status.lastError || 'VTS 连接失败（VTS 开着吗？端口对吗？）' }),
+                };
+            }
+            case 'test-inject': {
+                // 诊断用：主进程**绕过渲染层**直接注入一帧固定追踪值，1 秒后归零。
+                // ok=true 只代表 VTS 接受了注入请求；真实生效用 scripts/check-vts.js 读回 VTS 输入参数确认
+                // （注意：VTS 自己开着摄像头追踪时，FaceAngleX/EyeLeftX 每帧会被它写回去，MouthOpen 最适合当判据）。
+                const result = await svc.testInject();
+                pushVtsStatus(result.status);
+                if (!result.ok) return { ok: false, status: result.status, error: result.error || '测试注入失败' };
+                const injected = result.status.lastTracking ? JSON.stringify(result.status.lastTracking) : '{}';
+                return {
+                    ok: true,
+                    status: result.status,
+                    message: `测试注入已发送：faceAngleX=15 / eyeLeftX=0.6 / mouthOpen=0.7（${vtsService_1.VTS_TEST_INJECT_HOLD_MS}ms 后归零）｜累计注入 ${result.status.injectedCount} 帧｜最近一帧 ${injected}`,
                 };
             }
             case 'disconnect': {
@@ -2365,7 +2415,7 @@ async function bootstrap() {
             lastError: '',
         }),
         vtsAction: (action, arg) => runVtsAction(action, arg),
-        onVtsTracking: (values) => vtsService?.injectTracking(values),
+        onVtsTracking: (values) => onVtsTracking(values),
         onVtsMouth: (value) => vtsService?.injectTracking({ mouthOpen: value }),
         onSettingsSaved: (next) => {
             applyAutoTaskSettings(next);

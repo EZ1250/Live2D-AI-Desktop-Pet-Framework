@@ -42,7 +42,25 @@ export interface VtsStatus {
   modelLoaded: boolean;
   /** 最近一次失败的**可读**原因；成功后清空。可能来自连接/授权/注入 */
   lastError: string;
+  /** 已成功注入 VTS 的追踪帧数（start/stop 时清零） */
+  injectedCount: number;
+  /** 最近一次成功注入的时刻（ISO 字符串；从未注入过为空串） */
+  lastInjectedAt: string;
+  /** 最近一次成功注入的追踪值（逻辑字段名，见 vtsClient.ts 的 VtsTrackingField） */
+  lastTracking: VtsTrackingValues | null;
+  /** 因未启用/未连接/未授权被丢弃的追踪帧数（验证"渲染层在发但主进程丢了"用） */
+  droppedCount: number;
 }
+
+/** 「测试注入」用的固定一帧：不做视线换算，只验证主进程 → VTS 这条路 */
+export const VTS_TEST_INJECT_VALUES: Readonly<VtsTrackingValues> = Object.freeze({
+  faceAngleX: 15,
+  eyeLeftX: 0.6,
+  mouthOpen: 0.7,
+});
+
+/** 测试注入的保持时长（之后归零） */
+export const VTS_TEST_INJECT_HOLD_MS = 1000;
 
 /** start() 的入参：一个都不给就用构造时的默认值 */
 export interface VtsStartOptions {
@@ -65,7 +83,18 @@ export interface VtsServiceOptions {
 }
 
 function emptyStatus(): VtsStatus {
-  return { enabled: false, connected: false, authenticated: false, modelName: '', modelLoaded: false, lastError: '' };
+  return {
+    enabled: false,
+    connected: false,
+    authenticated: false,
+    modelName: '',
+    modelLoaded: false,
+    lastError: '',
+    injectedCount: 0,
+    lastInjectedAt: '',
+    lastTracking: null,
+    droppedCount: 0,
+  };
 }
 
 function errorMessage(err: unknown): string {
@@ -213,7 +242,7 @@ export class VtsService {
   /**
    * 注入一帧追踪值（高频调用；**永不抛**）。
    *
-   * 未启用/未连接/未授权时静默丢弃并记 lastError；在途时只留最后一帧，
+   * 未启用/未连接/未授权时丢弃并记 lastError + droppedCount；在途时只留最后一帧，
    * 所以 30fps 调用也不会把 websocket 请求堆起来。
    */
   injectTracking(values: unknown): void {
@@ -224,7 +253,10 @@ export class VtsService {
         : !this.current.connected
           ? 'VTS 未连接，追踪已丢弃'
           : 'VTS 未授权，追踪已丢弃';
-      if (this.current.lastError !== reason) this.setStatus({ lastError: reason });
+      this.setStatus({
+        ...(this.current.lastError !== reason ? { lastError: reason } : {}),
+        droppedCount: this.current.droppedCount + 1,
+      });
       return;
     }
     const cleaned = normalizeTrackingValues(values);
@@ -234,6 +266,51 @@ export class VtsService {
       return;
     }
     this.sendFrame(client, cleaned);
+  }
+
+  /**
+   * 「测试注入」：主进程**绕过渲染层**直接注入一帧固定追踪值（faceAngleX=15 /
+   * eyeLeftX=0.6 / mouthOpen=0.7），保持 1 秒后归零。
+   *
+   * 用途：设置页点一下就能判断"主进程 → VTS"这条路通不通——不依赖渲染层是否在发视线。
+   * 返回 ok=true 只代表 VTS **接受了请求**（真实生效与否要用 scripts/check-vts.js 读回模型参数）。
+   * 永不 reject。
+   */
+  async testInject(): Promise<{ ok: boolean; error?: string; status: VtsStatus }> {
+    let client: VtsClient;
+    try {
+      client = this.requireReadyClient();
+    } catch (err) {
+      const message = errorMessage(err);
+      this.setStatus({ lastError: message });
+      return { ok: false, error: message, status: this.status() };
+    }
+    const values: VtsTrackingValues = { ...VTS_TEST_INJECT_VALUES };
+    try {
+      await client.injectTracking(values);
+      this.markInjected(values);
+    } catch (err) {
+      const message = `VTS 测试注入失败：${errorMessage(err)}`;
+      this.setStatus({ lastError: message });
+      return { ok: false, error: message, status: this.status() };
+    }
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, VTS_TEST_INJECT_HOLD_MS);
+      if (typeof timer.unref === 'function') timer.unref();
+    });
+    const zero: VtsTrackingValues = {};
+    for (const key of Object.keys(values) as Array<keyof VtsTrackingValues>) zero[key] = 0;
+    try {
+      // 客户端可能在 1 秒里断开（用户点了「断开」/VTS 退出）
+      if (client !== this.client) return { ok: false, error: 'VTS 在测试注入期间断开，未能归零', status: this.status() };
+      await client.injectTracking(zero);
+      this.markInjected(zero);
+    } catch (err) {
+      const message = `VTS 测试注入归零失败：${errorMessage(err)}`;
+      this.setStatus({ lastError: message });
+      return { ok: false, error: message, status: this.status() };
+    }
+    return { ok: true, status: this.status() };
   }
 
   /** 触发热键（按名字）；失败抛错（调用方要看到"为什么没触发"） */
@@ -289,9 +366,8 @@ export class VtsService {
     this.inflight = true;
     void client.injectTracking(values)
       .then(() => {
-        if (client === this.client && this.current.lastError.includes('追踪注入失败')) {
-          this.setStatus({ lastError: '' });
-        }
+        if (client !== this.client) return;
+        this.markInjected(values);
       })
       .catch((err: unknown) => {
         if (client !== this.client) return;
@@ -307,6 +383,18 @@ export class VtsService {
         this.queued = null;
         if (next) this.sendFrame(client, next);
       });
+  }
+
+  /** 记一笔"VTS 已接受这一帧"（设置页的 injectedCount / lastInjectedAt / lastTracking 用它） */
+  private markInjected(values: VtsTrackingValues): void {
+    this.setStatus({
+      injectedCount: this.current.injectedCount + 1,
+      lastInjectedAt: new Date().toISOString(),
+      lastTracking: { ...values },
+      ...(this.current.lastError.includes('追踪注入失败') || this.current.lastError.includes('测试注入失败')
+        ? { lastError: '' }
+        : {}),
+    });
   }
 
   private async authenticateOn(

@@ -56,6 +56,35 @@ async function readProbe(client) {
   return out;
 }
 
+/**
+ * 从 VTS 的**输入参数**（tracking 参数，插件能直接注入的那一层）里读回值。
+ *
+ * 这是"注入到底有没有被 VTS 收下"最直接的证据：
+ *   - 模型参数（ParamAngleX）会被 VTS 自己的追踪 / Idle 动画覆盖，单独看它会误判；
+ *   - 输入参数（FaceAngleX / MouthOpen）只有插件注入和 VTS 追踪会写，能立刻看到我们发的值。
+ */
+const INPUT_PROBE_PARAMS = ['FaceAngleX', 'FaceAngleY', 'EyeLeftX', 'EyeRightX', 'MouthOpen'];
+
+async function readInputs(client) {
+  const data = await client.request('InputParameterListRequest', {});
+  const list = Array.isArray(data.defaultParameters) ? data.defaultParameters : [];
+  const out = {};
+  for (const name of INPUT_PROBE_PARAMS) {
+    const found = list.find((p) => p && p.name === name);
+    out[name] = found && typeof found.value === 'number' ? Number(found.value.toFixed(3)) : null;
+  }
+  return out;
+}
+
+/** 测试注入判定：VTS 是否真的收下了我们发的那几个值 */
+function testInjectAccepted(during) {
+  if (!during) return false;
+  const mouth = typeof during.MouthOpen === 'number' && during.MouthOpen > 0.5;
+  const face = typeof during.FaceAngleX === 'number' && Math.abs(during.FaceAngleX - 15) < 3;
+  const eye = typeof during.EyeLeftX === 'number' && Math.abs(during.EyeLeftX - 0.6) < 0.2;
+  return mouth || face || eye;
+}
+
 function changed(before, after, name) {
   const a = before[name];
   const b = after[name];
@@ -100,6 +129,7 @@ function changed(before, after, name) {
     service.injectTracking({ faceAngleX: 0, eyeLeftX: 0, eyeRightX: 0, mouthOpen: 0 });
     await wait(holdMs);
     const before = await readProbe(client);
+    const beforeInputs = await readInputs(client);
     service.injectTracking({ faceAngleX: 15, eyeLeftX: 0.6, eyeRightX: 0.6, mouthOpen: 0.7 });
     await wait(holdMs);
     const holding = await readProbe(client);
@@ -125,13 +155,46 @@ function changed(before, after, name) {
     // 判定：注入后至少一个模型参数明显变了（>0.2），且归 0 后又回到基线附近（<0.2）
     const moved = Object.values(report.injectTracking.deltas).some((d) => typeof d === 'number' && d > 0.2);
     const restored = Object.values(report.injectTracking.restored).every((d) => typeof d !== 'number' || d < 0.2);
-    report.injectTracking.effective = moved && restored && !service.status().lastError;
+    report.injectTracking.visibleOnModel = moved && restored && !service.status().lastError;
     console.log(
       `注入 FaceAngleX=15/EyeLeftX=0.6/MouthOpen=0.7 → ParamAngleX ${before.ParamAngleX}→${holding.ParamAngleX}→${after.ParamAngleX}` +
-        `（有效=${report.injectTracking.effective}）`,
+        `（模型参数可见变化=${report.injectTracking.visibleOnModel}）`,
     );
-    if (!report.injectTracking.effective) {
-      console.log('  ⚠ 注入未通过判定：确认 VTS 里没在播动画/Idle 覆盖 ParamAngleX（等动画播完再测），或模型没有对应参数。');
+    if (!report.injectTracking.visibleOnModel) {
+      console.log('  ⚠ 模型参数没跟着变：常见原因是 VTS 自己的摄像头追踪/Idle 动画每帧把 ParamAngleX 写回去');
+      console.log('            （插件注入对"头/眼"只赢一帧）—— 不代表注入没送到，下一步用输入参数判定。');
+    }
+
+    // 3.2) 「测试注入」同一条代码路径（设置页按钮 = VTS_TEST_INJECT_VALUES + 1s 后归零）
+    //      判据换成 VTS **输入参数**：它只可能被插件注入或 VTS 自己的追踪写，能证明"主进程 → VTS"通。
+    try {
+      const injectPromise = service.testInject();
+      await wait(350); // 保持期内采样
+      const duringInputs = await readInputs(client);
+      const result = await injectPromise;
+      await wait(300);
+      const afterInputs = await readInputs(client);
+      report.testInject = {
+        ok: result.ok,
+        error: result.error ?? '',
+        beforeInputs,
+        duringInputs,
+        afterInputs,
+        injectedCount: result.status.injectedCount,
+        lastTracking: result.status.lastTracking,
+        acceptedByVts: testInjectAccepted(duringInputs),
+      };
+      console.log(
+        `测试注入（test-inject）→ 输入参数 FaceAngleX=${duringInputs.FaceAngleX} EyeLeftX=${duringInputs.EyeLeftX} MouthOpen=${duringInputs.MouthOpen}` +
+          `（VTS 收下=${report.testInject.acceptedByVts}，累计注入 ${report.testInject.injectedCount} 帧）`,
+      );
+      if (!report.testInject.acceptedByVts) {
+        console.log('  ⚠ 输入参数里没看到 15 / 0.6 / 0.7：注入没被 VTS 接受，检查授权与模型；');
+        console.log('            也可能 VTS 的追踪每帧都在覆盖同一个参数（MouthOpen 通常不会被覆盖，最适合当判据）。');
+      }
+    } catch (err) {
+      report.testInject = { ok: false, error: err instanceof Error ? err.message : String(err) };
+      console.log(`测试注入失败：${report.testInject.error}`);
     }
 
     // 4) 热键列表（实测消息类型是 HotkeysInCurrentModelRequest；HotkeyListRequest 会被 VTS 拒）
@@ -161,11 +224,26 @@ function changed(before, after, name) {
       console.log('热键触发：跳过（当前模型没有热键）');
     }
 
-    // 成功率判定：授权 + 模型 + 注入生效 才算通过；热键没有/失败单独标注，不掩盖
+    // 成功率判定：授权 + 模型 + "VTS 收下了测试注入" 才算通过；热键没有/失败单独标注，不掩盖。
+    // 注意：不再用"模型参数可见变化"当通过条件 —— VTS 自己的追踪会覆盖 FaceAngleX，那会把
+    // "链路通但看不见"误判成"注入失败"。模型参数可见与否单独放在 injectTracking.visibleOnModel。
+    const accepted = report.testInject ? report.testInject.acceptedByVts === true : false;
     report.ok = report.connect.connected === true
       && report.connect.authenticated === true
       && report.model.modelLoaded === true
-      && report.injectTracking.effective === true;
+      && accepted;
+    if (!report.ok) {
+      console.log('判定：未通过（' + [
+        report.connect.connected ? '' : '连接失败',
+        report.connect.authenticated ? '' : '未授权',
+        report.model.modelLoaded ? '' : '模型未加载',
+        accepted ? '' : '测试注入未被 VTS 收下',
+      ].filter(Boolean).join('、') + '）');
+    } else if (!report.injectTracking.visibleOnModel) {
+      console.log('判定：通过（VTS 已收下注入；但模型参数被 VTS 自己的追踪覆盖，画面上看不到头/眼跟随）');
+    } else {
+      console.log('判定：通过（注入被 VTS 收下，且模型参数可见变化）');
+    }
     exitCode = report.ok ? 0 : 1;
   } catch (err) {
     report.ok = false;

@@ -29,11 +29,14 @@ const COMMON_HEADERS: http.OutgoingHttpHeaders = {
  * 因此禁止远程 script/style/img/connect，锁死 base 标签与嵌套框架。
  * 'unsafe-eval' 是 Pixi 里 new Function（WebGL 程序编译）需要的；'unsafe-inline' 供 JS 设置的样式属性。
  * worker-src/child-src 放行 blob:：Pixi 8 的贴图解码用 blob worker，不给会 SecurityError（模型挂不上）。
+ * media-src 必须放行 data:：TTS 音频是 `data:audio/mpeg;base64,...`（见 ttsService），
+ * 不给 data: 会被 CSP 拦成 "Media load rejected by URL safety check"，表现为"点试听没声音"。
+ * （2026-11 实测：Electron 31 的 autoplay 默认本就免手势，真正的拦截来自这条 CSP。）
  * 若某天出现白屏且怀疑是它：注掉下面这一行 + handleRequest 里的 CSP 赋值即可回滚。
  */
 const HTML_CSP =
   "default-src 'self'; script-src 'self' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; " +
-  "img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; font-src 'self' data:; " +
+  "img-src 'self' data: blob:; media-src 'self' blob: data:; connect-src 'self'; font-src 'self' data:; " +
   "worker-src 'self' blob:; child-src 'self' blob:; " +
   "object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
 

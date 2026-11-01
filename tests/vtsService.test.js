@@ -241,11 +241,129 @@ test('stop 之后状态清空，注入恢复为静默丢弃；可以把服务重
   assert.equal(service.status().connected, true);
   service.stop();
   assert.deepEqual(service.status(), {
-    enabled: false, connected: false, authenticated: false, modelName: '', modelLoaded: false, lastError: '',
+    enabled: false,
+    connected: false,
+    authenticated: false,
+    modelName: '',
+    modelLoaded: false,
+    lastError: '',
+    injectedCount: 0,
+    lastInjectedAt: '',
+    lastTracking: null,
+    droppedCount: 0,
   });
   assert.doesNotThrow(() => service.injectTracking({ faceAngleX: 1 }));
 
   const again = await service.start({ enabled: true });
   assert.equal(again.connected, true);
   assert.equal(again.authenticated, true);
+});
+
+/* ---------------------------------------------------------------- 诊断字段（injectedCount / lastTracking） */
+
+test('注入成功后 status 记 injectedCount / lastInjectedAt / lastTracking，值按 VTS 区间夹取', async (t) => {
+  const server = await createMockVtsServer(createHandler());
+  const token = tempTokenFile('tok-service-1');
+  const service = new VtsService({ url: server.url, tokenStorePath: token.file, logger: silent });
+  t.after(async () => { service.dispose(); await server.close(); token.cleanup(); });
+  await service.start({ enabled: true });
+
+  assert.equal(service.status().injectedCount, 0);
+  assert.equal(service.status().lastInjectedAt, '');
+  assert.deepEqual(service.status().lastTracking, null);
+
+  // faceAngleX 100 会被夹到 30；未知字段直接丢掉
+  service.injectTracking({ faceAngleX: 100, eyeLeftX: 0.5, notAField: 1 });
+  await wait(80);
+
+  const st = service.status();
+  assert.equal(st.injectedCount, 1, '成功注入一帧后计数必须 +1（设置页靠它判断"渲染层有没有在发"）');
+  assert.match(st.lastInjectedAt, /^\d{4}-\d{2}-\d{2}T/, 'lastInjectedAt 应是 ISO 时间串');
+  assert.deepEqual(st.lastTracking, { faceAngleX: 30, eyeLeftX: 0.5 });
+  assert.equal(st.droppedCount, 0);
+
+  const injections = server.requests.filter((r) => r.messageType === 'InjectParameterDataRequest');
+  assert.equal(injections.length, 1);
+  assert.deepEqual(injections[0].data.parameterValues, [
+    { id: 'FaceAngleX', value: 30 },
+    { id: 'EyeLeftX', value: 0.5 },
+  ]);
+});
+
+test('未连接/未授权时丢帧会累加 droppedCount（不静默：状态行能看出丢了多少）', async (t) => {
+  const server = await createMockVtsServer(createHandler());
+  const token = tempTokenFile(); // 没有 token → 连上了但未授权
+  const service = new VtsService({ url: server.url, tokenStorePath: token.file, logger: silent });
+  t.after(async () => { service.dispose(); await server.close(); token.cleanup(); });
+  await service.start({ enabled: true });
+  assert.equal(service.status().authenticated, false);
+
+  for (let i = 0; i < 5; i += 1) service.injectTracking({ faceAngleX: i });
+  const st = service.status();
+  assert.equal(st.droppedCount, 5);
+  assert.equal(st.injectedCount, 0);
+  assert.equal(st.lastInjectedAt, '');
+  assert.match(st.lastError, /未授权/);
+  assert.equal(server.requests.filter((r) => r.messageType === 'InjectParameterDataRequest').length, 0);
+});
+
+/* ---------------------------------------------------------------- 测试注入（设置页「测试注入」按钮） */
+
+test('testInject：主进程直接注入 15/0.6/0.7，1 秒后归零（两帧都记进计数）', async (t) => {
+  const server = await createMockVtsServer(createHandler());
+  const token = tempTokenFile('tok-service-1');
+  const service = new VtsService({ url: server.url, tokenStorePath: token.file, logger: silent });
+  t.after(async () => { service.dispose(); await server.close(); token.cleanup(); });
+  await service.start({ enabled: true });
+
+  const result = await service.testInject();
+  assert.equal(result.ok, true, result.error);
+  assert.equal(result.status.injectedCount, 2, '保持帧 + 归零帧都要计入');
+
+  const injections = server.requests.filter((r) => r.messageType === 'InjectParameterDataRequest');
+  assert.equal(injections.length, 2);
+  assert.deepEqual(injections[0].data.parameterValues, [
+    { id: 'FaceAngleX', value: 15 },
+    { id: 'EyeLeftX', value: 0.6 },
+    { id: 'MouthOpen', value: 0.7 },
+  ]);
+  assert.deepEqual(injections[1].data.parameterValues, [
+    { id: 'FaceAngleX', value: 0 },
+    { id: 'EyeLeftX', value: 0 },
+    { id: 'MouthOpen', value: 0 },
+  ]);
+  assert.deepEqual(injections[0].data.faceFound, true, '桌宠没有人脸追踪：必须显式 faceFound=true');
+  assert.equal(injections[0].data.mode, 'set');
+  assert.deepEqual(service.status().lastTracking, { faceAngleX: 0, eyeLeftX: 0, mouthOpen: 0 });
+  assert.equal(service.status().lastError, '');
+});
+
+test('testInject：未连接时返回 ok=false + 可读错误（永不 reject、不假装成功）', async (t) => {
+  const token = tempTokenFile('tok-service-1');
+  const service = new VtsService({ url: 'ws://127.0.0.1:1', tokenStorePath: token.file, logger: silent });
+  t.after(async () => { service.dispose(); token.cleanup(); });
+
+  const result = await service.testInject();
+  assert.equal(result.ok, false);
+  assert.match(result.error, /VTS 未连接/);
+  assert.match(service.status().lastError, /VTS 未连接/);
+  assert.equal(service.status().injectedCount, 0);
+});
+
+test('testInject：VTS 拒绝注入时把原因写进 lastError（不吞错）', async (t) => {
+  const server = await createMockVtsServer(async (message) => {
+    if (message.messageType === 'InjectParameterDataRequest') {
+      return envelope(message, 'APIError', { errorID: 453, message: 'Parameter does not exist' });
+    }
+    return createHandler()(message);
+  });
+  const token = tempTokenFile('tok-service-1');
+  const service = new VtsService({ url: server.url, tokenStorePath: token.file, logger: silent });
+  t.after(async () => { service.dispose(); await server.close(); token.cleanup(); });
+  await service.start({ enabled: true });
+
+  const result = await service.testInject();
+  assert.equal(result.ok, false);
+  assert.match(result.error, /测试注入失败/);
+  assert.match(service.status().lastError, /#453/);
 });

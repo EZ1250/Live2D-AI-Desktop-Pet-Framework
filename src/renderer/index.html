@@ -22,9 +22,11 @@
        端口运行时才知，故 connect-src/img-src 放行 127.0.0.1 与 localhost 任意端口。
        unsafe-eval：Pixi 内部需要 new Function（WebGL 着色器/程序编译路径）。
        worker-src/child-src blob:：Pixi 8 的贴图解码会用 blob worker（不给就 SecurityError → 模型挂不上）。
+       media-src 必须带 data:：TTS 语音是 `data:audio/mpeg;base64,...` 的 data URL，
+       缺 data: 时 play() 会被 CSP 拦掉（"Media load rejected by URL safety check"）→ 试听没声音。
        应用只加载本地自带脚本、无任何远程脚本，故放行以保证 moc3 渲染可用。 -->
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self'; script-src 'self' 'unsafe-eval' blob:; style-src 'self'; img-src 'self' data: blob: http://127.0.0.1:* http://localhost:*; media-src http://127.0.0.1:* http://localhost:* blob:; connect-src 'self' http://127.0.0.1:* http://localhost:*; worker-src 'self' blob:; child-src 'self' blob:; font-src 'self'" />
+        content="default-src 'self'; script-src 'self' 'unsafe-eval' blob:; style-src 'self'; img-src 'self' data: blob: http://127.0.0.1:* http://localhost:*; media-src http://127.0.0.1:* http://localhost:* blob: data:; connect-src 'self' http://127.0.0.1:* http://localhost:*; worker-src 'self' blob:; child-src 'self' blob:; font-src 'self'" />
   <title>Pet</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
@@ -211,8 +213,16 @@
           <button id="setting-vts-authorize" type="button" title="让 VTS 弹一次授权窗（只需一次，token 会保存到本机）">授权</button>
           <button id="setting-vts-disconnect" type="button">断开</button>
           <button id="setting-vts-refresh" type="button" title="重新读取 VTS 当前模型名">刷新状态</button>
+          <button id="setting-vts-test-inject" type="button" title="主进程绕过渲染层直接注入 faceAngleX=15 / eyeLeftX=0.6 / mouthOpen=0.7，1 秒后归零：用来判断「主进程 → VTS」通不通">测试注入</button>
         </div>
         <p id="setting-vts-status" class="settings-status" role="status">读取 VTS 状态…</p>
+        <!-- 排障提示：这两句是从真实联调里总结出来的，直接写在这里省得用户来回问 -->
+        <p class="settings-status">
+          自查顺序：状态行「已注入 N 帧」不动 → 渲染层没在发（控制台 <code>__petDebug.vts()</code>）；
+          N 在涨但 VTS 里模型不动 → 点「测试注入」：通就说明是 VTS 侧。<br />
+          注意：VTS 里若开着<b>摄像头追踪</b>，它每帧都会把 FaceAngleX/EyeLeftX 写回自己的值，
+          插件注入对「头/眼」只赢一帧 —— 要让 VTS 里的模型跟鼠标，请先在 VTS 里关掉摄像头追踪。
+        </p>
         <label class="settings-row">热键表情
           <input id="setting-vts-hotkey" type="text" maxlength="60" placeholder="VTS 里的热键名，例如「开心」" autocomplete="off" spellcheck="false" />
           <button id="setting-vts-hotkey-run" type="button" title="在当前 VTS 模型里按名字找到热键并触发">触发热键</button>

@@ -1025,7 +1025,7 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
 }
 
 /** 允许的 VTS 操作名（与 contracts 的 VtsActionName 一一对应；白名单校验防脏字符串） */
-const VTS_ACTIONS: readonly VtsActionName[] = ['connect', 'disconnect', 'authorize', 'refresh', 'trigger-hotkey'];
+const VTS_ACTIONS: readonly VtsActionName[] = ['connect', 'disconnect', 'authorize', 'refresh', 'trigger-hotkey', 'test-inject'];
 
 /** 读 VTS 状态，但绝不让它把 IPC 弄崩（状态只是展示用） */
 function safeVtsStatus(deps: IpcDeps): VtsStatusDto | null {

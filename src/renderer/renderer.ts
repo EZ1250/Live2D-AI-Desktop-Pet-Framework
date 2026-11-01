@@ -679,7 +679,8 @@ function frameLoop(nowMs: number): void {
   accMs = 0;
   try {
     gazeApi()?.tick(nowMs); // 先喂视线目标，handle.update 内做平滑插值
-    pushVtsTracking(nowMs); // VTS 可选后端：把视线按 ~30fps 同步出去（未启用时零开销）
+    // VTS 追踪推送不在这里：它由独立的 33ms 定时器驱动（不受本循环的空闲降帧影响，
+    // 见 setVtsTrackingEnabled / startVtsPushTimer）
     currentHandle?.update?.(nowSec, deltaSec);
   } catch (err) {
     console.warn('[renderer] 帧更新失败', err);
@@ -783,12 +784,36 @@ const VTS_EYE_GAIN = 0.6;
 
 let vtsTrackingEnabled = false;
 let vtsTrackingBridge: RendererBridge | null = null;
-let lastVtsPushAt = 0;
+/**
+ * VTS 推送定时器（33ms）。
+ *
+ * **不能挂在主循环里**：主循环空闲时会降到 24fps（41.7ms/帧），VTS 虽然还能收到，
+ * 但"设置页里说 30fps、实际是 24fps"会给排障添乱；而且文档隐藏时 RAF 会停。
+ * 这里用独立 setInterval：启用 VTS 就固定 33ms 发一帧（值可以是全 0，静止时也发）。
+ */
+let vtsPushTimer: number | null = null;
+/** 自查计数：已发出的帧数 / 最后一帧 / 最后发送时刻 / 发送异常（__petDebug.vts() 用） */
+let vtsSentCount = 0;
+let vtsLastSent: VtsTrackingValues | null = null;
+let vtsLastSentAt = 0;
+let vtsLastSendError = '';
 
 /** 打开/关闭 VTS 追踪推送（设置里勾「启用 VTS」并保存后生效；启动时按设置应用一次） */
 function setVtsTrackingEnabled(on: boolean): void {
   vtsTrackingEnabled = on === true;
-  if (!vtsTrackingEnabled) lastVtsPushAt = 0;
+  if (vtsTrackingEnabled) startVtsPushTimer();
+  else stopVtsPushTimer();
+}
+
+function startVtsPushTimer(): void {
+  if (vtsPushTimer !== null) return;
+  vtsPushTimer = window.setInterval(pushVtsTracking, VTS_PUSH_INTERVAL_MS) as unknown as number;
+}
+
+function stopVtsPushTimer(): void {
+  if (vtsPushTimer === null) return;
+  window.clearInterval(vtsPushTimer);
+  vtsPushTimer = null;
 }
 
 /** 归一化视线 [-1,1] → 一帧 VTS 追踪值（只含可算的字段） */
@@ -805,21 +830,42 @@ function gazeToVtsTracking(nx: number, ny: number): VtsTrackingValues {
   };
 }
 
-/** 主循环每帧调用：启用且到间隔就把当前视线换算成追踪参数发出去（fire-and-forget） */
-function pushVtsTracking(nowMs: number): void {
+/**
+ * 定时器每 33ms 调一次：启用且 bridge 可用就把当前视线换算成追踪参数发出去（fire-and-forget）。
+ * 视线"静止过期"时发全 0 —— 与桌宠自己回正一致，也保证 VTS 侧不会一直歪着头。
+ */
+function pushVtsTracking(): void {
   if (!vtsTrackingEnabled) return;
   const bridge = vtsTrackingBridge;
   if (!bridge || typeof bridge.sendVtsTracking !== 'function') return;
-  if (lastVtsPushAt && nowMs - lastVtsPushAt < VTS_PUSH_INTERVAL_MS) return;
-  lastVtsPushAt = nowMs;
   const gaze = gazeApi()?.state();
-  if (!gaze) return;
-  // 静止归零与桌宠自己一致：鼠标停 3s 后视线回正，VTS 那边也别一直歪着头
+  const values = gaze ? gazeToVtsTracking(gaze.stale ? 0 : gaze.nx, gaze.stale ? 0 : gaze.ny) : gazeToVtsTracking(0, 0);
   try {
-    bridge.sendVtsTracking(gazeToVtsTracking(gaze.stale ? 0 : gaze.nx, gaze.stale ? 0 : gaze.ny));
-  } catch {
-    /* 高频通道：发失败不能影响主循环 */
+    bridge.sendVtsTracking(values);
+    vtsSentCount += 1;
+    vtsLastSent = values;
+    vtsLastSentAt = Date.now();
+    vtsLastSendError = '';
+  } catch (err) {
+    /* 高频通道：发失败不能影响主循环，但要留痕给 __petDebug.vts() 自查 */
+    vtsLastSendError = (err as Error)?.message ?? String(err);
   }
+}
+
+/** __petDebug.vts() 的快照：判断"渲染层到底有没有在发" */
+function vtsDebugState(): Any {
+  return {
+    enabled: vtsTrackingEnabled,
+    sentCount: vtsSentCount,
+    lastSent: vtsLastSent,
+    lastSentAt: vtsLastSentAt ? new Date(vtsLastSentAt).toISOString() : '',
+    sinceLastMs: vtsLastSentAt ? Date.now() - vtsLastSentAt : null,
+    lastError: vtsLastSendError,
+    bridgeOk: !!vtsTrackingBridge && typeof vtsTrackingBridge.sendVtsTracking === 'function',
+    timerRunning: vtsPushTimer !== null,
+    intervalMs: VTS_PUSH_INTERVAL_MS,
+    gaze: gazeApi()?.state() ?? null,
+  };
 }
 
 /* ================================================================
@@ -3325,13 +3371,32 @@ async function runAutoTaskNowFromUi(bridge: RendererBridge): Promise<void> {
 
 /* ---------- 设置页：VTube Studio（可选后端）+ Edge TTS 试听 ---------- */
 
-/** VTS 状态行文本：连接/授权/模型/错误 */
+/**
+ * VTS 状态行文本：连接/授权/模型/注入统计/错误。
+ *
+ * 注入统计是排障关键：`injectedCount` 一直不涨 = 渲染层根本没在发（或主进程全丢了）；
+ * 涨了但 VTS 里模型不动 = 主进程→VTS 这一段的问题（用「测试注入」再区分一次）。
+ * droppedCount 是"主进程收到但没连上/没授权，被丢弃"的帧数。
+ */
 function describeVtsStatus(st: VtsStatusDto | null): string {
   if (!st) return '当前版本不支持 VTS（主进程未接 VTS 服务）';
   const link = st.connected ? (st.authenticated ? '已连接 · 已授权' : '已连接 · 未授权') : st.enabled ? '未连接' : '未启用';
   const model = st.modelName ? ` · 模型：${st.modelName}` : st.modelLoaded ? '' : ' · 未加载模型';
+  let injected = '';
+  if (typeof st.injectedCount === 'number') {
+    const at = st.lastInjectedAt ? ` · 最近 ${formatClock(st.lastInjectedAt)}` : '';
+    injected = ` · 已注入 ${st.injectedCount} 帧${at}`;
+    if (typeof st.droppedCount === 'number' && st.droppedCount > 0) injected += ` · 丢弃 ${st.droppedCount}`;
+  }
   const err = st.lastError ? `｜${st.lastError}` : '';
-  return `${link}${model}${err}`;
+  return `${link}${model}${injected}${err}`;
+}
+
+/** ISO 时间 → 本地 HH:MM:SS（状态行只给"最近一次注入"用，不显示日期） */
+function formatClock(iso: string): string {
+  const t = new Date(iso);
+  if (Number.isNaN(t.getTime())) return iso;
+  return t.toLocaleTimeString('zh-CN', { hour12: false });
 }
 
 /** 渲染一行 VTS 状态 */
@@ -3393,11 +3458,120 @@ async function runVtsActionFromUi(bridge: RendererBridge, action: 'connect' | 'a
 }
 
 /**
- * 播放一段主进程合成的语音。
- * 自动播放可能被拦（没有用户手势）：appendSwitch('autoplay-policy', ...) 已在主进程加上，
- * 但仍可能在别的环境下失败 —— 失败要给出可操作的提示，不能静默没声音。
+ * 设置页「测试注入」：让**主进程**直接注入一帧固定追踪值（faceAngleX=15 / eyeLeftX=0.6 /
+ * mouthOpen=0.7），1 秒后归零。
+ *
+ * 它完全绕过渲染层的视线链路，所以能把问题切成两半：
+ *   - 点它 VTS 里模型动了 → 主进程→VTS 通；那"动鼠标没反应"就出在渲染层（看 __petDebug.vts()）
+ *   - 点它也不动 → 是 VTS 侧的授权/模型/参数映射问题，与渲染层无关
+ * 注意：ok=true 只代表 VTS 接受了请求；真实生效用 scripts/check-vts.js 读回 VTS **输入参数**
+ * 判断（MouthOpen 最可靠：VTS 自己的摄像头追踪不会写它；而 FaceAngleX/EyeLeftX 每帧会被追踪写回去）。
  */
+async function runVtsTestInjectFromUi(bridge: RendererBridge): Promise<void> {
+  const btn = elementById<HTMLButtonElement>('setting-vts-test-inject');
+  if (typeof bridge.vtsAction !== 'function') {
+    setSettingsStatus('当前版本不支持 VTS 操作（preload 未暴露 vtsAction）', true);
+    return;
+  }
+  if (btn) btn.disabled = true;
+  setSettingsStatus('测试注入：主进程直接发 faceAngleX=15 / eyeLeftX=0.6 / mouthOpen=0.7（1 秒后归零）…');
+  try {
+    const result = await bridge.vtsAction('test-inject');
+    renderVtsStatus(result.status ?? null);
+    if (!result.ok) {
+      setSettingsStatus(result.error ?? '测试注入失败（先点「连接」和「授权」）', true);
+      return;
+    }
+    setSettingsStatus(result.message ?? '测试注入已发送');
+  } catch (err) {
+    setSettingsStatus(`测试注入失败：${(err as Error).message ?? String(err)}`, true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+/* ---------------------------------------------------------------- TTS 播放 */
+
+/** 一段 50ms 的静音 wav（8kHz/8bit 单声道）：只为在用户手势里"预热"音频通道，没有声音 */
+const SILENT_WAV_DATA_URL =
+  'data:audio/wav;base64,UklGRrQBAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YZABAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA';
+
 let ttsAudioEl: HTMLAudioElement | null = null;
+/** 音频通道是否已经在用户手势里解锁过 */
+let ttsUnlocked = false;
+let ttsAudioContext: AudioContext | null = null;
+/** 最近一次 TTS 播放失败（原始 name/message，诊断与设置页提示都用它） */
+let ttsLastError = '';
+
+/**
+ * 音频解锁：必须在**用户手势的同一个调用栈里**跑。
+ *
+ * 为什么要它：主进程合成 TTS 是异步的（IPC 回来时手势早已失效），如果运行环境的
+ * autoplay 策略是 user-gesture-required 系，play() 会直接 NotAllowedError。
+ * 这里在首次点击/按键时先 resume 一个 AudioContext + 静音播一个空音频，
+ * 之后（同一文档内）再播就一路畅通。命令行的 autoplay-policy 开关仍在（earlySwitches），
+ * 这层是"策略被收紧也还能出声"的兜底。
+ */
+function unlockTtsAudio(): void {
+  if (ttsUnlocked) return;
+  ttsUnlocked = true;
+  try {
+    const Ctor = (window as Any).AudioContext ?? (window as Any).webkitAudioContext;
+    if (typeof Ctor === 'function') {
+      ttsAudioContext = new Ctor() as AudioContext;
+      void ttsAudioContext.resume().catch(() => {});
+    }
+  } catch (err) {
+    console.warn('[renderer] AudioContext 解锁失败（继续尝试直接播放）', err);
+  }
+  try {
+    const silent = new Audio(SILENT_WAV_DATA_URL);
+    silent.volume = 0;
+    const played = silent.play();
+    if (played && typeof played.catch === 'function') void played.catch(() => {});
+    window.setTimeout(() => {
+      try {
+        silent.pause();
+      } catch {
+        /* 已销毁 */
+      }
+    }, 600);
+  } catch (err) {
+    console.warn('[renderer] 静音解锁播放失败（继续尝试直接播放）', err);
+  }
+}
+
+/** 首次用户手势（点击/按键/触摸）就解锁音频通道 */
+function installTtsAudioUnlock(): void {
+  for (const evt of ['pointerdown', 'keydown', 'touchstart', 'click'] as const) {
+    window.addEventListener(evt, unlockTtsAudio, { capture: true, passive: true });
+  }
+}
+
+/** __petDebug.tts()：判断"到底有没有出声/被谁拦了" */
+function ttsDebugState(): Any {
+  return {
+    unlocked: ttsUnlocked,
+    audioContext: ttsAudioContext ? ttsAudioContext.state : 'none',
+    lastError: ttsLastError,
+    playing: !!ttsAudioEl && !ttsAudioEl.paused,
+    currentTime: ttsAudioEl ? Math.round(ttsAudioEl.currentTime * 1000) / 1000 : 0,
+    duration: ttsAudioEl && Number.isFinite(ttsAudioEl.duration) ? ttsAudioEl.duration : null,
+    volume: ttsAudioEl ? ttsAudioEl.volume : null,
+    muted: ttsAudioEl ? ttsAudioEl.muted : null,
+  };
+}
+
+/**
+ * 播放一段主进程合成的语音。
+ *
+ * 已知坑（2026-11 实测）：
+ *   1) **CSP**：TTS 音频是 `data:audio/mpeg;base64,...`，页面 CSP 的 media-src 少了 `data:`
+ *      就会被拦成 "Media load rejected by URL safety check"，play() 抛 NotSupportedError
+ *      —— 表现为"点试听没声音"。现在 staticServer.HTML_CSP 与 index.html 的 meta 都放行 data:。
+ *   2) **autoplay**：Electron 默认策略本就免手势；但策略一旦收紧，没有手势就是 NotAllowedError。
+ *      首次点击会走 unlockTtsAudio()，失败时这里给可操作提示并保留原始错误（__petDebug.tts()）。
+ */
 function playTtsAudio(payload: TtsAudioPayload): void {
   if (!payload || payload.ok !== true || typeof payload.dataUrl !== 'string' || !payload.dataUrl) {
     if (payload && payload.error) setSettingsStatus(`语音合成失败：${payload.error}`, true);
@@ -3411,15 +3585,33 @@ function playTtsAudio(payload: TtsAudioPayload): void {
   try {
     const audio = new Audio(payload.dataUrl);
     ttsAudioEl = audio;
+    ttsLastError = '';
+    audio.addEventListener('error', () => {
+      const code = audio.error ? audio.error.code : '?';
+      const message = audio.error ? audio.error.message : '';
+      ttsLastError = `媒体加载失败（code=${code}${message ? `，${message}` : ''}）`;
+    });
     const played = audio.play();
     if (played && typeof played.catch === 'function') {
       void played.catch((err: unknown) => {
-        setSettingsStatus('浏览器拦截了自动播放：先点一下桌宠再试', true);
+        const name = (err as Error)?.name ?? 'Error';
+        const message = (err as Error)?.message ?? String(err);
+        ttsLastError = `${name}: ${message}`;
         console.warn('[renderer] TTS 播放失败', err);
+        if (name === 'NotAllowedError') {
+          // 自动播放拦截：只有用户手势能解；试听按钮本身就是手势
+          setSettingsStatus('浏览器拦截了自动播放：点一次「🔊 试听语音」（按钮本身是手势）再试一次', true);
+          showBubble('语音被浏览器拦截：点一下桌宠再说话', { tone: 'error', ttlMs: 4000 });
+        } else {
+          // NotSupportedError / AbortError 等：多半是资源被安全策略拦了或数据不完整
+          setSettingsStatus(`语音播放失败（${name}）：${message || '音频数据无法解码'}`, true);
+          showBubble(`语音播放失败：${name}`, { tone: 'error', ttlMs: 4000 });
+        }
       });
     }
   } catch (err) {
-    setSettingsStatus(`播放失败：${(err as Error).message ?? String(err)}`, true);
+    ttsLastError = (err as Error)?.message ?? String(err);
+    setSettingsStatus(`播放失败：${ttsLastError}`, true);
   }
 }
 
@@ -3431,6 +3623,9 @@ async function speakSampleFromUi(bridge: RendererBridge): Promise<void> {
     if (el) el.textContent = '当前版本不支持语音合成';
     return;
   }
+  // 关键：**先解锁再合成**。合成要走网络（几百 ms~几秒），回来时这次点击的手势早就失效了；
+  // 在同一个手势里先把音频通道打开，之后异步回来的 play() 才不会被策略拦。
+  unlockTtsAudio();
   if (btn) btn.disabled = true;
   if (el) el.textContent = '合成中…';
   try {
@@ -5001,6 +5196,10 @@ function installSettingsUi(bridge: RendererBridge): void {
   elementById<HTMLButtonElement>('setting-vts-hotkey-run')?.addEventListener('click', () => {
     void runVtsActionFromUi(bridge, 'trigger-hotkey');
   });
+  // 「测试注入」：绕过渲染层的视线链路，直接验证"主进程 → VTS"（排障用，无副作用）
+  elementById<HTMLButtonElement>('setting-vts-test-inject')?.addEventListener('click', () => {
+    void runVtsTestInjectFromUi(bridge);
+  });
   elementById<HTMLButtonElement>('setting-tts-speak')?.addEventListener('click', () => {
     void speakSampleFromUi(bridge);
   });
@@ -5419,6 +5618,14 @@ function installDebugHooks(bridge: RendererBridge): void {
     bounds: () => currentHandle?.bounds?.() ?? null,
     // 追踪参数层（骨骼/表情/语音口型）：调试与自动化验证用
     tracking: () => currentTrackingApi?.state() ?? null,
+    /**
+     * VTS 追踪推送自查（Console 里 `__petDebug.vts()`）：
+     * enabled=有没有在发；sentCount 每次调用都应增长；lastSent 是最近一帧；
+     * 若 enabled=true 但 sentCount 不涨 → bridge 没接上（bridgeOk/timerRunning 里能看出来）。
+     */
+    vts: () => vtsDebugState(),
+    /** TTS 自查：有没有解锁音频通道、最近一次播放失败的原始错误、当前音频进度 */
+    tts: () => ttsDebugState(),
     /** 视线驱动模式自查：sdkFocusActive=true 表示当前由 SDK focus 驱动，false=项目代码管线兜底 */
     gazeMode: () => gazeApi()?.debug() ?? null,
     /** 调试：直接写模型参数，验证该参数是否真的驱动网格 */
@@ -5569,6 +5776,7 @@ async function init(): Promise<void> {
   startLoop();
   installVisibilityHooks();
   installIdleHooks(); // 空闲降帧：无交互一段时间后把帧上限降到 24fps
+  installTtsAudioUnlock(); // 首次点击/按键就把音频通道解锁（TTS 是异步回来的，手势早失效了）
 
   const bridge = await waitForElectron();
   if (!bridge) {

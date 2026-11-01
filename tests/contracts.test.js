@@ -170,8 +170,19 @@ test('Edge TTS 播放接线：speak handler + 渲染层播放 + 说话时 VTS �
   assert.ok(renderer.includes('new Audio('), '渲染层应真的用 new Audio(...) 播放');
   assert.ok(renderer.includes('onTtsAudio'), '渲染层应订阅 onTtsAudio');
   assert.ok(readSrc('src/main/ipc.ts').includes('onVtsMouth'), '说话时应向 VTS 注入 MouthOpen');
+  // 自动播放开关已前移到 earlySwitches（由 main.ts 在 mainImpl 之前 import、mainImpl 顶部也 require）：
+  // 位置必须"早于任何 app ready / 创建窗口"，所以不能再只查 mainImpl.js 里那一段。
   assert.ok(
-    readSrc('src/main/mainImpl.js').includes("appendSwitch('autoplay-policy'"),
-    '主进程应在 app ready 前放宽自动播放策略（否则渲染层没有用户手势时 play() 被拒）',
+    readSrc('src/main/earlySwitches.ts').includes("AUTOPLAY_POLICY_SWITCH = 'autoplay-policy'"),
+    'earlySwitches.ts 应装 autoplay-policy（app ready 前生效）',
+  );
+  assert.ok(
+    readSrc('src/main/main.ts').indexOf("import './earlySwitches'") <
+      readSrc('src/main/main.ts').indexOf("import './mainImpl'"),
+    'main.ts 必须先 import earlySwitches，再 import mainImpl',
+  );
+  assert.ok(
+    readSrc('src/main/mainImpl.js').includes('require("./earlySwitches")'),
+    'mainImpl.js 顶部也 require 一次 earlySwitches（直接 require mainImpl 的入口同样有保障）',
   );
 });
