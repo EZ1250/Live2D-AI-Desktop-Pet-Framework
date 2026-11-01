@@ -1176,9 +1176,9 @@
         const HEAD_TRACK_MAX_Y = 10;
         const HEAD_TRACK_MAX_Z = 4;
         /** 身体摆动上限（度）：比头部小一档 */
-        const BODY_TRACK_MAX_X = 5;
-        const BODY_TRACK_MAX_Y = 4;
-        const BODY_TRACK_MAX_Z = 3;
+        const BODY_TRACK_MAX_X = 10;
+        const BODY_TRACK_MAX_Y = 8;
+        const BODY_TRACK_MAX_Z = 6;
         /**
          * 逻辑参数 → 模型实际参数 ID。
          * 默认就是 Cubism 标准名；命名不标准的模型可以在它的 pet-model.json 里写 parameterMap，
@@ -1727,8 +1727,8 @@
               const hk = Math.min(1, dt * 2.6);
               headCX += (gazeCX - headCX) * hk;
               headCY += (gazeCY - headCY) * hk;
-              const bodyCX = headCX * 0.55; // 身体比头更滞后、幅度更小
-              const bodyCY = headCY * 0.55;
+              const bodyCX = headCX * 0.8; // body follows head with smaller/lagging amplitude
+              const bodyCY = headCY * 0.8;
               if (gazeCX !== 0 || gazeCY !== 0) {
                 // AngleX=左右，AngleY=上下；使用较慢的 headC* 保持自然滞后。
                 if (headTrackX > 0) setBaseParam(paramIds.angleX, headCX * headTrackX);
