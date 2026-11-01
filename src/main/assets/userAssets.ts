@@ -577,11 +577,24 @@ export function readModelExpressionNames(modelDir: string): string[] {
     | { FileReferences?: { Expressions?: Array<{ Name?: unknown }> } }
     | null;
   const list = json?.FileReferences?.Expressions;
-  if (!Array.isArray(list)) return [];
-  return list
-    .map((e) => (e && typeof e.Name === 'string' ? e.Name : ''))
-    .filter((n): n is string => !!n)
-    .slice(0, 40);
+  const fromModel3 = Array.isArray(list)
+    ? list.map((e) => (e && typeof e.Name === 'string' ? e.Name : '')).filter((n): n is string => !!n)
+    : [];
+  if (fromModel3.length) return fromModel3.slice(0, 40);
+  // VTube Studio 模型：表情登记在 *.vtube.json 的 Hotkeys（ToggleExpression）
+  const vtubeRel = findFile(modelDir, (n) => /\.vtube\.json$/i.test(n), 2);
+  if (vtubeRel) {
+    const vjson = readJsonLoose(path.join(modelDir, vtubeRel)) as
+      | { Hotkeys?: Array<{ Name?: unknown; Action?: unknown }> }
+      | null;
+    const hotkeys = Array.isArray(vjson?.Hotkeys) ? vjson.Hotkeys : [];
+    return hotkeys
+      .filter((h) => h && h.Action === 'ToggleExpression')
+      .map((h) => (typeof h.Name === 'string' ? h.Name : ''))
+      .filter((n): n is string => !!n)
+      .slice(0, 40);
+  }
+  return [];
 }
 
 /** 预设模板内容（JSON 合法：提示键以 _ 开头，解析侧忽略） */
