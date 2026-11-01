@@ -675,7 +675,7 @@ function frameLoop(nowMs: number): void {
   const deltaSec = Math.min(0.1, accMs / 1000);
   accMs = 0;
   try {
-    driveGaze(nowMs); // 先喂视线目标，handle.update 内做平滑插值
+    gazeApi()?.tick(nowMs); // 先喂视线目标，handle.update 内做平滑插值
     currentHandle?.update?.(nowSec, deltaSec);
   } catch (err) {
     console.warn('[renderer] 帧更新失败', err);
@@ -720,149 +720,47 @@ function installVisibilityHooks(): void {
 /* ================================================================
    7.5 视线跟踪（鼠标 → handle.setGaze；平滑插值在各 handle 的
        update() 内做，不动主循环节奏）
+   —— 状态与换算逻辑已抽到 gazeController.ts（全局脚本 window.PetGaze）；
+      这里只保留事件接线与"当前取景 / 当前 handle"的注入，行为不变。
    ================================================================ */
-const GAZE_IDLE_MS = 3000;
-let gazeNX = 0;          // 归一化鼠标偏移 [-1,1]，向右为正
-let gazeNY = 0;          // 向上为正
-let lastGazeMoveAt = 0;  // 0 = 尚未移动/已离开窗口
-let globalCursorPushes = 0; // 主进程推来的全局光标更新次数（自查"窗口外是否还在跟"用）
-let sdkFocusActive = false; // 当前是否由 Live2D/Pixi SDK 内置 FocusController 驱动视线（默认主路径）
-let sdkTargetX = 0;   // 最近一次输入换算出的画布目标点
-let sdkTargetY = 0;
-let sdkFeedX = NaN;   // 逐帧插值后喂给 SDK 的实际坐标（消除低频输入的一卡一卡）
-let sdkFeedY = NaN;
-let sdkIdleReset = false; // 静止 3s 后只回正一次，避免反复覆盖 SDK 中性位
-let lastDriveAt = 0;
-/** 迟滞：连续成功/失败达阈值才切换驱动模式，避免 SDK 与项目管线逐帧交替写参数 */
-let sdkOkStreak = 0;
-let sdkFailStreak = 0;
-let lastGazeHandle: Any = null;
-/** SDK focus 调用失败次数（静默兜底时至少可自查，不刷 console） */
-let sdkFocusFailures = 0;
-let lastGlobalCursorAt = 0; // 最近一次全局光标推送时刻（performance.now 基准）
 
-/**
- * 优先喂给 SDK 内置 FocusController（默认主路径）。
- * 成功返回 true；SDK 不可用/抛错时返回 false，调用方回退到项目自建 setGaze 管线。
- */
-function trySdkFocus(clientX: number, clientY: number): boolean {
-  const h = currentHandle;
-  if (!h || typeof h.focusAt !== 'function') {
-    sdkFocusFailures += 1;
-    sdkFailStreak += 1;
-    if (sdkFailStreak >= 3) sdkFocusActive = false;
-    return false;
-  }
-  try {
-    const ok = h.focusAt(clientX, clientY);
-    if (ok) {
-      sdkOkStreak += 1;
-      sdkFailStreak = 0;
-      if (sdkOkStreak >= 3) sdkFocusActive = true;
-      return true;
-    }
-  } catch {
-    /* 按失败计，走迟滞 */
-  }
-  sdkOkStreak = 0;
-  sdkFailStreak += 1;
-  sdkFocusFailures += 1;
-  if (sdkFailStreak >= 3) sdkFocusActive = false;
-  return false;
+/** gazeController.ts 暴露的全局视线模块（见 ./gazeController.ts 底部 window.PetGaze） */
+interface GazeApi {
+  /** 窗口内指针（pointermove）→ 归一化视线目标 */
+  setPointer(clientX: number, clientY: number): void;
+  /** 主进程推来的全局光标（屏幕 DIP 坐标）→ 归一化视线目标 */
+  setGlobal(screenX: number, screenY: number): void;
+  /** 主循环每帧调用：喂视线目标 / 静止归零 */
+  tick(nowMs: number): void;
+  /** 暂停跟随（鼠标离开窗口 / 拖拽窗口期间） */
+  pause(): void;
+  /** 渲染层换算结果快照（__petDebug.gaze() 的 renderer 段） */
+  state(): { nx: number; ny: number; stale: boolean; sinceMoveMs: number | null; globalCursorPushes: number; sinceGlobalMs: number | null };
+  /** 视线驱动模式自查（__petDebug.gazeMode() 委托它） */
+  debug(): { sdkFocusActive: boolean; globalCursorPushes: number; sdkFocusFailures: number };
+  /** 注入当前取景（全身/半身）的 getter */
+  setFramingGetter(fn: () => 'full' | 'half'): void;
+  /** 注入当前渲染 handle 的 getter（换模型无需重新注入） */
+  setHandleGetter(fn: () => RenderHandle | null): void;
 }
 
-/** 半身视线原点：优先用模型预设的 gazeOriginRatio，缺省脖颈 38%；全身=窗口中心 */
-function gazeOriginY(vh: number): number {
-  if (currentFraming !== 'half') return vh / 2;
-  const h = currentHandle;
-  const r = h && typeof h.gazeOriginRatio === 'function' ? h.gazeOriginRatio() : null;
-  return vh * (Number.isFinite(Number(r)) && Number(r) > 0 && Number(r) < 1 ? Number(r) : 0.38);
+function gazeApi(): GazeApi | null {
+  const g = (window as Any).PetGaze;
+  return g && typeof g.setPointer === 'function' ? (g as GazeApi) : null;
 }
 
-function updateGazeFromPointer(clientX: number, clientY: number): void {
-  const vw = window.innerWidth || 1;
-  const vh = window.innerHeight || 1;
-  // Half framing: gaze origin at the neck (head lives in the upper part of the window).
-  const cx = vw / 2;
-  const cy = gazeOriginY(vh);
-  gazeNX = Math.max(-1, Math.min(1, (clientX - cx) / (vw / 2)));
-  gazeNY = Math.max(-1, Math.min(1, (cy - clientY) / (vh / 2))); // screen down -> negative (look down)
-  lastGazeMoveAt = performance.now();
-  sdkTargetX = clientX;
-  sdkTargetY = clientY;
-  sdkIdleReset = false;
-  trySdkFocus(clientX, clientY); // SDK 主路径（窗口内跟手，SDK 自己的 autoInteract 也在跑）
+/** 初始化视线模块：注入取景/handle getter（必须先于主循环与事件接线） */
+function installGazeController(): void {
+  const g = gazeApi();
+  if (!g) return;
+  g.setFramingGetter(() => currentFraming);
+  g.setHandleGetter(() => currentHandle);
 }
 
-/** 全局鼠标（主进程轮询推送，屏幕 DIP 坐标）→ 归一化视线目标。 */
-function updateGazeFromGlobal(screenX: number, screenY: number): void {
-  const w = window.innerWidth || 1;
-  const h = window.innerHeight || 1;
-  const oy = gazeOriginY(h); // neck origin in half framing (per-model configurable)
-  const cx = window.screenX + w / 2;
-  const cy = window.screenY + oy;
-  // 分母含 220px 软区：鼠标在窗口附近时视线按比例细腻跟动，远离则平滑趋于极限
-  // 窗口外光标相对坐标可能到 -2/3，不能 clamp 到 [-1,1]（否则视线卡在边缘）；tanh 平滑饱和
-  const scaleX = w / 2 + 220;
-  const scaleY = h / 2 + 220;
-  gazeNX = Math.tanh((screenX - cx) / scaleX);
-  gazeNY = Math.tanh(-(screenY - cy) / scaleY); // 向上为正
-  lastGazeMoveAt = performance.now();
-  // 喂给 SDK：画布局部坐标（可超出画布），方向交给 SDK 内部换算 → 窗口外也能生效
-  sdkTargetX = w / 2 + gazeNX * (w / 2);
-  sdkTargetY = gazeOriginY(h) - gazeNY * (h / 2);
-  sdkIdleReset = false;
-  // 不在这里直接 focus：交给 driveGaze 每帧插值，避免低频输入一卡一卡
-  if (!sdkFocusActive) trySdkFocus(sdkTargetX, sdkTargetY);
-}
 function installGazeTracking(): void {
-  window.addEventListener('pointermove', (e) => updateGazeFromPointer(e.clientX, e.clientY), { passive: true });
+  window.addEventListener('pointermove', (e) => gazeApi()?.setPointer(e.clientX, e.clientY), { passive: true });
   // 鼠标离开窗口：视线不再更新，主循环里走“缓缓归零”分支
-  window.addEventListener('mouseleave', () => { lastGazeMoveAt = 0; });
-}
-
-/** 主循环每帧调用：鼠标静止/离开超过 GAZE_IDLE_MS 则目标归零 */
-function driveGaze(nowMs: number): void {
-  const h = currentHandle;
-  if (!h || typeof h.setGaze !== 'function') return;
-  if (h !== lastGazeHandle) {
-    // 换模型：清掉旧模型的 SDK 插值状态，避免第一帧跳变
-    lastGazeHandle = h;
-    sdkFeedX = NaN;
-    sdkIdleReset = false;
-    sdkOkStreak = 0;
-    sdkFailStreak = 0;
-  }
-  const stale = !lastGazeMoveAt || nowMs - lastGazeMoveAt > GAZE_IDLE_MS;
-  if (sdkFocusActive) {
-    if (stale) {
-      if (!sdkIdleReset) {
-        sdkIdleReset = true;
-        sdkFeedX = NaN; // 下次移动重新起步
-        if (typeof h.resetFocus === 'function') h.resetFocus();
-        h.setGaze(0, 0); // 静止回正也要走项目管线，避免 SDK 头部参数被 Idle 卡住
-      }
-      return;
-    }
-    // 逐帧插值：即使输入只有 6.7fps，喂给 SDK 的坐标也是连续的（不卡顿）
-    if (!Number.isFinite(sdkFeedX)) { sdkFeedX = sdkTargetX; sdkFeedY = sdkTargetY; }
-    const dtMs = lastDriveAt ? Math.min(120, Math.max(1, nowMs - lastDriveAt)) : 16;
-    lastDriveAt = nowMs;
-    const ease = 1 - Math.exp(-(dtMs / 1000) * 20);
-    sdkFeedX += (sdkTargetX - sdkFeedX) * ease;
-    sdkFeedY += (sdkTargetY - sdkFeedY) * ease;
-    const ok = trySdkFocus(sdkFeedX, sdkFeedY);
-    if (ok) {
-      // SDK 的 FocusController 在 model.update 内部写参数，但模型 Idle 动作会在其后覆盖
-      // AngleX/Y（眼球参数不被 Idle 覆盖）→ 表现为"只有眼睛动、头不动"。
-      // 这里在 update 之后再补写一次（头部+眼球），让头和眼睛一起跟。
-      h.setGaze(gazeNX, gazeNY);
-      return;
-    }
-    if (sdkFocusActive) return; // 未达失败阈值：继续等 SDK，避免双写者逐帧抖动
-    // 达到阈值 → 掉到下面的代码管线兜底
-  }
-  h.setGaze(stale ? 0 : gazeNX, stale ? 0 : gazeNY);
+  window.addEventListener('mouseleave', () => { gazeApi()?.pause(); });
 }
 
 /* ================================================================
@@ -1268,7 +1166,7 @@ function installWindowInteractions(bridge: RendererBridge): void {
     dragLongReported = false;
     lastDragX = e.screenX;
     lastDragY = e.screenY;
-    lastGazeMoveAt = 0; // 拖拽期间暂停视线跟随
+    gazeApi()?.pause(); // 拖拽期间暂停视线跟随
   });
   document.addEventListener('pointermove', (e) => {
     if (!dragging) return;
@@ -2226,9 +2124,7 @@ function subscribeOptionalPushes(bridge: RendererBridge): void {
   if (typeof bridge.onGlobalCursor === 'function') {
     bridge.onGlobalCursor((pos) => {
       if (pos && typeof pos.x === 'number' && typeof pos.y === 'number') {
-        globalCursorPushes += 1;
-        lastGlobalCursorAt = performance.now();
-        updateGazeFromGlobal(pos.x, pos.y);
+        gazeApi()?.setGlobal(pos.x, pos.y);
       }
     });
   }
@@ -5300,7 +5196,7 @@ function installDebugHooks(bridge: RendererBridge): void {
     // 追踪参数层（骨骼/表情/语音口型）：调试与自动化验证用
     tracking: () => currentTrackingApi?.state() ?? null,
     /** 视线驱动模式自查：sdkFocusActive=true 表示当前由 SDK focus 驱动，false=项目代码管线兜底 */
-    gazeMode: () => ({ sdkFocusActive, globalCursorPushes, sdkFocusFailures }),
+    gazeMode: () => gazeApi()?.debug() ?? null,
     /** 调试：直接写模型参数，验证该参数是否真的驱动网格 */
     setParam: (id: string, value: number) =>
       currentHandle && typeof currentHandle.debugSetParam === 'function' ? currentHandle.debugSetParam(id, value) : null,
@@ -5417,12 +5313,7 @@ function installDebugHooks(bridge: RendererBridge): void {
      */
     gaze: () => ({
       renderer: {
-        nx: Math.round(gazeNX * 1000) / 1000,
-        ny: Math.round(gazeNY * 1000) / 1000,
-        stale: !lastGazeMoveAt || performance.now() - lastGazeMoveAt > GAZE_IDLE_MS,
-        sinceMoveMs: lastGazeMoveAt ? Math.round(performance.now() - lastGazeMoveAt) : null,
-        globalCursorPushes,
-        sinceGlobalMs: lastGlobalCursorAt ? Math.round(performance.now() - lastGlobalCursorAt) : null,
+        ...(gazeApi()?.state() ?? {}),
         window: { screenX: window.screenX, screenY: window.screenY, w: window.innerWidth, h: window.innerHeight },
       },
       handle: currentHandle?.gaze?.() ?? null,
@@ -5450,6 +5341,7 @@ async function init(): Promise<void> {
   if (!grabElements()) {
     return;
   }
+  installGazeController(); // 视线模块：注入取景/handle getter（先于主循环与事件接线）
   startLoop();
   installVisibilityHooks();
   installIdleHooks(); // 空闲降帧：无交互一段时间后把帧上限降到 24fps

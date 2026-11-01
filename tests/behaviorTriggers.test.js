@@ -23,6 +23,7 @@ const path = require('node:path');
 const APP = path.join(__dirname, '..');
 const RENDERER = path.join(APP, 'dist', 'renderer', 'renderer.js');
 const VOICELAB = path.join(APP, 'dist', 'renderer', 'voicelab.js');
+const GAZE = path.join(APP, 'dist', 'renderer', 'gazeController.js');
 
 /* ---------------- 假 DOM（够 init()/设置页/气泡跑） ---------------- */
 class FakeEl {
@@ -271,9 +272,11 @@ function bootPetWindow(triggers = USER_TRIGGERS) {
   process.on('unhandledRejection', (e) => errors.push(e));
 
   delete require.cache[require.resolve(VOICELAB)];
+  delete require.cache[require.resolve(GAZE)];
   delete require.cache[require.resolve(RENDERER)];
   require(VOICELAB);
   window.PetVoiceLab = globalThis.PetVoiceLab;
+  require(GAZE); // 视线模块：renderer 初始化时注入 getter（index.html 里同样先于 renderer.js）
   require(RENDERER);
 
   return { dom, document, window, handlers, calls, errors, emit, dispatchWin, dispatchDoc };

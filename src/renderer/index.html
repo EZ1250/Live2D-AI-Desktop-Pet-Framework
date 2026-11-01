@@ -11,7 +11,7 @@
   三者在浏览器分支下互相配合，moc3 路径可用（Cubism 3/4/5 导出的 moc3 都能读）；任一缺失时渲染层自动降级为
   portrait <img> / 占位图形，页面照常可用（见 live2d.ts / renderer.ts）。
 
-  以下 JS 均为 tsc 编译产物（与 .ts 同目录）：live2d.js、renderer.js。
+  以下 JS 均为 tsc 编译产物（与 .ts 同目录）：emotion.js、voicelab.js、gazeController.js、live2d.js、renderer.js。
   若主进程改为打包器/ESM 构建，只需保证 renderer.js 先于 DOM 逻辑、live2d.js 先于 renderer.js。
 -->
 <html lang="zh-CN">
@@ -326,6 +326,9 @@
   <script src="./emotion.js"></script>
   <!-- 声纹（实时输入电平波形）：全局脚本，挂 window.PetVoiceLab；必须在 renderer.js 之前 -->
   <script src="./voicelab.js"></script>
+  <!-- 视线控制器（窗口内指针/全局光标的换算与 SDK focus 迟滞）：全局脚本，挂 window.PetGaze；
+       renderer.js 初始化时注入取景/handle getter，故必须在 renderer.js 之前 -->
+  <script src="./gazeController.js"></script>
   <!-- ③ 渲染辅助层：moc3/portrait/placeholder 挂载（全局脚本，暴露 window.PetLive2d） -->
   <script src="./live2d.js"></script>
   <!-- ④ 渲染入口 -->

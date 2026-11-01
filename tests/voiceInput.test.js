@@ -6,6 +6,7 @@ const path = require('node:path');
 const APP = path.join(__dirname, '..');
 const RENDERER = path.join(APP, 'dist', 'renderer', 'renderer.js');
 const VOICELAB = path.join(APP, 'dist', 'renderer', 'voicelab.js');
+const GAZE = path.join(APP, 'dist', 'renderer', 'gazeController.js');
 
 /* ------------------------------------------------------------------ 假 DOM */
 
@@ -196,9 +197,11 @@ function bootRenderer() {
   });
 
   delete require.cache[require.resolve(VOICELAB)];
+  delete require.cache[require.resolve(GAZE)];
   delete require.cache[require.resolve(RENDERER)];
   require(VOICELAB);
   window.PetVoiceLab = globalThis.PetVoiceLab; // voicelab 挂在 globalThis 上
+  require(GAZE); // 视线模块（index.html 里同样先于 renderer.js 加载）
   require(RENDERER);
 
   return {
