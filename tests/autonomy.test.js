@@ -91,7 +91,7 @@ test('提示词：后台任务口吻 + 一句中文 + 上下文', () => {
   const prompt = a.buildAutoTaskPrompt(now, {
     mode: 'scene_brief',
     prompt: '',
-    petName: '白子',
+    petName: '小宠',
     model: 'm',
     activeWindow: 'Edge — 文档',
     todoText: '喝水',
@@ -100,7 +100,7 @@ test('提示词：后台任务口吻 + 一句中文 + 上下文', () => {
   assert.ok(prompt.includes('后台自主任务'));
   assert.ok(prompt.includes('不超过 40 字'));
   assert.ok(prompt.includes('Edge — 文档'));
-  assert.ok(prompt.includes('白子'));
+  assert.ok(prompt.includes('小宠'));
   const custom = a.buildAutoTaskPrompt(now, { mode: 'custom', prompt: '提醒喝水', petName: '', model: '', activeWindow: '', todoText: '', mcpText: '' });
   assert.ok(custom.includes('提醒喝水'));
 });

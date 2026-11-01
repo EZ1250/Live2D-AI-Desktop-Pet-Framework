@@ -105,10 +105,10 @@ const USER_TRIGGERS = {
 const MODEL_EXPRESSIONS = ['呆猫', '呆猫眼珠摇晃', '围裙', '拍照', '拿笔', '点一下', '猫咪滤镜', '眼镜'];
 const MODEL_MOTIONS = ['Idle'];
 const MODEL_MANIFEST = {
-  name: '神宫白子',
-  url: 'http://127.0.0.1:1/user-models/神宫白子/baizi.model3.json',
+  name: '模型A',
+  url: 'http://127.0.0.1:1/user-models/模型A/model_a.model3.json',
   type: 'moc3',
-  model3Path: 'baizi.model3.json',
+  model3Path: 'model_a.model3.json',
   mocVersion: 5,
   compat: { type: 'moc3', mocVersion: 5, verdict: 'ok', issues: [], coreMax: 5, reason: null, action: null },
   preset: {
@@ -121,12 +121,12 @@ const MODEL_MANIFEST = {
     emotionMap: { surprised: '呆猫' },
   },
 };
-/** 第二个模型：没有表情、只有 Idle 动作组（真实 Hiyori 就是这样） */
-const HIYORI_MANIFEST = {
-  name: 'Hiyori',
-  url: 'http://127.0.0.1:1/user-models/Hiyori/hiyori_free_t09.model3.json',
+/** 第二个模型：没有表情、只有 Idle 动作组（真实模型就是这样） */
+const MODEL_B_MANIFEST = {
+  name: '模型B',
+  url: 'http://127.0.0.1:1/user-models/模型B/model_b.model3.json',
   type: 'moc3',
-  model3Path: 'hiyori_free_t09.model3.json',
+  model3Path: 'model_b.model3.json',
   mocVersion: 5,
   compat: { type: 'moc3', mocVersion: 5, verdict: 'ok', issues: [], coreMax: 5, reason: null, action: null },
   preset: { capabilities: { idle: ['Idle'] }, emotionMap: {} },
@@ -182,14 +182,14 @@ function bootPetWindow(triggers = USER_TRIGGERS) {
     for (const fn of docListeners.get(type) ?? []) fn({ preventDefault() {}, stopPropagation() {}, target: null, button: 0, ...event });
   };
 
-  /** 假的 Live2D handle：只记录"到底播了什么"。表情清单按当前模型变化（Hiyori 没有表情） */
-  let activeModel = '神宫白子';
+  /** 假的 Live2D handle：只记录"到底播了什么"。表情清单按当前模型变化（模型B 没有表情） */
+  let activeModel = '模型A';
   const handle = {
     kind: 'moc3',
     update() {},
     destroy() {},
     bounds: () => ({ top: 10, height: 480 }),
-    listExpressions: () => (activeModel === 'Hiyori' ? [] : MODEL_EXPRESSIONS.slice()),
+    listExpressions: () => (activeModel === '模型B' ? [] : MODEL_EXPRESSIONS.slice()),
     listMotions: () => MODEL_MOTIONS.slice(),
     setExpression(name) { calls.setExpression.push(name); },
     playMotion(group) { calls.playMotion.push(group); },
@@ -208,23 +208,23 @@ function bootPetWindow(triggers = USER_TRIGGERS) {
 
   const bridge = {
     loadModel: async (name) => {
-      activeModel = String(name || '神宫白子');
-      return activeModel === 'Hiyori' ? HIYORI_MANIFEST : MODEL_MANIFEST;
+      activeModel = String(name || '模型A');
+      return activeModel === '模型B' ? MODEL_B_MANIFEST : MODEL_MANIFEST;
     },
-    modelList: async () => ['神宫白子'],
+    modelList: async () => ['模型A'],
     getSettings: async () => ({
       displayMode: 'half',
       sfxEnabled: false,
       sfxVolume: 0,
       showThinking: true,
-      // 按模型分桶保存：当前模型（神宫白子）用自己的那桶；另一模型（Hiyori）配的是动作组。
+      // 按模型分桶保存：当前模型（模型A）用自己的那桶；另一模型（模型B）配的是动作组。
       // 旧版全局字段故意留空 → 能证明运行时用的是"按模型"那一份，而不是全局回退。
       motionTriggers: {},
       motionTriggersByModel: {
-        神宫白子: { ...triggers },
-        Hiyori: { user_message: 'motion:Idle' },
+        模型A: { ...triggers },
+        模型B: { user_message: 'motion:Idle' },
       },
-      modelName: '神宫白子',
+      modelName: '模型A',
     }),
     setSettings: async () => ({ ok: true }),
     chatLogGet: async () => ({ sessions: [] }),
@@ -304,44 +304,44 @@ test('切模型时「行为触发」下拉标签不能残留「当前模型没�
     return out;
   };
 
-  // 打开设置面板（此时模型=白子，6 个绑定都指向白子真实存在的表情）
+  // 打开设置面板（此时模型=模型A，6 个绑定都指向模型A真实存在的表情）
   dbg.openSettings();
   assert.equal(await waitFor(() => env.document.getElementById('setting-motion-user_message')?.value, 1500), true);
   await sleep(200);
-  const onBaizi = labels();
-  assert.equal(onBaizi.user_message.value, 'expr:猫咪滤镜', '白子下应回填它自己的绑定');
-  for (const key of Object.keys(onBaizi)) {
+  const onModelA = labels();
+  assert.equal(onModelA.user_message.value, 'expr:猫咪滤镜', '模型A下应回填它自己的绑定');
+  for (const key of Object.keys(onModelA)) {
     assert.ok(
-      !/当前模型没有/.test(String(onBaizi[key].text)),
-      `白子下「${key}」不该被标成"当前模型没有"（实际：${onBaizi[key].text}）—— 刷新时机必须等模型挂载完成`
+      !/当前模型没有/.test(String(onModelA[key].text)),
+      `模型A下「${key}」不该被标成"当前模型没有"（实际：${onModelA[key].text}）—— 刷新时机必须等模型挂载完成`
     );
   }
 
-  // 切到 Hiyori（没有表情）：应该用 Hiyori 自己的绑定（这里配的是 Idle 动作组），而不是把白子的表情标成"没有"
+  // 切到 模型B（没有表情）：应该用 模型B 自己的绑定（这里配的是 Idle 动作组），而不是把模型A的表情标成"没有"
   const sel = env.document.getElementById('setting-model');
-  sel.value = 'Hiyori';
+  sel.value = '模型B';
   sel.dispatchEvent('change', { bubbles: true });
   assert.equal(await waitFor(() => labels().user_message.value === 'motion:Idle', 3000), true, '切模型后应换成该模型自己的绑定');
-  const onHiyori = labels();
-  assert.equal(onHiyori.user_message.value, 'motion:Idle');
-  assert.equal(onHiyori.user_message.text, 'Idle', 'Hiyori 的 Idle 是合法目标，不该带"当前模型没有"');
-  assert.equal(onHiyori.error.value, 'auto', 'Hiyori 没有配过「出错」→ 应显示自动，而不是继承白子的呆猫');
+  const onModelB = labels();
+  assert.equal(onModelB.user_message.value, 'motion:Idle');
+  assert.equal(onModelB.user_message.text, 'Idle', '模型B 的 Idle 是合法目标，不该带"当前模型没有"');
+  assert.equal(onModelB.error.value, 'auto', '模型B 没有配过「出错」→ 应显示自动，而不是继承模型A的呆猫');
 
-  // 切回白子：标签必须恢复成正常名字（不能残留"当前模型没有"）
-  sel.value = '神宫白子';
+  // 切回模型A：标签必须恢复成正常名字（不能残留"当前模型没有"）
+  sel.value = '模型A';
   sel.dispatchEvent('change', { bubbles: true });
-  assert.equal(await waitFor(() => labels().user_message.value === 'expr:猫咪滤镜', 3000), true, '切回白子应恢复它的绑定');
+  assert.equal(await waitFor(() => labels().user_message.value === 'expr:猫咪滤镜', 3000), true, '切回模型A应恢复它的绑定');
   const back = labels();
   for (const key of Object.keys(back)) {
     assert.ok(
       !/当前模型没有/.test(String(back[key].text)),
-      `切回白子后「${key}」不该残留"当前模型没有"（实际：${back[key].text}）`
+      `切回模型A后「${key}」不该残留"当前模型没有"（实际：${back[key].text}）`
     );
   }
   assert.deepEqual(
     Object.fromEntries(Object.entries(back).map(([k, v]) => [k, v.value])),
     USER_TRIGGERS,
-    '切回白子后 6 个绑定应完整还原'
+    '切回模型A后 6 个绑定应完整还原'
   );
 });
 
@@ -411,20 +411,27 @@ test('窗口外视线跟随：全局光标推送会更新视线目标（渲染�
   assert.equal(await waitFor(() => dbg.behaviors().resolved.user_message, 3000), true);
 
   // 窗口 360x520 在屏幕 (0,0)，中心 (180,260)；软区 w/2+220=400、h/2+220=480
-  env.emit('onGlobalCursor', { x: 180 + 500, y: 260 });
+  // 窗口外远处用 tanh 平滑饱和：不能硬 clamp（否则视线卡边缘）；远处渐近 ±1
+  env.emit('onGlobalCursor', { x: 180 + 500, y: 198 }); // 半身：视线原点在脖颈(38%高度)，同一水平线应取脖颈高度
   await sleep(50);
   let g = dbg.gaze();
   assert.ok(g.renderer.ny !== undefined, '应提供 __petDebug.gaze() 自查入口');
-  assert.ok(g.renderer.nx > 0.99, `鼠标在窗口右侧远处 → nx 应饱和为 1（实际 ${g.renderer.nx}）`);
-  assert.ok(Math.abs(g.renderer.ny) < 0.05, `同一水平线 → ny 应≈0（实际 ${g.renderer.ny}）`);
+  assert.ok(g.renderer.nx > 0.8 && g.renderer.nx < 1, `鼠标在窗口右侧远处 → nx 应平滑饱和（实际 ${g.renderer.nx}）`);
+  assert.ok(Math.abs(g.renderer.ny) < 0.05, `脖颈水平线 → ny 应≈0（实际 ${g.renderer.ny}）`);
   assert.equal(g.renderer.stale, false, '刚收到推送不应判过期');
 
-  env.emit('onGlobalCursor', { x: 180 - 500, y: 260 - 480 });
+  env.emit('onGlobalCursor', { x: 180 - 500, y: 198 - 480 });
   await sleep(50);
   g = dbg.gaze();
-  assert.ok(g.renderer.nx < -0.99, `鼠标在窗口左侧远处 → nx 应为 -1（实际 ${g.renderer.nx}）`);
-  assert.ok(g.renderer.ny > 0.99, `鼠标在窗口上方远处 → ny 应为 1（向上为正，实际 ${g.renderer.ny}）`);
-  assert.ok(g.renderer.globalCursorPushes >= 2, '应统计到全局光标推送次数（排查"窗口外不跟"用）');
+  assert.ok(g.renderer.nx < -0.8, `鼠标在窗口左侧远处 → nx 应平滑饱和为负（实际 ${g.renderer.nx}）`);
+  assert.ok(g.renderer.ny > 0.6, `鼠标在窗口上方远处 → ny 应平滑饱和为正（向上为正，实际 ${g.renderer.ny}）`);
+
+  // 极远处应接近但仍不超过 1，且不会因 clamp 卡死在某一侧
+  env.emit('onGlobalCursor', { x: 180 + 5000, y: 198 });
+  await sleep(50);
+  g = dbg.gaze();
+  assert.ok(g.renderer.nx > 0.99 && g.renderer.nx <= 1, `极远处 nx 应趋近 1（实际 ${g.renderer.nx}）`);
+  assert.ok(g.renderer.globalCursorPushes >= 3, '应统计到全局光标推送次数（排查"窗口外不跟"用）');
 });
 
 test('交互语料事件：单击/连点/长拖三种事件都会上报给主进程', async () => {

@@ -2204,7 +2204,9 @@ async function bootstrap() {
         clientVersion: electron_1.app.getVersion(),
         log: (msg) => console.log(`[main] ${msg}`),
         onToolsChanged: () => {
-          chat?.setExternalToolDefs(mcpClient ? mcpClient.toolDefs() : []);
+          const defs = mcpClient ? mcpClient.toolDefs() : [];
+          chat?.setExternalToolDefs(defs);
+          configureExternalChatTools();
           configureAutoTaskTools();
       },
     });

@@ -248,6 +248,7 @@ export class McpClient {
   private routes = new Map<string, ToolRoute>();
   private disposed = false;
   private connecting: Promise<void> | null = null;
+  private reloading: Promise<void> | null = null;
 
   constructor(
     private readonly opts: {
@@ -426,15 +427,23 @@ export class McpClient {
 
   /** 热重载 mcp.json：断开现有连接/子进程，按当前配置重新连接（/mcp reload 用） */
   async reload(): Promise<void> {
-    for (const rt of this.runtimes.values()) {
-      this.closeServer(rt);
-      this.rejectAll(rt, new Error('MCP 客户端重载中'));
-    }
-    this.runtimes.clear();
-    this.routes.clear();
-    this.connecting = null;
-    this.disposed = false;
-    await this.connectAll();
+    if (this.reloading) return this.reloading;
+    this.reloading = (async () => {
+      const currentConnection = this.connecting;
+      if (currentConnection) await currentConnection.catch(() => undefined);
+      for (const rt of this.runtimes.values()) {
+        this.closeServer(rt);
+        this.rejectAll(rt, new Error('MCP 客户端重载中'));
+      }
+      this.runtimes.clear();
+      this.routes.clear();
+      this.connecting = null;
+      this.disposed = false;
+      await this.connectAll();
+    })().finally(() => {
+      this.reloading = null;
+    });
+    return this.reloading;
   }
 
   // ------------------------------------------------------------------ private

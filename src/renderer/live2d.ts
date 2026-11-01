@@ -1177,6 +1177,7 @@
         const HEAD_TRACK_MAX_Z = 4;
         /** 身体摆动上限（度）：比头部小一档 */
         const BODY_TRACK_MAX_X = 5;
+        const BODY_TRACK_MAX_Y = 4;
         const BODY_TRACK_MAX_Z = 3;
         /**
          * 逻辑参数 → 模型实际参数 ID。
@@ -1207,6 +1208,7 @@
         /** 身体摆动参数是否可用（不可用就走"整体倾斜"兜底） */
         let bodyTrackOK = false;
         let bodyTrackX = 0;
+        let bodyTrackY = 0;
         let bodyTrackZ = 0;
         /** 呼吸参数是否可用（可用就交给它，不可用只靠整体缩放呼吸） */
         let breathParamOK = false;
@@ -1224,8 +1226,9 @@
           headTrackZ = Math.min(paramLimit(paramIds.angleZ), HEAD_TRACK_MAX_Z);
           headTrackOK = headTrackX > 0 || headTrackY > 0;
           bodyTrackX = Math.min(paramLimit(paramIds.bodyX), BODY_TRACK_MAX_X);
+          bodyTrackY = Math.min(paramLimit(paramIds.bodyY), BODY_TRACK_MAX_Y);
           bodyTrackZ = Math.min(paramLimit(paramIds.bodyZ), BODY_TRACK_MAX_Z);
-          bodyTrackOK = bodyTrackX > 0 || bodyTrackZ > 0;
+          bodyTrackOK = bodyTrackX > 0 || bodyTrackY > 0 || bodyTrackZ > 0;
           breathParamOK = paramLimit(paramIds.breath) > 0;
           eyeLOK = paramLimit(paramIds.eyeLOpen) > 0;
           eyeROK = paramLimit(paramIds.eyeROpen) > 0;
@@ -1511,6 +1514,9 @@
                 [paramIds.eyeROpen]: eyeROK,
                 [paramIds.eyeBallX]: eyeBallXOK,
                 [paramIds.eyeBallY]: eyeBallYOK,
+                [paramIds.bodyX]: bodyTrackX > 0,
+                [paramIds.bodyY]: bodyTrackY > 0,
+                [paramIds.bodyZ]: bodyTrackZ > 0,
                 [paramIds.mouthOpenY]: mouthOpenOK,
                 [paramIds.mouthForm]: mouthFormOK,
               },
@@ -1722,15 +1728,16 @@
               headCX += (gazeCX - headCX) * hk;
               headCY += (gazeCY - headCY) * hk;
               const bodyCX = headCX * 0.55; // 身体比头更滞后、幅度更小
+              const bodyCY = headCY * 0.55;
               if (gazeCX !== 0 || gazeCY !== 0) {
                 // AngleX=左右，AngleY=上下；使用较慢的 headC* 保持自然滞后。
                 if (headTrackX > 0) setBaseParam(paramIds.angleX, headCX * headTrackX);
                 if (headTrackY > 0) setBaseParam(paramIds.angleY, headCY * headTrackY);
                 if (headTrackZ > 0) setBaseParam(paramIds.angleZ, headCX * headTrackZ);
                 // 眼球按满量程驱动（除掉取景增益），否则半身取景下几乎看不出在动
-                const eyeScale = (framingGazeGain() > 0 ? 1 / framingGazeGain() : 1) * 0.55;
-                if (eyeBallXOK) setBaseParam(paramIds.eyeBallX, Math.max(-1, Math.min(1, gazeCX * eyeScale)));
-                if (eyeBallYOK) setBaseParam(paramIds.eyeBallY, Math.max(-1, Math.min(1, gazeCY * eyeScale)));
+                const eyeScale = framingGazeGain() > 0 ? 1 / framingGazeGain() : 1;
+                if (eyeBallXOK) setBaseParam(paramIds.eyeBallX, Math.max(-1, Math.min(1, gazeCX * eyeScale * 0.55)));
+                if (eyeBallYOK) setBaseParam(paramIds.eyeBallY, Math.max(-1, Math.min(1, gazeCY * eyeScale * 0.8)));
               } else if (headTrackOK && !idleMotionAvailable) {
                 // 没有原生 Idle 时才补充幅度很小的头部游移。
                 if (headTrackX > 0) setBaseParam(paramIds.angleX, Math.sin(nowSec * 0.45 + phase * 0.7) * Math.min(headTrackX, 2.2));
@@ -1740,6 +1747,7 @@
               // 身体摆动·第一层预案：模型有 ParamBodyAngle* → 参数级跟随（跟着物理走，最自然）
               if (bodyTrackOK) {
                 if (bodyTrackX > 0) setBaseParam(paramIds.bodyX, bodyCX * bodyTrackX);
+                if (bodyTrackY > 0) setBaseParam(paramIds.bodyY, bodyCY * bodyTrackY);
                 if (bodyTrackZ > 0) setBaseParam(paramIds.bodyZ, swayDeg);
               }
               // 呼吸·有 ParamBreath 就交给它，没有则只靠整体缩放呼吸（frameModel 的 breathe）

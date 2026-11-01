@@ -41,7 +41,7 @@ test('内容框可信：按真实内容居中，缩放仍按画布包围盒算',
 test('内容框不可信：退回画布包围盒（角色绝不被摆出窗口）', () => {
   const { __computeMoc3Placement: place } = loadLive2d();
   // 无效情形：小得离谱 / 大得离谱 / 非有限值 / 偏移得没边。
-  // 注意：**不能**再拿"内容超出画布包围盒"当无效 —— 真机上 Hiyori 的正确内容框就在画布
+  // 注意：**不能**再拿"内容超出画布包围盒"当无效 —— 真机上某个真实模型的正确内容框就在画布
   // 包围盒之外（见下面那条用例），那是引擎坐标系的原点问题，不是量歪。
   const bogus = [
     { name: '小得离谱（挂载瞬间量出来的点）', rect: { x: 0, y: -1, w: 1, h: 2 } },
@@ -64,19 +64,19 @@ test('内容框不可信：退回画布包围盒（角色绝不被摆出窗口�
   }
 });
 
-test('局部原点不在内容左上角（Hiyori 实测形状）：内容框必须被接受并按内容居中', () => {
-  // 真机数值（2026-10-21，Hiyori 在 pixi-live2d 引擎上实测）：
+test('局部原点不在内容左上角（真实模型实测形状）：内容框必须被接受并按内容居中', () => {
+  // 真机数值（2026-10-21，Cubism 3 模型在 pixi-live2d 引擎上实测）：
   //   画布 1211×3778，但真实内容在局部坐标 x≈932..2102 —— **原点并不在内容左上角**，
   //   `model.width/height` 只给尺寸、不给偏移。
   // 旧规则"内容必须落在 [0,natW] 内"会把这条**正确**的测量否掉；退回画布包围盒后
   // 角色只剩右边缘一条（用户看到的"只显示一部分 + 严重偏移"）。这里把它锁死。
   const { __computeMoc3Placement: place } = loadLive2d();
-  const HIYORI = { natW: 1211.22, natH: 3777.86 };
+  const SAMPLE_MODEL = { natW: 1211.22, natH: 3777.86 };
   const CONTENT = { x: 932, y: 328, w: 1170, h: 3745 };
   const vw = 364;
   const vh = 522;
 
-  const full = place({ vw, vh, ...HIYORI, framing: 'full', content: CONTENT });
+  const full = place({ vw, vh, ...SAMPLE_MODEL, framing: 'full', content: CONTENT });
   assert.ok(full);
   assert.equal(full.used, 'content', '偏移原点的模型必须接受内容框，否则会被摆到窗口外');
   assert.equal(full.contentRejected, false);
@@ -85,7 +85,7 @@ test('局部原点不在内容左上角（Hiyori 实测形状）：内容框必�
   assert.ok(Math.abs(cx - vw / 2) < 0.5, `全身：内容中心应在窗口水平中间（${cx}）`);
   assert.ok(Math.abs(cy - vh / 2) < 0.5, `全身：内容中心应在窗口垂直中间（${cy}）`);
 
-  const half = place({ vw, vh, ...HIYORI, framing: 'half', content: CONTENT });
+  const half = place({ vw, vh, ...SAMPLE_MODEL, framing: 'half', content: CONTENT });
   assert.ok(half);
   assert.equal(half.used, 'content');
   const hcx = half.x + (CONTENT.x + CONTENT.w / 2) * half.scale;
@@ -117,4 +117,29 @@ test('没有内容框时直接用画布包围盒；尺寸非法时不落位（�
   assert.equal(r.contentRejected, false);
   assert.equal(place({ ...VIEW, ...CANVAS, natW: 0, framing: 'full', content: null }), null);
   assert.equal(place({ vw: 0, vh: 0, ...CANVAS, framing: 'full', content: null }), null);
+});
+
+test('半身：头部锚点只影响横向，全身/无锚点回退不受影响', () => {
+  const { __computeMoc3Placement: place } = loadLive2d();
+  const head = { x: 210 };
+  const base = { ...VIEW, ...CANVAS, content: CONTENT_INSIDE };
+  const half = place({ ...base, framing: 'half', headAnchor: head });
+  assert.ok(half);
+  // 头部中心必须落在窗口中心（缩放围绕头部）
+  assert.ok(Math.abs(half.x + head.x * half.scale - VIEW.vw / 2) < 1e-6, '半身头部中心应对准窗口中心');
+  // 无 headAnchor → 回退内容中心（旧行为）
+  const halfNo = place({ ...base, framing: 'half' });
+  assert.ok(Math.abs(halfNo.x - (VIEW.vw / 2 - (CONTENT_INSIDE.x + CONTENT_INSIDE.w / 2) * halfNo.scale)) < 1e-6);
+  // 全身忽略 headAnchor
+  const fullHead = place({ ...base, framing: 'full', headAnchor: head });
+  const fullNo = place({ ...base, framing: 'full' });
+  assert.equal(fullHead.x, fullNo.x);
+  assert.equal(fullHead.y, fullNo.y);
+  assert.equal(fullHead.scale, fullNo.scale);
+  // 缩放档位变化时，头部中心屏幕位置不漂移（缩放原点是头部）
+  const halfZoom = place({ ...base, framing: 'half', headAnchor: head, extra: 1.2 });
+  assert.ok(Math.abs(halfZoom.x + head.x * halfZoom.scale - VIEW.vw / 2) < 1e-6);
+  // 纵向维持现状：头顶贴窗口上沿附近
+  const top = halfZoom.y + CONTENT_INSIDE.y * halfZoom.scale;
+  assert.ok(Math.abs(top - VIEW.vh * 0.04) < 1, '半身纵向仍按内容顶部贴窗口上沿');
 });
