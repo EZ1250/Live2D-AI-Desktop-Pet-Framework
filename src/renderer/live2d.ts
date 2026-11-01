@@ -25,6 +25,7 @@
  * 本层不自起 RAF，避免多循环互相打架。
  */
 (() => {
+  let activeGazeOriginRatio: number | null = null;
   /** 内部宽松类型别名（对外 API 见 window.PetLive2d） */
   type Any = any;
 
@@ -47,6 +48,8 @@
     listMotions?(): string[];
     /** 设置视线目标：nx/ny ∈ [-1,1]，向右/向上为正；0 = 归位（项目自建管线/兜底用） */
     setGaze?(nx: number, ny: number): void;
+    /** 该模型半身取景的视线原点（窗口高度比例，0..1）；null=用默认脖颈 0.38 */
+    gazeOriginRatio?(): number | null;
     /** 喂给 SDK 内置 FocusController 的指针坐标（画布局部坐标，可在窗口外）；成功返回 true */
     focusAt?(clientX: number, clientY: number): boolean;
     /** 让 SDK 内置视线回正（静止超时兜底）；成功返回 true */
@@ -489,6 +492,19 @@
         if (refs.Expressions !== undefined && !Array.isArray(refs.Expressions)) refs.Expressions = [];
         if (refs.Motions !== undefined && (typeof refs.Motions !== 'object' || Array.isArray(refs.Motions))) refs.Motions = {};
       }
+      // Optional per-model gaze origin (0..1 of window height in half framing); default 0.38 (neck)
+      try {
+        const slash = url.lastIndexOf('/');
+        if (slash >= 0) {
+          const presetUrl = url.slice(0, slash) + '/pet-model.json';
+          const pres = await fetch(presetUrl, { cache: 'no-cache' });
+          if (pres.ok) {
+            const pj = (await pres.json()) as Any;
+            const r = Number(pj && pj.gazeOriginRatio);
+            if (Number.isFinite(r) && r > 0 && r < 1) json.__petGazeOriginRatio = r;
+          }
+        }
+      } catch { /* optional */ }
       return json;
     } catch (err) {
       console.warn('[live2d] 设置文件归一化失败，改为直接交给运行库:', err);
@@ -939,6 +955,9 @@
 
     // Pixi 8 那套新引擎：喂归一化后的设置对象（补 HitAreas 等）；Pixi 6 老栈直接给 URL
     const settings = isModern ? await normalizeModelSettings(modelUrl) : null;
+    activeGazeOriginRatio = settings && Number.isFinite(Number((settings as Any).__petGazeOriginRatio))
+      ? Number((settings as Any).__petGazeOriginRatio)
+      : null;
     /**
      * 贴图 LOD —— ⚠️ 实测结论：**在当前这套运行库 + 本工程的加载路径下，这个开关对画面没有
      * 可测量的影响，请勿再把它当成"毛边已解决"的依据。**
@@ -1308,6 +1327,9 @@
           setGaze(nx: number, ny: number): void {
           gazeTX = (Number.isFinite(nx) ? Math.max(-1, Math.min(1, nx)) : 0) * framingGazeGain();
           gazeTY = (Number.isFinite(ny) ? Math.max(-1, Math.min(1, ny)) : 0) * framingGazeGain();
+          },
+          gazeOriginRatio(): number | null {
+            return activeGazeOriginRatio;
           },
           /** 交给 SDK 内置 FocusController：画布局部坐标（可超出画布=窗口外），方向由 SDK 换算 */
           focusAt(clientX: number, clientY: number): boolean {

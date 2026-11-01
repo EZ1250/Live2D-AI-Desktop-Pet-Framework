@@ -57,6 +57,7 @@ interface RenderHandle {
   listMotions?(): string[];
   /** 视线目标 nx/ny ∈[-1,1]，向右/向上为正；0 = 归位 */
   setGaze?(nx: number, ny: number): void;
+  gazeOriginRatio?(): number | null;
   /** SDK 内置 FocusController 指针喂入（画布局部坐标，可窗口外） */
   focusAt?(clientX: number, clientY: number): boolean;
   /** SDK 视线回正 */
@@ -769,12 +770,20 @@ function trySdkFocus(clientX: number, clientY: number): boolean {
   return false;
 }
 
+/** 半身视线原点：优先用模型预设的 gazeOriginRatio，缺省脖颈 38%；全身=窗口中心 */
+function gazeOriginY(vh: number): number {
+  if (currentFraming !== 'half') return vh / 2;
+  const h = currentHandle;
+  const r = h && typeof h.gazeOriginRatio === 'function' ? h.gazeOriginRatio() : null;
+  return vh * (Number.isFinite(Number(r)) && Number(r) > 0 && Number(r) < 1 ? Number(r) : 0.38);
+}
+
 function updateGazeFromPointer(clientX: number, clientY: number): void {
   const vw = window.innerWidth || 1;
   const vh = window.innerHeight || 1;
   // Half framing: gaze origin at the neck (head lives in the upper part of the window).
   const cx = vw / 2;
-  const cy = currentFraming === 'half' ? vh * 0.38 : vh / 2;
+  const cy = gazeOriginY(vh);
   gazeNX = Math.max(-1, Math.min(1, (clientX - cx) / (vw / 2)));
   gazeNY = Math.max(-1, Math.min(1, (cy - clientY) / (vh / 2))); // screen down -> negative (look down)
   lastGazeMoveAt = performance.now();
@@ -788,7 +797,7 @@ function updateGazeFromPointer(clientX: number, clientY: number): void {
 function updateGazeFromGlobal(screenX: number, screenY: number): void {
   const w = window.innerWidth || 1;
   const h = window.innerHeight || 1;
-  const oy = currentFraming === 'half' ? h * 0.38 : h / 2; // neck origin in half framing
+  const oy = gazeOriginY(h); // neck origin in half framing (per-model configurable)
   const cx = window.screenX + w / 2;
   const cy = window.screenY + oy;
   // 分母含 220px 软区：鼠标在窗口附近时视线按比例细腻跟动，远离则平滑趋于极限
@@ -800,7 +809,7 @@ function updateGazeFromGlobal(screenX: number, screenY: number): void {
   lastGazeMoveAt = performance.now();
   // 喂给 SDK：画布局部坐标（可超出画布），方向交给 SDK 内部换算 → 窗口外也能生效
   sdkTargetX = w / 2 + gazeNX * (w / 2);
-  sdkTargetY = (currentFraming === 'half' ? h * 0.38 : h / 2) - gazeNY * (h / 2);
+  sdkTargetY = gazeOriginY(h) - gazeNY * (h / 2);
   sdkIdleReset = false;
   // 不在这里直接 focus：交给 driveGaze 每帧插值，避免低频输入一卡一卡
   if (!sdkFocusActive) trySdkFocus(sdkTargetX, sdkTargetY);
