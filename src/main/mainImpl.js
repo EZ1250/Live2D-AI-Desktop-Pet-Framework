@@ -85,6 +85,7 @@ const mcpServer_1 = require("./ai/mcpServer");
 const autonomy_1 = require("./ai/autonomy");
 const userAssets_1 = require("./assets/userAssets");
 const ipc_1 = require("./ipc");
+const gazeInput_1 = require("./gazeInput");
 // ------------------------------------------------------------------ 数据目录统一
 // app.getPath('userData') 默认是 %APPDATA%\<productName>：
 //   开发态 productName = package.json 的 name（pet-desktop-app）
@@ -139,11 +140,6 @@ const CHAT_BUBBLE_GAP = 8;
 const CHAT_BUBBLE_TOP_TOLERANCE = 26;
 const MONITOR_INTERVAL_MS = 2000;
 const PLUGIN_TICK_MS = 50;
-const CURSOR_POLL_MS = 80; // 全局光标轮询周期（窗口附近；视线自动跟随的平滑度）
-const CURSOR_FAR_POLL_MS = 150; // 鼠标远离窗口时的低频轮询（约 6.7fps；太低会一卡一卡）
-const CURSOR_NEAR_DISTANCE = 260; // 距窗口边界多少 DIP 内算"靠近"
-/** 鼠标静止时的光标心跳间隔：保证窗口外也一直望着鼠标（渲染层 3s 没更新会回正） */
-const CURSOR_HEARTBEAT_MS = 400;
 // ------------------------------------------------------------------ 模块级状态
 let mainWindow = null;
 /** 对话气泡窗（?panel=chat 的同一个渲染页；小气泡，浮在桌宠上方） */
@@ -198,7 +194,6 @@ let externalChatReject = null;
 let externalChatBusy = false;
 let lastExternalChatAt = 0;
 let externalChatThink = '';
-let phoneTouchUntil = 0;
 let phoneHitPending = null; // 手机点击命中检测的一次性 resolver
 // 后台自主任务的工具调用预算（防失控/死循环；参考 DSH 的有界工具循环与重复调用保护）
 let autoTaskToolCount = 0;
@@ -211,9 +206,6 @@ let bootRef = null;
 let loadDone = false;
 // chat/monitor 回调需要 pushToRenderer，而它由 registerIpc 返回（晚于两者构造），用可变引用承接
 let sendToRenderer = () => { };
-let cursorTimer = null;
-let lastCursorSent = null;
-    let lastCursorPushAt = 0; // 上次推送 IPC_GLOBAL_CURSOR 的时刻（心跳用）
 /** 用户在确认框里选过"本次会话内不再询问写入类操作"后置为 true（仅内存，重启恢复） */
 let devAutoAllowWrites = false;
 /** 用户选过"本次会话内不再询问任何操作（含命令）"后置为 true（仅内存；危险命令仍会被拦） */
@@ -546,106 +538,18 @@ function reloadOfflinePoolForModel(modelName) {
         return;
     loadOfflinePool(resolver.knowledgeDirForModel(modelName || 'character'), modelName || 'character', path.join(resolver.assetsRoot(), 'knowledge'));
 }
-// —— 鼠标行为侦测（在光标轮询内累积）——
-const MOUSE_IDLE_MS = 90000; // 静止 90s 视为“鼠标静止”事件
-const MOUSE_SCENE_GAP_MS = 300000; // 鼠标类场景 5min 冷却
-let lastMouseMovedAt = Date.now();
-let lastMouseIdleSceneAt = 0;
+// —— 鼠标行为侦测（GazeInput 的光标轮询回调；场景触发仍在本文件）——
 let lastMouseActiveSceneAt = 0;
-let mouseIdleFired = false;
-/**
- * 全局光标轮询 → IPC_GLOBAL_CURSOR 推送（renderer 据此换算视线目标，
- * 实现"宠物望向鼠标"的自动视线跟随；移动时实时推，静止时按心跳补推）。
- */
-function startCursorTracking() {
-    let cursorFast = true;
-    if (cursorTimer)
-        return;
-    const poll = () => {
-        const win = mainWindow;
-        if (!win || win.isDestroyed())
-            return;
-        const now = Date.now();
-        const phoneTouchBypass = now < phoneTouchUntil; // 手机触摸期间：只暂停光标推送，不跳过穿透/鼠标状态维护
-        const p = electron_1.screen.getCursorScreenPoint();
-        try {
-            let near = true;
-            try {
-                const boundsForPoll = win.getBounds();
-                const dx = Math.max(boundsForPoll.x - p.x, 0, p.x - (boundsForPoll.x + boundsForPoll.width));
-                const dy = Math.max(boundsForPoll.y - p.y, 0, p.y - (boundsForPoll.y + boundsForPoll.height));
-                near = Math.hypot(dx, dy) <= CURSOR_NEAR_DISTANCE;
-            }
-            catch {
-                near = true;
-            }
-            if (near !== cursorFast) {
-                cursorFast = near;
-                if (cursorTimer !== null)
-                    clearInterval(cursorTimer);
-                cursorTimer = setInterval(poll, near ? CURSOR_POLL_MS : CURSOR_FAR_POLL_MS);
-            }
-            const moved = !lastCursorSent || lastCursorSent.x !== p.x || lastCursorSent.y !== p.y;
-            if (moved) {
-                lastCursorSent = { x: p.x, y: p.y };
-                lastMouseMovedAt = now;
-                // 从“静止事件”恢复为活跃 → 触发一次“鼠标活跃”（与上次活跃气泡间隔 ≥5min）
-                if (mouseIdleFired) {
-                    mouseIdleFired = false;
-                    if (now - lastMouseActiveSceneAt >= MOUSE_SCENE_GAP_MS) {
-                        lastMouseActiveSceneAt = now;
-                        handleSceneGroup('鼠标活跃');
-                    }
-                }
-            }
-            // 光标推送：移动时实时推；鼠标静止时每 CURSOR_HEARTBEAT_MS 也补一次。
-            // 为什么要有心跳：渲染层的视线目标 3s 没更新就会回正，只在"移动"时推的话，
-            // 鼠标停在窗口外不动 → 宠物看一会儿就不看了（用户报的"窗口外不追踪"）。
-            if (!phoneTouchBypass && (moved || now - lastCursorPushAt >= CURSOR_HEARTBEAT_MS)) {
-                lastCursorPushAt = now;
-                sendToRenderer(contracts_1.IPC_GLOBAL_CURSOR, { x: p.x, y: p.y });
-            }
-            // 点击穿透：把全局光标换算成"相对客户区"坐标交给渲染层做命中判定；
-            // 光标离开窗口时立刻恢复可交互（否则移回来第一下会点不到）。
-            if (clickThroughEnabled && moved) {
-                try {
-                    const b = win.getBounds();
-                    const inside = p.x >= b.x && p.x < b.x + b.width && p.y >= b.y && p.y < b.y + b.height;
-                    if (inside) {
-                        const [cw, ch] = win.getContentSize();
-                        // 客户区左上角的屏幕坐标 = 窗口左上角 + 边框内缩（无边框窗口通常为 0）
-                        const cb = win.getContentBounds();
-                        const relX = p.x - cb.x;
-                        const relY = p.y - cb.y;
-                        if (relX >= 0 && relY >= 0 && relX < cw && relY < ch) {
-                            sendToRenderer(contracts_1.IPC_HIT_PROBE, { x: relX, y: relY });
-                        }
-                        else {
-                            resetHitIgnore(win);
-                        }
-                    }
-                    else {
-                        resetHitIgnore(win);
-                    }
-                }
-                catch {
-                    /* 取几何失败时保守恢复可交互 */
-                    resetHitIgnore(win);
-                }
-            }
-            if (!moved && !mouseIdleFired && now - lastMouseMovedAt >= MOUSE_IDLE_MS && now - lastMouseIdleSceneAt >= MOUSE_SCENE_GAP_MS) {
-                // 静止超过 90s → “鼠标静止”事件
-                mouseIdleFired = true;
-                lastMouseIdleSceneAt = now;
-                handleSceneGroup('鼠标静止');
-            }
-        }
-        catch {
-            /* screen 暂不可用等场景静默，下轮重试 */
-        }
-    };
-    poll();
-    cursorTimer = setInterval(poll, CURSOR_POLL_MS);
+/** 鼠标从静止恢复活跃 → 触发一次“鼠标活跃”（与上次活跃气泡间隔 ≥ MOUSE_SCENE_GAP_MS） */
+function onMouseMoved(now) {
+    if (now - lastMouseActiveSceneAt >= gazeInput_1.MOUSE_SCENE_GAP_MS) {
+        lastMouseActiveSceneAt = now;
+        handleSceneGroup('鼠标活跃');
+    }
+}
+/** 静止超过 90s → “鼠标静止”事件（静止计时在 GazeInput 内，这里只负责场景文案） */
+function onMouseIdle(now) {
+    handleSceneGroup('鼠标静止');
 }
 // ------------------------------------------------------------------ 点击穿透
 /**
@@ -696,6 +600,42 @@ function resetHitIgnore(win) {
 /** 只读：当前是否处于"忽略鼠标（即穿透）"状态 —— 供调试自检与自动化验证 */
 function getHitIgnoreState() {
     return hitIgnoreActive;
+}
+/**
+ * 光标移动时的点击穿透探测（GazeInput 回调）。
+ * 把全局光标换算成"相对客户区"坐标交给渲染层做命中判定；光标离开窗口时立刻恢复可交互
+ * （否则移回来第一下会点不到）。是否启用由设置项 clickThrough 决定，未开启时什么都不做。
+ */
+function onClickThroughProbe(p, now) {
+    if (!clickThroughEnabled)
+        return;
+    const win = mainWindow;
+    if (!win || win.isDestroyed())
+        return;
+    try {
+        const b = win.getBounds();
+        const inside = p.x >= b.x && p.x < b.x + b.width && p.y >= b.y && p.y < b.y + b.height;
+        if (inside) {
+            const [cw, ch] = win.getContentSize();
+            // 客户区左上角的屏幕坐标 = 窗口左上角 + 边框内缩（无边框窗口通常为 0）
+            const cb = win.getContentBounds();
+            const relX = p.x - cb.x;
+            const relY = p.y - cb.y;
+            if (relX >= 0 && relY >= 0 && relX < cw && relY < ch) {
+                sendToRenderer(contracts_1.IPC_HIT_PROBE, { x: relX, y: relY });
+            }
+            else {
+                resetHitIgnore(win);
+            }
+        }
+        else {
+            resetHitIgnore(win);
+        }
+    }
+    catch {
+        /* 取几何失败时保守恢复可交互 */
+        resetHitIgnore(win);
+    }
 }
 /** 只读：设置里是否开启了点击穿透 */
 function clickThroughEnabledOn() {
@@ -787,7 +727,7 @@ function startTimedEvents() {
                 handleSceneGroup('周末放松');
             }
             // 连续活跃计时：鼠标不在静止状态才累计，满 50 分钟提醒一次（长时间工作 / 健康护眼 交替）
-            if (mouseIdleFired) {
+            if (gazeInput_1.isMouseIdle()) {
                 activeMinutes = 0;
             }
             else if (++activeMinutes >= LONG_SESSION_MINUTES) {
@@ -2920,8 +2860,14 @@ async function bootstrap() {
     tickTimer = setInterval(() => {
         registry?.tick(PLUGIN_TICK_MS / 1000);
     }, PLUGIN_TICK_MS);
-    // 11. 全局光标轮询（宠物视线自动跟随鼠标，任意屏幕位置）
-    startCursorTracking();
+    // 11. 全局光标轮询（宠物视线自动跟随鼠标，任意屏幕位置；实现见 src/main/gazeInput.ts）
+    gazeInput_1.startGazeInput({
+        getWindow: () => mainWindow,
+        sendCursor: (x, y) => sendToRenderer(contracts_1.IPC_GLOBAL_CURSOR, { x, y }),
+        onMouseMoved,
+        onMouseIdle,
+        onClickThroughProbe,
+    });
     installClickThrough(); // 11.1 点击穿透：透明区不拦截鼠标（默认关闭，见设置项 clickThrough）
     // 12. 离线台词池 + 随机冒泡定时器（提升互动频率；纯离线）
     const defaultModel = resolver.modelList()[0] || 'character';
@@ -3773,8 +3719,7 @@ async function handlePhoneTouch(action, x, y) {
     const cb = win.getContentBounds();
     const globalX = cb.x + localX;
     const globalY = cb.y + localY;
-    phoneTouchUntil = Date.now() + 1500;
-    lastCursorSent = { x: globalX, y: globalY };
+    gazeInput_1.notifyPhoneTouch(globalX, globalY); // 1500ms 内暂停光标推送，并把这帧记为"已推送位置"
     sendToRenderer(contracts_1.IPC_GLOBAL_CURSOR, { x: globalX, y: globalY });
     if (action === 'click') {
         // 只在"非穿透区域"触发点击：开启点击穿透时，先问渲染层该点是否命中角色
@@ -4105,10 +4050,7 @@ function shutdown() {
         clearInterval(tickTimer);
         tickTimer = null;
     }
-    if (cursorTimer !== null) {
-        clearInterval(cursorTimer);
-        cursorTimer = null;
-    }
+    gazeInput_1.stopGazeInput(); // 停掉全局光标轮询（并清掉"已推送光标"记忆）
     if (bubbleTimer !== null) {
         clearTimeout(bubbleTimer);
         bubbleTimer = null;
@@ -4117,7 +4059,6 @@ function shutdown() {
         clearInterval(timedEventTimer);
         timedEventTimer = null;
     }
-    lastCursorSent = null;
     if (thinkAutoHideTimer) {
         clearTimeout(thinkAutoHideTimer);
         thinkAutoHideTimer = null;
