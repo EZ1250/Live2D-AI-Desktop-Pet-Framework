@@ -264,6 +264,10 @@ export class McpClient {
     this.opts.log?.(message);
   }
 
+  private isCurrentRuntime(rt: ServerRuntime): boolean {
+    return this.runtimes.get(rt.cfg.serverName) === rt && !this.disposed;
+  }
+
   /** 读配置并连接全部服务器（后台调用，不阻塞启动；重复调用只连一次） */
   connectAll(): Promise<void> {
     if (this.connecting) return this.connecting;
@@ -432,6 +436,10 @@ export class McpClient {
       const currentConnection = this.connecting;
       if (currentConnection) await currentConnection.catch(() => undefined);
       for (const rt of this.runtimes.values()) {
+        rt.state = 'error';
+        rt.lastError = 'MCP 客户端重载中';
+        rt.toolsBacklog = [];
+        rt.tools = [];
         this.closeServer(rt);
         this.rejectAll(rt, new Error('MCP 客户端重载中'));
       }
@@ -484,13 +492,13 @@ export class McpClient {
     this.log(`MCP：工具路由更新，共 ${this.routes.size} 个`);
     try {
       this.opts.onToolsChanged?.();
-    } catch {
-      /* 回调失败不影响 MCP 自身 */
+    } catch (err) {
+      this.log(`MCP：工具变更回调失败：${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
   private async connectServer(rt: ServerRuntime): Promise<void> {
-    if (this.disposed || rt.state === 'ready' || rt.state === 'connecting') return;
+    if (!this.isCurrentRuntime(rt) || rt.state === 'ready' || rt.state === 'connecting') return;
     rt.state = 'connecting';
     rt.lastError = '';
     try {
@@ -502,6 +510,10 @@ export class McpClient {
       });
       this.notify(rt, 'notifications/initialized', {});
       await this.syncTools(rt);
+      if (!this.isCurrentRuntime(rt)) {
+        this.closeServer(rt);
+        return;
+      }
       rt.state = 'ready';
       this.log(`MCP：${rt.cfg.serverName} 已连接（${rt.tools.length} 个工具）`);
     } catch (err) {
@@ -550,7 +562,7 @@ export class McpClient {
       // 整批替换：先收集完整清单，再统一重建公开名/路由（与参考实现"要么完整世代、要么没有"一致）
       rt.toolsBacklog = collected;
       rt.tools = collected.map((t) => ({ rawName: t.rawName, publicName: makePublicToolName(rt.cfg.serverName, t.rawName) }));
-      if (rt.state === 'ready') this.rebuildRoutes();
+      if (rt.state === 'ready' && this.isCurrentRuntime(rt)) this.rebuildRoutes();
     })().finally(() => {
       rt.syncInFlight = null;
     });
@@ -685,7 +697,9 @@ export class McpClient {
       }
       return;
     }
-    void this.httpPost(rt, body).catch(() => undefined);
+    void this.httpPost(rt, body).catch((err) => {
+      this.log(`MCP：HTTP 通知发送失败（${rt.cfg.serverName}）：${err instanceof Error ? err.message : String(err)}`);
+    });
   }
 
   private request(rt: ServerRuntime, method: string, params: Record<string, unknown>, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<unknown> {

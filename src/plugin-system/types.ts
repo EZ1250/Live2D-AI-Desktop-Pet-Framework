@@ -53,6 +53,10 @@ export interface PetPlugin {
   name: string;
   /** 插件版本号。 */
   version: string;
+  /** 仅影响启动和卸载顺序，不允许插件直接引用其它插件实例。 */
+  dependencies?: readonly string[];
   /** 启动钩子：注册事件、做一次性初始化。可异步。 */
   setup(ctx: PluginContext): void | Promise<void>;
+  /** 释放插件自己创建的定时器、连接或文件句柄。 */
+  teardown?(): void | Promise<void>;
 }
