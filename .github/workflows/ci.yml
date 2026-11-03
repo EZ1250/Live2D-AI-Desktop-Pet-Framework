@@ -15,3 +15,5 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+      # 隐私闸门：防止本机配置/密钥被打进 dist/public/local-assets（CI 上无本机 Key，仅校验文件清单）
+      - run: npm run check:privacy --all

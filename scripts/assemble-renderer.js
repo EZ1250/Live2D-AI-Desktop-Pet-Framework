@@ -51,27 +51,20 @@ function main() {
     fs.cpSync(path.join(SRC, 'lib'), path.join(DST, 'lib'), { recursive: true });
     ok.push('lib/ (pixi/cubism/core)');
   }
-  // lib 完整性告警：core 若为 wasm 引导版且缺伴随 .wasm → 提醒一句（但**不一定**会失败）。
-  // 实测：官方 SDK / CDN 的 live2dcubismcore.min.js 都不单独提供 .wasm，仍能正常初始化并渲染，
-  // 所以这里只作为提示，不再写成"moc3 将无法渲染"。
-  const coreJs = path.join(DST, 'lib', 'live2dcubismcore.min.js');
-  if (fs.existsSync(coreJs)) {
-    const txt = fs.readFileSync(coreJs, 'utf8');
-    if (/WebAssembly\.instantiate|wasmBinaryFile|_em_module\.wasm/.test(txt)) {
-      const hasWasm = fs.existsSync(path.join(DST, 'lib', '_em_module.wasm')) ||
-        fs.existsSync(path.join(DST, 'lib', 'live2dcubismcore.wasm'));
-      if (!hasWasm) {
-        console.log(
-          '[assemble] 提示: live2dcubismcore.min.js 含 wasm 引导代码但 lib/ 没有伴随 .wasm —— ' +
-          '官方构建本来就不带（实测可正常运行）；若启动日志出现 Core 初始化失败，再跑 ' +
-          'node scripts/fetch-cubism-core.js --from <含 wasm 的目录>'
-        );
-      }
-    }
-  }
-  // 3) tsc 产物（都是全局脚本：renderer 主逻辑 / Live2D 层 / 情感判定 / 声纹显示 / 视线控制器）
-  for (const f of ['renderer.js', 'live2d.js', 'emotion.js', 'voicelab.js', 'gazeController.js', 'ttsMouth.js']) {
+  // 3) tsc 产物（都是全局脚本：renderer 主逻辑 / Live2D 层 / 情感判定 / 声纹显示 / 视线控制器 / 内核 / 特效）
+  for (const f of ['renderer.js', 'live2d.js', 'emotion.js', 'voicelab.js', 'gazeController.js', 'ttsMouth.js', 'kernel.js', 'fx.js']) {
     if (copyFile(path.join(DIST, f), path.join(DST, f))) ok.push(f);
+  }
+  // 3.1) 渲染层模块目录（插件 plugins/ 与 UI 面板 panels/）：index.html 里都在 renderer.js 之前加载
+  const missingModuleDirs = [];
+  for (const dir of ['plugins', 'panels']) {
+    const from = path.join(DIST, dir);
+    if (!fs.existsSync(from)) {
+      missingModuleDirs.push(dir);
+      continue;
+    }
+    fs.cpSync(from, path.join(DST, dir), { recursive: true });
+    ok.push(`${dir}/ (渲染层模块)`);
   }
 
   // 4) 兜底副本：让 dist/renderer/ 成为**完整可用**的渲染入口。
@@ -91,17 +84,45 @@ function main() {
     console.error('[assemble] 装配不完整：需先运行 npm run build:tsc（产出 dist/renderer/*.js）');
     process.exit(1);
   }
+  if (missingModuleDirs.length) {
+    console.error(
+      `[assemble] 装配不完整：dist/renderer 下缺少 ${missingModuleDirs.join(', ')}/。\n` +
+        '          请确认 src/renderer/ 下对应源码存在，并重跑 npm run build:tsc。'
+    );
+    process.exit(1);
+  }
+
+  // 硬性校验（二）：index.html 引用到的每个本地脚本/样式都必须真的装配进 public/renderer。
+  // 这能挡住"源码没提交/漏拷目录 → 页面 404 但装配看起来成功"的情况。
+  const html = fs.readFileSync(path.join(DST, 'index.html'), 'utf8');
+  const refs = [...html.matchAll(/(?:src|href)="\.\/([^"]+)"/g)].map((m) => m[1]);
+  const missingAssets = refs.filter((rel) => !fs.existsSync(path.join(DST, rel)));
+  if (missingAssets.length) {
+    console.error(
+      `[assemble] 装配不完整：index.html 引用了 ${missingAssets.length} 个不存在的本地资源：\n` +
+        missingAssets.map((rel) => `          - ${rel}`).join('\n') +
+        '\n          请确认对应源码存在且已纳入版本库，再重跑 npm run build:all。'
+    );
+    process.exit(1);
+  }
 
   // 硬性校验：渲染层必须是「全局脚本」，一旦被编译成 CommonJS（出现 exports/require 垫片），
   // 浏览器里会立刻抛 "exports is not defined"，窗口直接白屏。这里宁可失败也不许装配出去。
-  for (const f of ['renderer.js', 'live2d.js', 'emotion.js', 'voicelab.js', 'gazeController.js', 'ttsMouth.js']) {
+  const commonScripts = ['renderer.js', 'live2d.js', 'emotion.js', 'voicelab.js', 'gazeController.js', 'ttsMouth.js', 'kernel.js', 'fx.js'];
+  for (const dir of ['plugins', 'panels']) {
+    for (const f of fs.existsSync(path.join(DST, dir)) ? fs.readdirSync(path.join(DST, dir)) : []) {
+      if (f.endsWith('.js')) commonScripts.push(path.join(dir, f));
+    }
+  }
+  for (const f of commonScripts) {
     const p = path.join(DST, f);
     if (!fs.existsSync(p)) continue;
     const src = fs.readFileSync(p, 'utf8');
     if (/Object\.defineProperty\(exports|^\s*(module\.exports|exports\.)/m.test(src)) {
       console.error(
-        `[assemble] 致命：${f} 被编译成了 CommonJS 模块（出现 exports 垫片）。\n` +
-          '          渲染层必须是全局脚本：请把 tsconfig.json 的 module/moduleResolution 改回 commonjs/node 后重跑 npm run build:tsc。'
+        `[assemble] 致命：${f} 被编译成了 CommonJS 模块（出现 exports 垫片），浏览器会直接白屏。\n` +
+          '          该文件必须保持"全局脚本"：不能有 import/export 语句；只允许 `import("…")` 类型注解（会被擦除）。\n' +
+          '          删掉源码里的 import/export 后重跑 npm run build:tsc。'
       );
       process.exit(1);
     }

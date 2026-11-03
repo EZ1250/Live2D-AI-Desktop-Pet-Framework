@@ -33,5 +33,5 @@ node scripts/check-model.js "local-assets\live2d_models\<模型名>"
 npm run import && npm run build
 ```
 
-体检结论若是 `unsupported`（moc3 v5 > 运行库上限 v4），渲染时会明确提示"需要 Cubism 5 运行库或改导出目标 4.2"
+体检结论若是 `unsupported`（moc3 v6 > 运行库上限 v5），渲染时会明确提示"用更低版本重新导出"
 （见 `docs/MODEL_COMPAT.md`）。

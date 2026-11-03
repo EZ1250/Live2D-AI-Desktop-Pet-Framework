@@ -726,7 +726,7 @@ export interface ElectronAPI {
    */
   onVtsEvent?(cb: (event: VtsEventDto) => void): () => void;
   /** 让主进程用 Edge TTS 合成一句话；音频经 onTtsAudio 推回来。 */
-  ttsSpeak?(text: string): Promise<{ ok: boolean; error?: string; bytes?: number }>;
+  ttsSpeak?(text: string, voice?: string, requestId?: string): Promise<{ ok: boolean; requestId?: string; error?: string; bytes?: number }>;
   /** 订阅 TTS 合成结果（渲染层用 new Audio(payload.dataUrl).play() 播放）。 */
   onTtsAudio?(cb: (payload: TtsAudioPayload) => void): () => void;
   /** 待办笔记本：读取列表（TodoDto[]）。 */
@@ -839,6 +839,10 @@ export interface AppSettings {
   sfxEnabled?: boolean;
   /** 音效音量 0~1（默认 0.6）。 */
   sfxVolume?: number;
+  /** 是否自动朗读对话（默认关闭）。 */
+  ttsEnabled?: boolean;
+  /** Edge TTS 音色短名（空=默认 zh-CN-XiaoxiaoNeural）。 */
+  ttsVoice?: string;
   /** 开发工作区根目录（绝对路径；空=未配置，此时建目录/写文件/执行命令类工具全部禁用）。 */
   devWorkspaceRoot?: string;
   /** 是否允许 AI 执行 PowerShell 命令（默认 true；危险命令始终会被拦截）。 */

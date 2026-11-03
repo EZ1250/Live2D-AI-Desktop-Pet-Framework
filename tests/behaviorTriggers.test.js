@@ -24,6 +24,13 @@ const APP = path.join(__dirname, '..');
 const RENDERER = path.join(APP, 'dist', 'renderer', 'renderer.js');
 const VOICELAB = path.join(APP, 'dist', 'renderer', 'voicelab.js');
 const GAZE = path.join(APP, 'dist', 'renderer', 'gazeController.js');
+const EMOTION = path.join(APP, 'dist', 'renderer', 'emotion.js');
+const KERNEL = path.join(APP, 'dist', 'renderer', 'kernel.js');
+const EMOTION_PLUGIN = path.join(APP, 'dist', 'renderer', 'plugins', 'emotion.js');
+const BEHAVIOR_PLUGIN = path.join(APP, 'dist', 'renderer', 'plugins', 'behavior.js');
+const FX = path.join(APP, 'dist', 'renderer', 'fx.js');
+const TODO_PANEL = path.join(APP, 'dist', 'renderer', 'panels', 'todo.js');
+const ASK_BOX = path.join(APP, 'dist', 'renderer', 'panels', 'askBox.js');
 
 /* ---------------- 假 DOM（够 init()/设置页/气泡跑） ---------------- */
 class FakeEl {
@@ -271,12 +278,27 @@ function bootPetWindow(triggers = USER_TRIGGERS) {
   const errors = [];
   process.on('unhandledRejection', (e) => errors.push(e));
 
+  delete require.cache[require.resolve(EMOTION)];
   delete require.cache[require.resolve(VOICELAB)];
   delete require.cache[require.resolve(GAZE)];
+  delete require.cache[require.resolve(KERNEL)];
+  delete require.cache[require.resolve(EMOTION_PLUGIN)];
+  delete require.cache[require.resolve(BEHAVIOR_PLUGIN)];
+  delete require.cache[require.resolve(FX)];
+  delete require.cache[require.resolve(TODO_PANEL)];
+  delete require.cache[require.resolve(ASK_BOX)];
   delete require.cache[require.resolve(RENDERER)];
+  require(EMOTION); // 情绪规则库：emotion 插件启动时读 window.PetEmotion
+  window.PetEmotion = globalThis.PetEmotion;
   require(VOICELAB);
   window.PetVoiceLab = globalThis.PetVoiceLab;
   require(GAZE); // 视线模块：renderer 初始化时注入 getter（index.html 里同样先于 renderer.js）
+  require(KERNEL); // 渲染层内核：index.html 里在 renderer.js 之前
+  require(EMOTION_PLUGIN); // 内置策略插件：在 kernel 之后、renderer.js 之前注册
+  require(BEHAVIOR_PLUGIN);
+  require(FX); // 渲染层 UI 模块：install(deps) 注入依赖
+  require(TODO_PANEL);
+  require(ASK_BOX);
   require(RENDERER);
 
   return { dom, document, window, handlers, calls, errors, emit, dispatchWin, dispatchDoc };

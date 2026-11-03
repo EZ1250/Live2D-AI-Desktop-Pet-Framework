@@ -1,4 +1,4 @@
-# 第三方资源与许可 / Third-Party Notices
+﻿# 第三方资源与许可 / Third-Party Notices
 
 本仓库原创的代码与文档采用 **MIT**（见 [`LICENSE`](LICENSE)）。
 
@@ -14,10 +14,9 @@ that MIT grant and keep their own terms — verify each one before redistributin
 
 | 文件 | 组件 | 说明 |
 |---|---|---|
-| `src/renderer/lib/pixi.min.js` | PixiJS | 2D 渲染引擎 |
-| `src/renderer/lib/live2dcubismcore.min.js` | **Live2D Cubism Core** | Live2D 官方运行库，**有独立授权条款**，商用/再分发条件需自行确认 |
-| `src/renderer/lib/live2d-engine.min.js` | Live2D 引擎适配层 | 与 Pixi 的桥接 |
-| `src/renderer/lib/live2d-engine-cubism2.min.js` | Cubism 2 兼容层 | 当前渲染入口未启用 |
+| `src/renderer/lib/pixi.min.js` | PixiJS 6.5.10 | 2D 渲染引擎（MIT） |
+| `src/renderer/lib/live2dcubismcore.min.js` | **Live2D Cubism Core 5.1** | Live2D 官方运行库，**有独立授权条款**，商用/再分发条件需自行确认 |
+| `src/renderer/lib/live2d-engine.min.js` | pixi-live2d-display 0.4.0（cubism4 构建） | Pixi 与 Live2D Cubism 框架的桥接（MIT + Live2D Cubism SDK 许可） |
 
 > ⚠️ **Live2D Cubism Core 是最需要注意的一个。** 它是 Live2D Inc. 的产品，
 > 有独立的使用与再分发条款（尤其商用场景）。公开或商用前请到 Live2D 官网确认你符合其许可。

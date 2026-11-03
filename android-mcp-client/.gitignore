@@ -1,0 +1,8 @@
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+
+# 预构建产物：本地可保留，但不进版本库（仓库只放源码，构建方法见 README）
+*.apk

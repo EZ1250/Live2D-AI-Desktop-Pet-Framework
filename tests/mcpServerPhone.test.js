@@ -87,3 +87,42 @@ test('手机超时不回执 → tools/call 返回超时错误（fail-closed）',
   assert.match(res.result.content[0].text, /没有返回结果/);
   server.dispose();
 });
+
+test('phone/result 兼容标准形状 {result:{content}} 与 {error:{message}}', async () => {
+  const { server, rpc } = await startServer();
+  await rpc('phone/register', {
+    tools: [{ name: 'battery', description: '手机电量', inputSchema: { type: 'object', properties: {} }, annotations: { readOnlyHint: true } }],
+  });
+
+  const okCall = rpc('tools/call', { name: 'phone_battery', arguments: {} });
+  const poll1 = await rpc('phone/poll', { waitMs: 3000 });
+  await rpc('phone/result', {
+    id: poll1.result.call.id,
+    result: { content: [{ type: 'text', text: '电量 66%' }] },
+  });
+  const okResult = await okCall;
+  assert.equal(okResult.result.content[0].text, '电量 66%');
+
+  const failCall = rpc('tools/call', { name: 'phone_battery', arguments: {} });
+  const poll2 = await rpc('phone/poll', { waitMs: 3000 });
+  await rpc('phone/result', {
+    id: poll2.result.call.id,
+    error: { code: 'PERMISSION_DENIED', message: '没有定位权限' },
+  });
+  const failResult = await failCall;
+  assert.equal(failResult.result.isError, true, '手机端执行失败必须回给模型 isError');
+  assert.match(failResult.result.content[0].text, /没有定位权限/);
+  server.dispose();
+});
+
+test('超时的调用不会残留在队列里被下一次 poll 领走', async () => {
+  const { server, rpc } = await startServer(300);
+  await rpc('phone/register', {
+    tools: [{ name: 'clipboard_write', description: '写剪贴板', inputSchema: { type: 'object', properties: {} }, annotations: { readOnlyHint: false } }],
+  });
+  const res = await rpc('tools/call', { name: 'phone_clipboard_write', arguments: { text: '过期指令' } });
+  assert.equal(res.result.isError, true);
+  const poll = await rpc('phone/poll', { waitMs: 300 });
+  assert.equal(poll.result.call, undefined, '超时调用必须从队列摘除，不能投递给手机');
+  server.dispose();
+});

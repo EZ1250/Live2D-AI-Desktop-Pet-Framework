@@ -155,14 +155,26 @@ function findArtifact(releaseDir) {
 }
 
 // ---------------------------------------------------------------- 主流程
-// 打包前置检查：extraResources 依赖这两个目录已生成，缺了就打成"白屏包"，宁可提前失败
-const REQUIRED_DIRS = [
-  ['public/renderer', 'node scripts/assemble-renderer.js'],
-  ['public/assets', 'node scripts/import-model.js'],
+// 打包前置检查：extraResources 依赖这两个目录已生成，缺了就打成"白屏包"，宁可提前失败。
+// 只查目录是否存在不够：换栈/拆分模块后，旧装配目录可能"存在但缺文件"，所以同时抽查关键产物。
+const REQUIRED_FILES = [
+  ['public/renderer/index.html', 'node scripts/assemble-renderer.js'],
+  ['public/renderer/renderer.js', 'node scripts/assemble-renderer.js'],
+  ['public/renderer/live2d.js', 'node scripts/assemble-renderer.js'],
+  ['public/renderer/kernel.js', 'node scripts/assemble-renderer.js'],
+  ['public/renderer/fx.js', 'node scripts/assemble-renderer.js'],
+  ['public/renderer/plugins/emotion.js', 'node scripts/assemble-renderer.js'],
+  ['public/renderer/plugins/behavior.js', 'node scripts/assemble-renderer.js'],
+  ['public/renderer/panels/todo.js', 'node scripts/assemble-renderer.js'],
+  ['public/renderer/panels/askBox.js', 'node scripts/assemble-renderer.js'],
+  ['public/renderer/lib/pixi.min.js', 'node scripts/assemble-renderer.js'],
+  ['public/renderer/lib/live2dcubismcore.min.js', 'node scripts/assemble-renderer.js'],
+  ['public/renderer/lib/live2d-engine.min.js', 'node scripts/assemble-renderer.js'],
+  ['public/assets/models.json', 'node scripts/import-model.js'],
 ];
-for (const [rel, fix] of REQUIRED_DIRS) {
+for (const [rel, fix] of REQUIRED_FILES) {
   if (!fs.existsSync(path.join(PROJECT_ROOT, rel))) {
-    console.error(`[build-portable] 缺少 ${rel}/（extraResources 源），已中止打包。`);
+    console.error(`[build-portable] 缺少 ${rel}（extraResources 源不完整），已中止打包。`);
     console.error(`              请先执行：${fix}`);
     process.exit(1);
   }

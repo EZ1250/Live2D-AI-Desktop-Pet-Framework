@@ -36,7 +36,7 @@ $env:DEVTOOLS=1
 # 全部测试（tsc + 装配 + node:test）
 npm test
 
-# CI 同款（tsc + node --test）
+# CI 同款（tsc + assemble + node --test）
 npm run check
 
 # 单模块测试（按需）
@@ -51,6 +51,9 @@ node --test tests/toolLoopGuard.test.js           # 工具循环守卫
 node --test tests/mcpClient.test.js               # MCP 客户端
 node --test tests/voiceInput.test.js              # 语音输入
 node --test tests/contracts.test.js               # 跨进程契约
+node --test tests/routes.test.js                  # IPC 路由（契约↔preload↔主进程）
+node --test tests/staticServer.test.js            # 本地静态资源路由（renderer/assets/挂载点/越界）
+node --test tests/assetIntegrity.test.js          # 渲染资源/运行库/仓库完整性
 ```
 
 ### 打包与验收
@@ -63,9 +66,10 @@ npm run build:all             # 只编译装配，不打包
 
 ## 当前功能
 
-- Live2D Cubism 3/4/5（随包 Core 5.0，可读 moc3 v3/v4/v5）与静态立绘；不兼容模型会显示原因。
+- Live2D Cubism 3/4/5（随包 Core 5.1，可读 moc3 v3/v4/v5）与静态立绘；不兼容模型会显示原因。
 - 右键菜单切换取景（全身/半身）、表情与动作；设置页切换模型、配置 OpenAI 兼容接口、语音转写接口、权限模式与音效。
 - 气泡聊天、独立对话窗、思考过程浮窗、历史会话、待办笔记本、提醒闹钟。
+- 对话可自动朗读（Edge TTS，设置里开关与音色可选；VTS 开启时同步口型）。
 - 托盘菜单（显示/隐藏、摆回屏幕内、取景、点击穿透、设置、退出）与全局快捷键 `Ctrl+Alt+P`（显隐）、`Ctrl+Alt+O`（设置）。
 - 窗口位置记忆、全屏时自动收起、空闲降帧、模型文件夹拖放导入。
 - 模型与插件通过设置里的资产目录导入，并显示检查结果。
@@ -78,6 +82,7 @@ npm run build:all             # 只编译装配，不打包
 - `src/renderer`：窗口界面与模型渲染。
 - `src/shared/contracts.ts`：IPC 与 preload 契约的唯一来源。
 - `local-assets`、`personas`：本地模型、技能和角色资料源。
+- `android-mcp-client`：手机端 MCP 客户端（Kotlin + Compose；源码随仓库提供，APK 用 Android Studio 本地构建，不纳入版本库）。
 - `public`、`dist`、`release`：导入、编译和打包产物（都已 gitignore，可由命令重建）。
 
 文件归属与构建关系见 `docs/PROJECT_LAYOUT.md`。

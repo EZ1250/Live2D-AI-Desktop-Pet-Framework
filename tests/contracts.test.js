@@ -188,6 +188,22 @@ test('Edge TTS 播放接线：speak handler + 渲染层播放 + 说话时 VTS �
   assert.ok(renderer.includes('new Audio('), '渲染层应真的用 new Audio(...) 播放');
   assert.ok(renderer.includes('onTtsAudio'), '渲染层应订阅 onTtsAudio');
   assert.ok(readSrc('src/main/ipc.ts').includes('onVtsMouth'), '说话时应向 VTS 注入 MouthOpen');
+  // 对话自动朗读：契约 / preload / 渲染层 / 设置页四处都接上，且旧结果必须被丢弃
+  assert.match(readSrc('src/preload/preload.ts'), /ipcRenderer\.invoke\(IPC_TTS_SPEAK,\s*text,\s*voice,\s*requestId\)/, 'preload 必须透传音色和 requestId');
+  assert.match(renderer, /payload\.requestId !== latestTtsRequestId/, '渲染层必须丢弃过期 TTS 结果');
+  assert.ok(renderer.includes('beginTtsRequest()'), '每次 TTS 请求必须生成并登记 requestId');
+  assert.ok(renderer.includes('speakConversation(bridge, payload.full)'), 'AI 回复必须接自动朗读');
+  assert.ok(renderer.includes('speakConversation(bridge, payload.text)'), '主动气泡必须接自动朗读');
+  assert.ok(renderer.includes('applyTtsSettings(bootSettings)'), '启动时必须初始化朗读开关（不打开设置页也要生效）');
+  assert.match(readSrc('src/main/ai/chatClient.ts'), /ttsEnabled: bool\(false, 'ttsEnabled'\)/, 'loadAppSettings 必须读回 ttsEnabled（否则重启丢配置）');
+  assert.match(readSrc('src/main/ai/chatClient.ts'), /ttsVoice: str\('ttsVoice'\)/, 'loadAppSettings 必须读回 ttsVoice');
+  assert.match(readSrc('src/shared/contracts.ts'), /ttsEnabled\?: boolean/);
+  assert.match(readSrc('src/shared/contracts.ts'), /ttsVoice\?: string/);
+  assert.ok(readSrc('src/main/ipc.ts').includes('const stopTtsMouth'), '新 TTS 请求必须先收口上一段 VTS 口型');
+  const html = readSrc('src/renderer/index.html');
+  for (const id of ['setting-tts-enabled', 'setting-tts-voice', 'setting-tts-speak']) {
+    assert.ok(html.includes(`id="${id}"`), `index.html 应包含 #${id}`);
+  }
   // 自动播放开关已前移到 earlySwitches（由 main.ts 在 mainImpl 之前 import、mainImpl 顶部也 require）：
   // 位置必须"早于任何 app ready / 创建窗口"，所以不能再只查 mainImpl.js 里那一段。
   assert.ok(

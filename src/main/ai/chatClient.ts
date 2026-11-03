@@ -176,6 +176,9 @@ export function loadAppSettings(): AppSettings {
       showThinking: bool(true, 'showThinking'),
       sfxEnabled: bool(true, 'sfxEnabled'),
       sfxVolume: Math.max(0, Math.min(1, num(0.6, 'sfxVolume'))),
+      // 对话朗读同样必须读回来，否则"存进去、重启丢"（同上面 confirmTools 的坑）
+      ttsEnabled: bool(false, 'ttsEnabled'),
+      ttsVoice: str('ttsVoice') ?? '',
       devWorkspaceRoot: str('devWorkspaceRoot') ?? '',
       allowShell: bool(true, 'allowShell'),
       permissionMode: ((): 'ask' | 'auto-edit' | 'plan-only' => {

@@ -1,0 +1,2 @@
+﻿# 本机路径，不要提交；Android Studio 会自动生成 local.properties
+sdk.dir=C\:\\Users\\<you>\\AppData\\Local\\Android\\Sdk

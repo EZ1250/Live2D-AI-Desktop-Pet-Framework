@@ -1,4 +1,4 @@
-# 微内核 + 事件总线 + 插件化重构方案
+# 微内核、事件总线与插件实现
 
 > 状态：**P1 已实施，渲染层拆分仍未实施**。主进程已加入 typed EventBus、依赖启动顺序、
 > 插件卸载和 owner 订阅清理；渲染层仍保持现有全局脚本与 `renderer.ts` 装配方式。
@@ -10,6 +10,14 @@
 ---
 
 ## 0. 结论摘要
+
+> **实现状态（以代码为准）**：§4.5/§5.3 的代码块是设计稿，实际实现有出入 ——
+> 渲染层插件用 `PetKernel.register(plugin)` 注册（没有 `define`；插件无 `version` 字段）；
+> `ctx.service(name)` 缺失时**抛错**（不是返回 null）；同步能力用 `ctx.handle(name, fn)` +
+> `PetKernel.call(name, …)`（没有 `ctx.provide`）；实际事件表是
+> `chat:reply / tracking:emotion / behavior / behavior:config`（`window:change/cursor:global/emotion:detected`
+> 未实现）；`PetKernel.provide` 有重名保护（保留先注册者并告警）。
+> 见 `src/renderer/kernel.ts` 与 `tests/kernel.test.js`。
 
 1. 现状不是"没有插件系统"，而是**插件宿主只在主进程**：`src/plugin-system/registry.ts`
    已具备 register/start/tick + 动作桥，但事件只有 4 个固定方向（内核 → 插件），没有卸载、
@@ -207,7 +215,7 @@ src/
 ├── plugin-system/                   主进程内核（插件宿主；保持在 src 顶层）
 │   ├── types.ts                     改造：PetPlugin + dependencies?/teardown?（纯增量）
 │   ├── eventBus.ts                  新增：主进程事件总线（按 owner 管理订阅）
-│   └── registry.ts                  改造：升级为主进程 PluginManager（依赖/卸载/总线派发）
+│   └── registry.ts                  主进程插件注册表（依赖/卸载/总线派发）
 ├── main/                            不动：main.ts 入口、mainImpl.js 装配、ipc/windowMonitor/ai/assets…
 ├── preload/
 │   └── preload.ts                   不动（本次不新增 IPC 通道）
@@ -216,7 +224,7 @@ src/
     ├── plugins/
     │   └── emotion.ts               新增：情绪插件（从 renderer.ts 剥出的策略）
     ├── emotion.ts                   不动：规则库 window.PetEmotion（插件与 live2d 共用）
-    ├── live2d.ts                    不动（阶段 4 可选：改为经内核服务取规则）
+    ├── live2d.ts                    模型加载、参数和表情动作
     ├── gazeController.ts            不动
     ├── ttsMouth.ts                  不动
     ├── voicelab.ts                  不动
@@ -229,14 +237,14 @@ src/
 scripts/assemble-renderer.js         改造：+ kernel.js；+ plugins/ 目录拷贝；CommonJS 守卫覆盖新脚本
 src/renderer/index.html              改造：+ kernel.js、+ plugins/emotion.js（顺序固定）
 tests/behaviorTriggers.test.js       改造：按 index.html 顺序多 require 两个编译产物
-docs/PROJECT_LAYOUT.md               阶段 4 同步（顺带修正：现状树把 plugin-system 画进 main 子目录，
+docs/PROJECT_LAYOUT.md               目录与构建说明
                                      实际在 src/ 顶层）
 CONTRACT.md                          阶段 1/4 同步：插件可选字段说明
 ```
 
 不在树里的东西：**不新建** `src/main/kernel/` 之类的壳目录。`mainImpl.js` 已经是这个项目的
 装配根（composition root），再包一层只会多一层转发；`PluginRegistry` 就是用户所说的
-"PluginManager"，不新建平行类（理由见 §8-3）。
+插件注册表，不新建平行管理器。
 
 ### 3.2 新增/改造文件清单
 
@@ -358,14 +366,14 @@ export interface PetPlugin {
 }
 ```
 
-### 4.3 插件管理器（`src/plugin-system/registry.ts` 改造后 = PluginManager）
+### 4.3 插件注册表（`src/plugin-system/registry.ts`）
 
 **保留类名 `PluginRegistry`**（`ipc.ts` 的 `PluginRegistryLike`、`mainImpl.js` 适配层都依赖它；
-"改成 PluginManager"属于纯改名，不带来任何能力，反而制造一次破坏性变更）。以下是改造后的完整文件：
+注册表负责依赖排序、启动、卸载和事件分发。以下是实现：
 
 ```ts
 /**
- * 插件注册表（主进程微内核的 PluginManager）：插件注册、依赖排序、启动、卸载与事件分发。
+ * 插件注册表：插件注册、依赖排序、启动、卸载与事件分发。
  *
  * 事件不再由本类逐个插件派发，而是进入 EventBus 后按 owner 分发；卸载/启动失败时
  * 按 owner 清订阅，避免残留回调。register/start/tick/windowChange/userInput/list/
@@ -1236,7 +1244,7 @@ function applyEmotionText(text: string): string | null {
 | 不动的东西 | 原因 |
 |---|---|
 | `emotion.ts`（规则库 `window.PetEmotion`） | 纯函数、零依赖、被单测/Node 直接加载；且 `live2d.ts:1476-1498` 仍在读它——删掉就是破坏公共全局 API |
-| `live2d.ts` 的 `applyEmotionLabel()` | 属渲染机制；阶段 4 可选改为经内核服务取规则（加 `window.PetKernel?.service('emotionRules')` 的兜底），本次不做以缩小风险面 |
+| `live2d.ts` 的 `applyEmotionLabel()` | 属渲染机制，保留在模型渲染模块 |
 | `pushTrackingFrame()` 里的 `frame.emotion` 分支（`renderer.ts:946-950`） | 这是"外部追踪帧"域，语义是"数据源已经给出标签、直接应用"，与文本判定不是同一条链路；强行统一会改变低置信帧的处理时机 |
 | `IPC_ACTION` 的 `emotion` 分支（`renderer.ts:2196-2199`） | 主进程/外部脚本直接推标签（非文本），行为保持不变 |
 | `window.petTracking` / `__petDebug` 的既有字段 | 公共调试/自动化接口；本次只在 `__petDebug` 上追加 `plugins()` |
@@ -1303,11 +1311,11 @@ const EMOTION_PLUGIN = path.join(APP, 'dist', 'renderer', 'plugins', 'emotion.js
 
 ---
 
-## 6. 迁移阶段（每阶段可独立编译、可回滚）
+## 6. 实施记录
 
 | 阶段 | 改动范围 | 行为影响 | 回滚 |
 |---|---|---|---|
-| P0 基线 | 无（记录 `npm test` 结果；当前仓库已知有 4 条过期测试待修，见 `AGENTS.md §5`） | 无 | — |
+| P0 基线 | 无（记录 `npm test` 结果） | 无 | — |
 | P1 主进程内核化 | `eventBus.ts` 新增；`types.ts` 增量；`registry.ts` 改造；`mainImpl.js` 透传；新增 `tests/pluginRegistry.test.js` | 无（事件名/顺序/去重/失败隔离与旧实现一致） | 还原 3 个文件、删 `eventBus.ts` |
 | P2 渲染层内核 | `kernel.ts` 新增；`renderer.ts` 装配/转发/`plugins()`；`index.html`；`assemble-renderer.js`；测试 harness 加载顺序 | 无（只接线，不迁逻辑；`window.PetKernel.status()` 显示 0 插件） | 同上 |
 | P3 情绪插件化 | `plugins/emotion.ts` 新增；`renderer.ts` 删策略/换 3 个调用点；新增 `tests/emotionPlugin.test.js`；harness 加载插件 | 与旧逻辑等价（§2.5 对照表） | 还原 `renderer.ts`、删插件目录 |
@@ -1322,21 +1330,21 @@ const EMOTION_PLUGIN = path.join(APP, 'dist', 'renderer', 'plugins', 'emotion.js
 ### 7.1 自动验证命令
 
 ```powershell
-cd DesktopPet-App
+cd Live2D-AI-Desktop-Pet-Framework-main
 npm run build:all            # tsc + 装配（含 assemble 的全局脚本/CommonJS 守卫）
 npm test                     # tsc + assemble + 全部 node --test
 node --test tests/behaviorTriggers.test.js   # 渲染层 vm 集成测试（最接近真实初始化）
 node --test tests/pluginRegistry.test.js tests/emotionPlugin.test.js   # P1/P3 实施后新增的用例
 
-# 回归套件（在 DesktopPet-App 下）
+# 回归套件
 $env:PET_APP_ROOT=(Get-Location).Path
-node "C:\Users\enze\Desktop\PET\AI调用方案\outputs\audit_2026-09-13\run_all_checks.js"
+node "<本机工作目录>\run_all_checks.js"
 ```
 
 P3 之后的通过标准：`npm test` 中 `behaviorTriggers` 的 4 条全绿（已知的 4 条过期测试不因本次
 改造恶化）；`pluginRegistry` / `emotionPlugin` 新增用例全绿；`npm run check:privacy` 通过。
 
-### 7.2 本次设计阶段的验证记录（代码骨架已在临时副本上跑过，工作区已还原）
+### 7.2 验证记录
 
 1. **类型检查**：把两个内核、情绪插件、改造后的 `registry.ts`/`types.ts`/`renderer.ts` 放进
    临时镜像目录，用与项目相同的编译选项跑 `tsc`——通过（含 `renderer.ts` 全文件约 6000 行）。
@@ -1382,7 +1390,7 @@ P3 之后的通过标准：`npm test` 中 `behaviorTriggers` 的 4 条全绿（�
 |---|---|---|
 | 1 | 不引入打包器、不改渲染层为 ESM | `assemble-renderer.js`、`index.html`、vm 测试都依赖"全局脚本 + 固定顺序"；引打包器属于另一场重构，且违反"不改依赖/构建链"的约束 |
 | 2 | 不开放第三方渲染层插件 | `contextIsolation` + CSP `script-src 'self'`；动态加载需要新 IPC、静态路由与权限模型（安全边界），本次不做 |
-| 3 | 不新建 `PluginManager` 平行类 | 用户所说的 PluginManager 就是现有 `PluginRegistry` 的职责；新建平行类会与 `ipc.ts` 的 `PluginRegistryLike`、`mainImpl.js` 适配层重复。改名属破坏性变更 |
+| 3 | 保留 `PluginRegistry` | 注册表已承担插件管理职责，不再增加平行管理器或别名 |
 | 4 | 依赖声明放 `PetPlugin` 而非 `PluginManifest`/`pet-plugin.json` | manifest 是对外注册契约，加字段要同步扫描/校验/IPC/preload/文档五处；依赖只是宿主调度信息。代价：资产面板看不到依赖（目前也不需要） |
 | 5 | 总线自己写（约 70 行）而不用 Node `EventEmitter` | 需要按插件归属批量清理订阅 + `PluginEventMap` 类型收窄；EventEmitter 两者都要额外包一层 |
 | 6 | 总线同步派发 | 事件顺序是行为的一部分（`windowChange` 后紧跟 `tick`）；异步化会改变插件观察顺序，也把错误挪到无法归属的位置 |
@@ -1395,7 +1403,7 @@ P3 之后的通过标准：`npm test` 中 `behaviorTriggers` 的 4 条全绿（�
 
 ---
 
-## 9. 未决问题（需要你确认后我才继续实施）
+## 9. 后续可选工作
 
 1. **「移除插件」按钮要不要真正卸载运行中的插件？** 要的话需要新增 `IPC_PLUGIN_UNREGISTER`
    通道（`contracts.ts` + preload + `ipc.ts` + `renderer.ts` 四处同步 + CONTRACT/文档），并把
@@ -1404,10 +1412,9 @@ P3 之后的通过标准：`npm test` 中 `behaviorTriggers` 的 4 条全绿（�
    插件公共契约的增量，需要你在 CONTRACT.md 的"插件"一节确认措辞。
 3. **渲染层是否接受新增 2 个脚本文件**（`kernel.js`、`plugins/emotion.js`）及其三处装配/测试改动？
    （这是本方案对"无打包器"约束的直接代价。）
-4. **阶段 4 范围**：先只做 emotion，还是同时把 `gazeController` / `ttsMouth` / `voicelab` 也纳入
-   内核服务/插件？（它们目前独立全局脚本已能工作，迁移收益低于 emotion，风险更高。）
+4. **后续范围**：`gazeController`、`ttsMouth` 和 `voicelab` 当前保持独立全局脚本，不纳入插件系统。
 5. **主进程事件表是否扩展**（如 `model:changed` / `chat:done`）供第三方插件使用？扩展要改
    `PluginEventMap` + CONTRACT + 文档，并评估对现有插件的兼容性。
 6. **`__petDebug` 追加 `plugins()`** 是否可以（调试 API 的增量）？
 
-> 确认 1–3 后，我可以按 §6 的 P1 → P3 顺序直接实施，并在每阶段跑 §7.1 的验证。
+> 后续扩展需同步更新实现、契约、装配清单和测试。

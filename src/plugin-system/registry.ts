@@ -1,9 +1,4 @@
-/**
- * 主进程微内核的插件管理器。
- *
- * 保留 PluginRegistry 名称以兼容现有 IPC 和动态加载适配层；
- * PluginManager 是面向新代码的别名。
- */
+/** 主进程插件注册表与生命周期管理器。 */
 import type { PluginManifest, WindowInfo } from '../shared/contracts';
 import { EventBus } from './eventBus';
 import type { PetPlugin, PluginContext, PluginEventMap } from './types';
@@ -166,8 +161,6 @@ export class PluginRegistry {
     }
   }
 }
-
-export { PluginRegistry as PluginManager };
 
 const registry = new PluginRegistry();
 export default registry;

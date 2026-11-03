@@ -46,6 +46,11 @@ extraResources:
   # 从 resources/renderer 提供 index.html、脚本和 Live2D 运行时库。
   - from: public/renderer
     to: renderer
+  # 第三方组件与项目 LICENSE 随包分发（MIT / Live2D 许可要求保留声明）
+  - from: LICENSE
+    to: LICENSE
+  - from: THIRD_PARTY_NOTICES.md
+    to: THIRD_PARTY_NOTICES.md
 
 win:
   # 两个目标：
@@ -84,7 +89,7 @@ portable:
 #   - 最快启动：装一次 nsis 安装包（之后启动≈0.5s），或直接用免解压的 win-unpacked/Pet.exe。
 #
 # ⚠️ 关键环境约束（本机实测，2026-09-30）：
-#   **在 `Desktop\PET\...\release\` 下生成的 exe 双击无反应、进程都不出现**（退出码 0x80000003），
+#   **在用户「桌面」目录下生成的 exe 双击无反应、进程都不出现**（退出码 0x80000003），
 #   同一份文件拷到 %TEMP% 或 %LOCALAPPDATA%\Programs\ 下却能正常启动。
 #   逐字节校验过：两种位置的运行时文件完全相同 → 是**系统安全策略拦截了 Desktop 下的新可执行文件**，
 #   不是构建问题。所以：**打包产物不要在 Desktop 目录下运行**；要么装到

@@ -513,6 +513,11 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
 
     deps.registry.emitUserInput?.(message);
 
+    // 手机对话进行中：电脑端输入直接拒绝，且不产生任何副作用（待办/提醒/浮窗都不动）
+    if (deps.isPhoneChatActive?.() === true) {
+      return { ok: false, error: '手机对话进行中，请稍后再发' };
+    }
+
     // 先走本地工具箱：命中（待办/提醒闹钟等）→ 直接气泡回执，不消耗外部 AI
     const toolReply = deps.toolbox.route(message);
     if (toolReply !== null) {
@@ -530,9 +535,6 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
       deps.onChatStarted?.();
     } catch {
       /* 浮窗开关失败不影响对话本身 */
-    }
-    if (deps.isPhoneChatActive?.() === true) {
-      return { ok: false, error: '手机对话进行中，请稍后再发' };
     }
     void deps.chat
       .startChat(message)
@@ -892,31 +894,71 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
   // ---- Edge TTS：合成后经 IPC_TTS_AUDIO 推回渲染层播放 ----------------------
   // 合成本身在 ttsService 里（不 import Electron，可离线测试）；这里只负责
   // 1) 找窗口当推送目标 2) 说话期间给 VTS 注入 MouthOpen（张嘴 → 按音频时长归 0）
+  // 3) 校验音色/请求 id，并用代际号保证"旧请求的口型收口"不会提前闭掉新一句的嘴
   let ttsMouthTimer: NodeJS.Timeout | null = null;
-  ipcMain.handle(IPC_TTS_SPEAK, async (_event, rawText: unknown): Promise<{ ok: boolean; error?: string; bytes?: number }> => {
+  let ttsMouthGeneration = 0;
+  const stopTtsMouth = (): void => {
+    ttsMouthGeneration += 1;
+    if (ttsMouthTimer) {
+      clearTimeout(ttsMouthTimer);
+      ttsMouthTimer = null;
+    }
+    try {
+      deps.onVtsMouth?.(0);
+    } catch (err) {
+      console.warn('[ipc] TTS 口型收口失败：', err);
+    }
+  };
+  ipcMain.handle(IPC_TTS_SPEAK, async (_event, rawText: unknown, rawVoice: unknown, rawRequestId: unknown): Promise<{ ok: boolean; requestId?: string; error?: string; bytes?: number }> => {
     const text = typeof rawText === 'string' ? rawText.trim() : '';
     if (!text) return { ok: false, error: '文本为空' };
+    const requestedVoice = typeof rawVoice === 'string' ? rawVoice.trim() : '';
+    if (requestedVoice && !/^[A-Za-z0-9-]+$/.test(requestedVoice)) {
+      return { ok: false, error: '音色名称无效' };
+    }
+    const requestId = typeof rawRequestId === 'string' && /^[A-Za-z0-9._:-]{1,160}$/.test(rawRequestId.trim())
+      ? rawRequestId.trim()
+      : undefined;
+    stopTtsMouth();
+    const mouthGeneration = ttsMouthGeneration;
     const win = deps.getWindow();
     const target = win && !win.isDestroyed() && !win.webContents.isDestroyed()
       ? { send: (channel: string, payload: unknown): void => { win.webContents.send(channel, payload); } }
       : null;
-    const result = await speakTts(target, text, { logger: (message) => console.warn(message) });
+    const ttsSettings = loadAppSettings();
+    const result = await speakTts(target, text, {
+      voice: requestedVoice || ttsSettings.ttsVoice || undefined,
+      requestId,
+      logger: (message) => console.warn(message),
+    });
     if (result.ok) {
       // 简单口型：开始 0.7，按 mp3 码率（48kbps ≈ 6KB/s）粗估时长后归 0；太短给 400ms、太长封顶 15s
       const durationMs = Math.min(15_000, Math.max(400, Math.round((result.bytes / 6000) * 1000)));
-      try {
-        deps.onVtsMouth?.(0.7);
-      } catch { /* 注入失败不影响播报 */ }
-      if (ttsMouthTimer) clearTimeout(ttsMouthTimer);
-      ttsMouthTimer = setTimeout(() => {
-        ttsMouthTimer = null;
+      if (mouthGeneration === ttsMouthGeneration) {
         try {
-          deps.onVtsMouth?.(0);
-        } catch { /* ignore */ }
-      }, durationMs);
-      if (typeof ttsMouthTimer.unref === 'function') ttsMouthTimer.unref();
+          deps.onVtsMouth?.(0.7);
+        } catch (err) {
+          console.warn('[ipc] TTS 口型开始注入失败：', err);
+        }
+        if (ttsMouthTimer) clearTimeout(ttsMouthTimer);
+        ttsMouthTimer = setTimeout(() => {
+          if (mouthGeneration !== ttsMouthGeneration) return;
+          ttsMouthTimer = null;
+          try {
+            deps.onVtsMouth?.(0);
+          } catch (err) {
+            console.warn('[ipc] TTS 口型收口失败：', err);
+          }
+        }, durationMs);
+        if (typeof ttsMouthTimer.unref === 'function') ttsMouthTimer.unref();
+      }
     }
-    return { ok: result.ok, bytes: result.bytes, ...(result.error ? { error: result.error } : {}) };
+    return {
+      ok: result.ok,
+      requestId: result.requestId,
+      bytes: result.bytes,
+      ...(result.error ? { error: result.error } : {}),
+    };
   });
 
 
@@ -1080,6 +1122,18 @@ function sanitizeSettings(raw: unknown): AppSettings | null {
     const volume = input.sfxVolume;
     if (typeof volume !== 'number' || !Number.isFinite(volume)) return null;
     settings.sfxVolume = Math.max(0, Math.min(1, volume));
+  }
+  // 对话朗读：开关必须是布尔；音色只收 Edge 的声音短名（字母/数字/连字符）
+  if (input.ttsEnabled !== undefined) {
+    if (typeof input.ttsEnabled !== 'boolean') return null;
+    settings.ttsEnabled = input.ttsEnabled;
+  }
+  if (input.ttsVoice !== undefined) {
+    if (typeof input.ttsVoice !== 'string') return null;
+    const voice = input.ttsVoice.trim();
+    if (voice && !/^[A-Za-z0-9-]+$/.test(voice)) return null;
+    if (voice.length > 120) return null;
+    settings.ttsVoice = voice;
   }
   // 开发工作区：非空时必须是绝对路径（工具层还会再做一次根目录内校验）
   // Windows：盘符带分隔符 (C:\) 或 UNC (\\server\share)；类 Unix：以 / 开头。

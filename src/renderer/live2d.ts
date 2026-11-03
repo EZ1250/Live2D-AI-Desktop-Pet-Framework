@@ -6,18 +6,18 @@
  *    未来接打包器亦无需改动）。对外只挂一个全局：window.PetLive2d。
  *
  * 职责：三种渲染形态的挂载与销毁：
- *   - moc3       → PIXI + pixi-live2d（Live2DModel.from(model3.json)）
- *                 运行库三件套与版本/来源/许可/兼容处理见 ./lib/VERSIONS.md：
- *                 PixiJS 8.14.0（MIT）+ untitled-pixi-live2d-engine 1.4.0（Cubism 3/4/5）
- *                 + 官方 Live2D Cubism Core 5.0（最高 moc3 v5）。
- *                 老栈（Pixi 6.5.10 + cubism4 0.4.0 + Core 4.2）也能跑：本文件按 PIXI.VERSION 自动分流。
+ *   - moc3       → PIXI + pixi-live2d-display（Live2DModel.from(...)）
+ *                 运行库见 ./lib/VERSIONS.md：PixiJS 6.5.10（MIT）
+ *                 + pixi-live2d-display 0.4（MIT）+ Live2D Cubism Core 5（moc3 v3/v4/v5）。
+ *                 模型若带 .vtube.json，按其中的 ParameterSettings 做 VTS 风格参数映射
+ *                 （自定义 AngleX/PositionX 等），否则走标准 Cubism 参数名。
  *   - portrait   → <img src=png> + JS 待机呼吸/浮动（CSS transform）
  *   - placeholder→ 占位图形（moc3 运行时缺失/加载失败时的底线可视）
  *
  * 依赖脚本（必须在此文件之前加载，顺序固定）：
  *   ./lib/pixi.min.js → window.PIXI
  *   ./lib/live2dcubismcore.min.js → window.Live2DCubismCore
- *   ./lib/live2d-engine.min.js → window.PIXI.live2d（untitled-pixi-live2d-engine 的浏览器构建）
+ *   ./lib/live2d-engine.min.js → window.PIXI.live2d（pixi-live2d-display 的浏览器构建）
  * 任一缺失时 isLive2DAvailable() 为 false，调用方自动走降级路径。
  *
  * 帧驱动：三种 handle 都暴露 update(nowSec, deltaSec)，由 renderer.ts 的
@@ -419,17 +419,30 @@
     return raw;
   }
 
+  /** .vtube.json ParameterSettings 的一条映射（VTS 输入 → 模型参数） */
+  interface VtsParamMap {
+    input: string;
+    inLow: number;
+    inHigh: number;
+    outId: string;
+    outLow: number;
+    outHigh: number;
+    clampInput: boolean;
+    clampOutput: boolean;
+    smoothing: number;
+  }
+
   /**
-   * 读 model3.json 并归一化后再交给运行库（**不是**改写用户模型文件，只是喂给库的这份内存对象）。
-   * 只在 Pixi 8 那套新引擎下用（Pixi 6 + cubism4 0.4.0 不需要，传对象反而可能不兼容）。
+   * 读 model3.json 并合并 .vtube.json，再把结果交给运行库（**不改写用户模型文件**，只改内存对象）。
    *
-   * 为什么必须做：新引擎内部是 `Object.assign(this, new CubismModelSettingJson(buffer))`，
-   * 把「框架设置类的 JSON 键名字符串」整片拷进设置对象（`hitAreas = "HitAreas"`…），
-   * 再用 `if (json.HitAreas) this.hitAreas = json.HitAreas` 覆盖 —— 模型没写 HitAreas 时
-   * `this.hitAreas` 会是字符串，随后 `.map()` 直接抛 `TypeError: _a.map is not a function`。
-   * 实测：VTS 导出的模型普遍没有 HitAreas。
+   * 为什么必须做：
+   *  - VTS 导出的模型把表情/动作/热键放在 .vtube.json 里，model3.json 的 FileReferences 常常是空的，
+   *    不合并的话右键菜单里没有任何表情/动作；
+   *  - ParameterSettings 是 VTS 的参数映射表（例如 FaceAngleX → AngleX/PositionX），
+   *    这类模型用自定义控制器参数，不按表驱动就会"只有眨眼、头僵着"。
    */
-  async function normalizeModelSettings(url: string): Promise<Any | null> {
+  async function normalizeModelSettings(url: string): Promise<{ json: Any; mapping: VtsParamMap[] } | null> {
+    let mapping: VtsParamMap[] = [];
     try {
       const res = await fetch(url, { cache: 'no-cache' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -446,6 +459,38 @@
         if (vres.ok) {
           const vjson = (await vres.json()) as Any;
           const hotkeys = Array.isArray(vjson.Hotkeys) ? vjson.Hotkeys : [];
+          // VTS 参数映射：模型用自定义控制器参数时，必须按这张表把追踪/口型写进去
+          const settingsList = Array.isArray(vjson.ParameterSettings) ? vjson.ParameterSettings : [];
+          mapping = [];
+          let invalidRangeRows = 0;
+          for (const entry of settingsList) {
+            if (!entry || typeof entry.OutputLive2D !== 'string' || !entry.OutputLive2D) continue;
+            // Input 为空的是 VTS 自带的呼吸/眨眼等行为，由模型动画负责，不走映射
+            if (typeof entry.Input !== 'string' || !entry.Input) continue;
+            const inLow = Number(entry.InputRangeLower);
+            const inHigh = Number(entry.InputRangeUpper);
+            const outLow = Number(entry.OutputRangeLower);
+            const outHigh = Number(entry.OutputRangeUpper);
+            // 范围缺失时不能猜 0/1（会让输出直接饱和到极值）：跳过并记数，启动日志里提示
+            if (![inLow, inHigh, outLow, outHigh].every(Number.isFinite)) {
+              invalidRangeRows += 1;
+              continue;
+            }
+            mapping.push({
+              input: entry.Input,
+              inLow,
+              inHigh,
+              outId: entry.OutputLive2D,
+              outLow,
+              outHigh,
+              clampInput: entry.ClampInput === true,
+              clampOutput: entry.ClampOutput === true,
+              smoothing: Number(entry.Smoothing) || 0,
+            });
+          }
+          if (invalidRangeRows) {
+            console.warn(`[live2d] .vtube.json 有 ${invalidRangeRows} 条映射缺范围字段，已跳过`);
+          }
           const enc = (rel: string): string => rel.split('/').map((x) => encodeURIComponent(x)).join('/');
           const exists = async (rel: string): Promise<boolean> => {
             try {
@@ -465,7 +510,7 @@
           const refs = (json.FileReferences = json.FileReferences && typeof json.FileReferences === 'object' ? json.FileReferences : {});
           const expressions: Any[] = Array.isArray(refs.Expressions) ? refs.Expressions : [];
           const motions: Record<string, Any[]> = refs.Motions && typeof refs.Motions === 'object' && !Array.isArray(refs.Motions) ? refs.Motions : {};
-          const hotkeyMotions: Any[] = [];
+          const hotkeyGroups: Record<string, Any[]> = {};
           for (const h of hotkeys) {
             const file = h && typeof h.File === 'string' ? h.File : '';
             if (!file) continue;
@@ -474,12 +519,19 @@
               if (p) expressions.push({ Name: String(h.Name || file).replace(/\.exp3\.json$/i, ''), File: p });
             } else if (h.Action === 'TriggerAnimation') {
               const p = await pick(file, ['Animation', 'Motions', '']);
-              if (p) hotkeyMotions.push({ File: p });
+              if (!p) continue;
+              // VTS 的 TriggerAnimation 热键名才是用户认得的动作名（如"抚胸手打开"）；
+              // 归成一个 "Hotkey" 组会让菜单里所有动作都变成无名条目，所以按热键名各自成组。
+              const name = String(h.Name || file).replace(/\.motion3\.json$/i, '').trim() || file;
+              if (!hotkeyGroups[name]) hotkeyGroups[name] = [];
+              hotkeyGroups[name].push({ File: p });
             }
+          }
+          for (const [name, list] of Object.entries(hotkeyGroups)) {
+            if (!Array.isArray(motions[name])) motions[name] = list;
           }
           const idle = await pick('IDLE.motion3.json', ['Animation', 'Motions', '']);
           if (idle && !Array.isArray(motions.Idle)) motions.Idle = [{ File: idle }];
-          if (hotkeyMotions.length) motions.Hotkey = hotkeyMotions;
           refs.Expressions = expressions;
           refs.Motions = motions;
         }
@@ -504,10 +556,16 @@
             const pj = (await pres.json()) as Any;
             const r = Number(pj && pj.gazeOriginRatio);
             if (Number.isFinite(r) && r > 0 && r < 1) json.__petGazeOriginRatio = r;
+            // 可选：隐藏模型里不该显示的 drawable（例如作者遗留的黑色条状贴图）。
+            // 模型特定的 id 只写在模型自己的 pet-model.json，不放框架代码里。
+            const hidden = Array.isArray(pj && pj.hiddenDrawables)
+              ? pj.hiddenDrawables.filter((x: Any) => typeof x === 'string' && x.trim()).slice(0, 32)
+              : [];
+            if (hidden.length) json.__petHiddenDrawables = hidden;
           }
         }
       } catch { /* optional */ }
-      return json;
+      return { json, mapping };
     } catch (err) {
       console.warn('[live2d] 设置文件归一化失败，改为直接交给运行库:', err);
       return null;
@@ -518,71 +576,6 @@
      moc3：PIXI + pixi-live2d 渲染
      ============================================================ */
 
-  /**
-   * 贴图降采样的边长上限。
-   *
-   * 为什么必须做：桌宠窗口里模型只占屏约 200×470 逻辑像素（DPR 1.5 时约 300×700 设备像素），
-   * 而大模型贴图是 4096²/8192² —— 相当于把 8192² 的图压到几百像素里采样，压缩比十几比一；
-   * 又因为引擎那条 LOD 分支实测不生效（见 `lod` 处的注释），没有 mipmap 兜底，
-   * 表现就是发丝闪烁、轮廓毛糙。
-   *
-   * 2048 的依据：即使按 DPR=2 且半身放大 2.5 倍，角色在屏上也不到 1200 设备像素，
-   * 2048² 余量充足；而 8192²→2048² 把显存降到 1/16（640MB → 约 40MB）。
-   */
-  const TEXTURE_MAX_EDGE = 2048; // 桌宠窗口实际显示约 500px；1024 足够，且能显著降低 4K/8K 贴图的显存/解码内存
-
-  /**
-   * 把模型贴图降采样到 TEXTURE_MAX_EDGE 以内（原地替换纹理的像素源）。
-   *
-   * 时机：必须在**第一次上传显存之前**调用，否则改了也没用（GPU 里已经是原图）。
-   * 做法：原图 drawImage 到缩小后的 canvas，再把 Pixi TextureSource 的 resource 换成它，
-   * 并 update()/resize() 让它按新尺寸重新上传。
-   *
-   * 任何一步不对就保持原图 —— 宁可费显存，也不能弄坏画面。
-   */
-  function downscaleModelTextures(model: Any): void {
-    const texes: Any[] = model && Array.isArray(model.textures) ? model.textures : [];
-    if (!texes.length) {
-      console.warn('[live2d] 模型没有 textures，跳过滤采样');
-      return;
-    }
-    for (let i = 0; i < texes.length; i++) {
-      try {
-        const tex = texes[i];
-        const src = tex && tex.source;
-        if (!src) continue;
-        const res = src.resource;
-        if (!res) continue;
-        // 用 pixelWidth/Height（原始资源尺寸）；width/height 可能已被引擎改写
-        const sw = Number(src.pixelWidth || src.width || 0);
-        const sh = Number(src.pixelHeight || src.height || 0);
-        const maxEdge = Math.max(sw, sh);
-        if (!sw || !sh || maxEdge <= TEXTURE_MAX_EDGE) continue;
-        const k = TEXTURE_MAX_EDGE / maxEdge;
-        const dw = Math.max(1, Math.round(sw * k));
-        const dh = Math.max(1, Math.round(sh * k));
-        const cv = document.createElement('canvas');
-        cv.width = dw;
-        cv.height = dh;
-        const ctx = cv.getContext('2d');
-        if (!ctx) continue;
-        ctx.drawImage(res as CanvasImageSource, 0, 0, dw, dh);
-        src.resource = cv;
-        if (typeof src.update === 'function') src.update();
-        if (typeof src.resize === 'function') src.resize(dw, dh, 1);
-        console.log(`[live2d] 贴图 #${i} 降采样 ${sw}x${sh} → ${dw}x${dh}`);
-        // 释放原图解码内存：8K 贴图解码后单张可达 ~256MB，替换纹理源后不释放会常驻
-        try {
-          const oldRes = res as Any;
-          if (oldRes && typeof oldRes.close === 'function') oldRes.close();
-          else if (oldRes && typeof oldRes.src === 'string') oldRes.src = '';
-        } catch { /* 释放失败不影像画面 */ }
-      } catch (err) {
-        console.warn(`[live2d] 贴图 #${i} 降采样异常（保持原图）`, err);
-      }
-    }
-  }
-
   async function mountLive2D(input: { container: HTMLElement; url: string }): Promise<RenderHandle | null> {
     if (!isLive2DAvailable()) {
       console.warn('[live2d] PIXI / Cubism Core / pixi-live2d 运行时缺失，moc3 不可用');
@@ -590,50 +583,10 @@
     }
     const PIXI = w.PIXI as Any;
     const modelUrl = toModelSettingsUrl(input.url);
-    // 运行库是 Pixi 6（老栈）还是 Pixi 8（新栈）：两条路都要能跑，换库时不用改代码。
-    const pixiMajor = (() => {
-      try {
-        const v = PIXI.VERSION || (PIXI.utils && PIXI.utils.VERSION) || '0';
-        return Number(String(v).split('.')[0]) || 0;
-      } catch {
-        return 0;
-      }
-    })();
-    const isModern = pixiMajor >= 8;
-    // 新引擎（Pixi8）不会自己拿到 Pixi 的共享 Ticker：不注册的话动作/物理/顶点更新不会被驱动。
-    if (isModern) {
-      try {
-        const LM = PIXI.live2d && PIXI.live2d.Live2DModel;
-        if (LM && typeof LM.registerTicker === 'function' && PIXI.Ticker) LM.registerTicker(PIXI.Ticker);
-      } catch (err) {
-        console.warn('[live2d] registerTicker 失败', err);
-      }
-    }
 
-    // Pixi 8：先 new、再 await init；Pixi 6：直接构造（autoStart:false —— 渲染交给本层 RAF）
+    // autoStart:false —— 渲染/更新交给本层 RAF（与窗口主循环同一节拍，避免两套循环打架）
     let app: Any;
-    if (isModern) {
-      app = new PIXI.Application();
-      try {
-        await app.init({
-          backgroundAlpha: 0,
-          antialias: true,
-          autoDensity: true,
-          resolution: dpr(),
-          autoStart: false,
-          powerPreference: 'high-performance',
-          // 透明窗口下的边缘合成：预乘 alpha 会让抗锯齿的半透明边缘与桌面底色混合出
-          // 一圈发白的描边（俗称白边/毛边）。关掉后画布输出非预乘 RGBA，由合成器负责混合。
-          premultipliedAlpha: false,
-          width: window.innerWidth || 1,
-          height: window.innerHeight || 1,
-        });
-      } catch (err) {
-        console.warn('[live2d] Pixi 初始化失败（无 WebGL/WebGPU？）', err);
-        try { app.destroy(true); } catch { /* ignore */ }
-        return null;
-      }
-    } else {
+    try {
       app = new PIXI.Application({
         backgroundAlpha: 0,           // 透明背景，配合无边框透明窗口
         antialias: true,
@@ -641,12 +594,14 @@
         resolution: dpr(),
         autoStart: false,
         powerPreference: 'high-performance',
-        premultipliedAlpha: false,    // 同上：避免透明窗口下的边缘白边
+        premultipliedAlpha: false,    // 避免透明窗口下的边缘白边
       });
+    } catch (err) {
+      console.warn('[live2d] Pixi 初始化失败（无 WebGL？）', err);
+      return null;
     }
 
-    // Pixi 6 用 app.view；Pixi 8 改名成 app.canvas（两个都认）
-    const view = (app.canvas ?? app.view) as HTMLCanvasElement | undefined;
+    const view = app.view as HTMLCanvasElement | undefined;
     if (!view) {
       try { app.destroy(true); } catch { /* ignore */ }
       return Promise.resolve(null);
@@ -955,30 +910,25 @@
       }
     }
 
-    // Pixi 8 那套新引擎：喂归一化后的设置对象（补 HitAreas 等）；Pixi 6 老栈直接给 URL
-    const settings = isModern ? await normalizeModelSettings(modelUrl) : null;
+    // 读 model3 并合并 .vtube.json（表情/动作菜单 + VTS 参数映射）；失败时退回直接给 URL
+    const normalized = await normalizeModelSettings(modelUrl);
+    const settings = normalized ? normalized.json : null;
+    const vtsMapping = normalized ? normalized.mapping : [];
     activeGazeOriginRatio = settings && Number.isFinite(Number((settings as Any).__petGazeOriginRatio))
       ? Number((settings as Any).__petGazeOriginRatio)
       : null;
-    /**
-     * 贴图 LOD —— ⚠️ 实测结论：**在当前这套运行库 + 本工程的加载路径下，这个开关对画面没有
-     * 可测量的影响，请勿再把它当成"毛边已解决"的依据。**
-     *
-     * 引擎 `lod` 名义上只有三种取值（见 lib 里的 ge() 归一化）：false / 'single-auto' / 'full'，
-     * 后两者分别对应"自动换低分辨率副本"与"生成完整 mipmap 链"。但实测（同一模型、同一取景、
-     * 只改这一个值）：
-     *   - GPU 审计里每张贴图的 source 与 effective 始终相同（8192² 还是 8192²）；
-     *   - 像素指标 A/B：aliasEnergy 31.09 → 30.70、hardEdgeRate 4.06% → 3.89%，
-     *     差异在噪声量级，等于没有效果。
-     * 也就是说纹理没有走引擎那条 LOD 分支（否则 effective 会明显小于 source）。
-     *
-     * 保留 'single-auto' 只是取一个"不改动现状"的保守值；真正要消毛边 + 降显存，需要
-     * **在贴图进 GPU 之前就降采样**（桌宠窗口模型只占屏约 200×470 逻辑像素、DPR 1.5，
-     * 8192² 用不到），而不是依赖这个开关。
-     */
-    const modelOptions = isModern ? ({ textureOptions: { lod: 'single-auto' } } as Any) : undefined;
+    // 合并后的设置必须用 Cubism4ModelSettings 交给库；直接传 URL 会忽略 .vtube.json 里的表情/动作。
+    // 构造是同步的、且对非法设置会抛错：失败时退回 URL（库自己拉 model3.json），不阻断降级路径。
+    let source: Any = modelUrl;
+    if (settings && PIXI.live2d.Cubism4ModelSettings) {
+      try {
+        source = new PIXI.live2d.Cubism4ModelSettings(settings);
+      } catch (err) {
+        console.warn('[live2d] 合并后的设置无法交给运行库，退回原始 model3.json:', err);
+      }
+    }
     return PIXI.live2d.Live2DModel
-      .from(settings ?? modelUrl, modelOptions) // 默认 autoInteract=true：SDK 内部交互链路接管指针→视线(focus)
+      .from(source) // 默认 autoInteract=true：SDK 内部交互链路接管指针→视线(focus)
       .then((m: Any) => {
         if (destroyed) {
           // 本次挂载已被弃用（期间用户切了模型）。必须**连 app 一起销毁**：
@@ -990,42 +940,7 @@
         }
         model = m;
         model.autoUpdate = false; // 由本层 update 手动驱动（与统一 RAF 同步）
-        // 交互：Pixi 8 用 eventMode（旧的 interactive 已移除）；两者都设，兼容新旧运行库。
-        model.eventMode = 'static';
         model.interactive = true;
-        if (isModern) {
-          // 新引擎的绘制回调需要 renderer（否则**静默不画**）；同时给全局 app 兜底。
-          try { model.renderer = app.renderer; } catch { /* ignore */ }
-          try { (w as Any).app = app; } catch { /* ignore */ }
-          // 贴图降采样必须在**第一次上传显存之前**做完（见函数注释）。
-          try {
-            downscaleModelTextures(model);
-          } catch (err) {
-            console.warn('[live2d] 贴图降采样失败（继续用原图）', err);
-          }
-          // Pixi 8.13+ 的 TextureSource 没有 `_gpuData` 字段，而新引擎拿它判断"显存纹理是否就绪"：
-          // 读到 undefined[uid] 会抛 "Failed to upload Live2D texture."。补一个空对象即可（只用于布尔判断）。
-          try {
-            const texes: Any[] = Array.isArray(model.textures) ? model.textures : [];
-            for (const tex of texes) {
-              const src = tex && tex.source;
-              if (src && !src._gpuData) src._gpuData = Object.create(null);
-              if (tex && tex.source) app.renderer.texture.bind(tex, 0);
-            }
-          } catch (err) {
-            console.warn('[live2d] 贴图兼容处理失败', err);
-          }
-          // 高精度遮罩在新引擎里默认开启，实测在 Pixi8 上会走进崩溃分支；关掉它先保证能画。
-          try {
-            const r = model.internalModel && model.internalModel.renderer;
-            if (r && typeof r.useHighPrecisionMask === 'function') {
-              r.useHighPrecisionMask(false);
-              console.log('[live2d] 已关闭高精度遮罩（Pixi8 引擎兼容处理）');
-            }
-          } catch (err) {
-            console.warn('[live2d] 关闭高精度遮罩失败', err);
-          }
-        }
         app.stage.addChild(model);
         refit();
         // 纹理和布局稳定后再次校正尺寸
@@ -1033,9 +948,9 @@
         const t2 = window.setTimeout(refit, 900);
 
         // —— 视线跟踪 / 动作 / 表情能力（对 pixi-live2d 运行时全防御式访问）——
-        // 参数容器在**两代运行库**上形状不同，两种都认：
-        //   老栈（pixi-live2d-display 0.4.0）：coreModel._model.parameters{count,minimumValues,maximumValues}
-        //   新栈（untitled-engine 1.4.0 / Cubism 5 框架）：coreModel._parameterValues / _parameterMinimumValues / _parameterMaximumValues
+        // 参数容器形状随框架版本不同，两种都认：
+        //   旧版框架：coreModel._model.parameters{count,minimumValues,maximumValues}
+        //   新版框架（Cubism 4/5）：coreModel._parameterValues / _parameterMinimumValues / _parameterMaximumValues
         function paramStore(): Any {
           try {
             const core = model.internalModel && model.internalModel.coreModel;
@@ -1240,7 +1155,7 @@
           mouthFormOK = paramLimit(paramIds.mouthForm) > 0;
         };
         resolveParams();
-        // 新框架（Cubism 5 / untitled-engine）在挂载瞬间 `_parameterValues` 可能还是空的，
+        // 框架在挂载瞬间 `_parameterValues` 可能还是空的，
         // 那一刻解析会得出"全部参数都不存在"；前若干帧再解析几次补上（幂等，最多 12 次）。
         let paramAttempts = 0;
         const ensureParamsReady = (): void => {
@@ -1273,12 +1188,210 @@
         let eBreath = 1; // 呼吸/浮动 ease 状态（指数趋近，避免生硬换向）
         let eBob = 0;
         let eSway = 0; // 常态身体摆动（度）的 ease 状态
+        /** 自动眨眼：下次时刻 / 本次开始时刻(ms) / 开始时的睁眼基线（模型无眨眼动画时不至于像静止贴图） */
+        let nextBlinkAt = 1500 + Math.random() * 2500;
+        let blinkStartedAt = 0;
+        let blinkBaseL = 1;
+        let blinkBaseR = 1;
         let zoomSteps = 0; // 滚轮缩放档位：scale × 1.08^steps；0 = fit 基准
         /**
          * 常态摆动幅度（度）。
          * 有原生 Idle 动作时收着点（动作本身就在动）；没有就补足，保证"一定在动"。
          */
         const idleSwayAmp = idleMotionAvailable ? 0.45 : 0.95;
+
+        // —— VTS 参数映射（模型带 .vtube.json 时）——
+        // 这类模型用自定义控制器参数（AngleX/PositionX 等），必须在 SDK 的 updateFocus 里写：
+        // 位置在 motion/表情/眨眼之后、呼吸/物理之前，物理（头发/裙子/尾巴）才会跟着头部动。
+        const hasVtsMapping = vtsMapping.length > 0;
+        /** 映射会写到的输出参数 ID：标准参数驱动要跳过这些（否则同帧双写，映射会被动作混合打乱） */
+        const mappedOutputs = new Set(vtsMapping.map((entry) => entry.outId));
+        /** 能由本程序提供的 VTS 输入值；不在这里的输入（如 VoiceA、TongueOut）只能跳过并记一次日志 */
+        const vtsInputs: Record<string, number> = {
+          FaceAngleX: 0,
+          FaceAngleY: 0,
+          FaceAngleZ: 0,
+          EyeLeftX: 0,
+          EyeLeftY: 0,
+          EyeRightX: 0,
+          EyeRightY: 0,
+          Brows: 0.45,
+          BrowsLeft: 0.45,
+          BrowsRight: 0.45,
+          MouthOpen: 0,
+          JawOpen: 0,
+          MouthSmile: 0.55,
+        };
+        const vtsSmoothed = new Map<string, number>();
+        let vtsLastMs = 0;
+        // 调试自查：本帧写了几条、目标参数缺失跳过几条、输入不支持跳过几条
+        let vtsWrites = 0;
+        let vtsSkips = 0;
+        let vtsInputSkips = 0;
+        let vtsFirstLimit = -1;
+        let vtsLastSet = -999;
+        if (hasVtsMapping) {
+          const unsupported = [...new Set(vtsMapping.map((entry) => entry.input))].filter(
+            (input) => !(input in vtsInputs),
+          );
+          log(
+            `VTS 参数映射：${vtsMapping.length} 条 / 输出参数 ${mappedOutputs.size} 个` +
+              (unsupported.length ? `；不支持的输入：${unsupported.join(', ')}` : ''),
+          );
+        }
+        function vtsApply(): void {
+          if (!hasVtsMapping) return;
+          vtsWrites = 0;
+          vtsSkips = 0;
+          vtsInputSkips = 0;
+          vtsFirstLimit = -1;
+          const nowMs = performance.now();
+          const dt = vtsLastMs ? Math.min(0.12, (nowMs - vtsLastMs) / 1000) : 1 / 60;
+          vtsLastMs = nowMs;
+          // 鼠标视线 → VTS 输入（与 VTS 的 FaceAngle/Eye 语义对齐）
+          vtsInputs.FaceAngleX = gazeCX * 30;
+          vtsInputs.FaceAngleY = -gazeCY * 20;
+          vtsInputs.FaceAngleZ = gazeCX * 8 + eSway * 0.3;
+          vtsInputs.EyeLeftX = -gazeCX * 0.6;
+          vtsInputs.EyeLeftY = gazeCY * 0.7;
+          vtsInputs.EyeRightX = vtsInputs.EyeLeftX;
+          vtsInputs.EyeRightY = vtsInputs.EyeLeftY;
+          vtsInputs.BrowsLeft = vtsInputs.Brows;
+          vtsInputs.BrowsRight = vtsInputs.Brows;
+          vtsInputs.JawOpen = vtsInputs.MouthOpen * 0.8;
+          for (const entry of vtsMapping) {
+            const raw = vtsInputs[entry.input];
+            if (!Number.isFinite(raw)) {
+              vtsInputSkips += 1;
+              continue;
+            }
+            const limit = paramLimit(entry.outId);
+            if (limit <= 0) {
+              vtsSkips += 1;
+              continue;
+            }
+            if (vtsFirstLimit < 0) vtsFirstLimit = limit;
+            const span = entry.inHigh - entry.inLow || 1;
+            const t = (raw - entry.inLow) / span;
+            const normalized = entry.clampInput ? Math.max(0, Math.min(1, t)) : t;
+            let value = entry.outLow + (entry.outHigh - entry.outLow) * normalized;
+            if (entry.clampOutput) {
+              const lo = Math.min(entry.outLow, entry.outHigh);
+              const hi = Math.max(entry.outLow, entry.outHigh);
+              value = Math.max(lo, Math.min(hi, value));
+            }
+            if (entry.smoothing > 0) {
+              const prev = vtsSmoothed.get(entry.outId);
+              // VTS 的 Smoothing 是 0~100（越大越迟钝）：换算成指数趋近系数
+              const k = 1 - Math.exp((-dt * Math.max(1, 100 - Math.min(99, entry.smoothing))) / 6);
+              if (prev !== undefined) value = prev + (value - prev) * Math.max(0.02, Math.min(1, k));
+            }
+            vtsSmoothed.set(entry.outId, value);
+            vtsWrites += 1;
+            vtsLastSet = value;
+            setParam(entry.outId, value);
+          }
+        }
+        if (hasVtsMapping) {
+          try {
+            const im = model && model.internalModel;
+            if (im) im.updateFocus = () => vtsApply();
+            log('VTS 参数映射已启用:', vtsMapping.length);
+          } catch (err) {
+            console.warn('[live2d] VTS 参数映射接线失败', err);
+          }
+        }
+
+        // —— pet-model.json 的 hiddenDrawables：**按 drawable ID 匹配**，不依赖序号 ——
+        // 序号只在内部用于写 opacities 数组；缓存每帧都用 getDrawableId 复核是否仍对得上，
+        // 模型换版本 / 调整 drawable 顺序时不会误隐藏别的部件。
+        const hiddenDrawableIds: string[] = settings && Array.isArray((settings as Any).__petHiddenDrawables)
+          ? ((settings as Any).__petHiddenDrawables as string[]).filter((x) => typeof x === 'string' && x)
+          : [];
+        const hiddenDrawableIndexCache = new Map<string, number>();
+        function drawableIdAt(core: Any, index: number): string {
+          try {
+            const it = core && typeof core.getDrawableId === 'function' ? core.getDrawableId(index) : null;
+            if (typeof it === 'string') return it;
+            if (it && typeof it.getString === 'function') {
+              const s = it.getString();
+              if (typeof s === 'string') return s;
+              if (s && typeof s.s === 'string') return s.s;
+            }
+            if (it && typeof it.s === 'string') return it.s;
+            if (it && it._id && typeof it._id.s === 'string') return it._id.s;
+          } catch { /* ignore */ }
+          return '';
+        }
+        /** ID → 当前 drawable 序号；缓存每帧用 ID 复核，失效就重新按 ID 找（序号从不被当作身份） */
+        function hiddenDrawableIndex(core: Any, id: string): number {
+          const cached = hiddenDrawableIndexCache.get(id);
+          if (cached !== undefined && cached >= 0 && drawableIdAt(core, cached) === id) return cached;
+          let index = -1;
+          try {
+            const i = core.getDrawableIndex(id);
+            if (typeof i === 'number' && i >= 0) index = i;
+          } catch { /* 字符串 id 不支持时退回扫表 */ }
+          if (index < 0) {
+            try {
+              const ids = core.getDrawableIds();
+              const size = ids && typeof ids.getSize === 'function' ? ids.getSize() : 0;
+              for (let i = 0; i < size; i += 1) {
+                if (drawableIdAt(core, i) === id) { index = i; break; }
+              }
+            } catch { /* ignore */ }
+          }
+          if (index >= 0) hiddenDrawableIndexCache.set(id, index);
+          return index;
+        }
+        /** hiddenDrawables 接管状态（只用于一次告警与调试） */
+        let hiddenDrawablePatchOk = false;
+        let hiddenDrawableWarned = false;
+        /** 渲染前把配置里列出的 drawable 不透明度清零（按 ID 解析，模型里不存在就跳过） */
+        function applyHiddenDrawables(): void {
+          try {
+            const core = model.internalModel && model.internalModel.coreModel;
+            const raw = core && typeof core.getModel === 'function' ? core.getModel() : null;
+            const ops = raw && raw.drawables && raw.drawables.opacities;
+            if (!core || !ops) return;
+            for (const id of hiddenDrawableIds) {
+              const index = hiddenDrawableIndex(core, id);
+              if (index >= 0 && index < ops.length) ops[index] = 0;
+            }
+          } catch (err) {
+            if (!hiddenDrawableWarned) {
+              hiddenDrawableWarned = true;
+              console.warn('[live2d] hiddenDrawables 生效失败（继续渲染，本次只提示一次）:', err);
+            }
+          }
+        }
+        // 引擎每帧会把 drawable 不透明度按部件重算回 1，所以在**真正 draw 之前**按 ID 清一次；
+        // 这里不缓存/依赖序号：每次都按 ID 解析当前索引。
+        if (hiddenDrawableIds.length) {
+          try {
+            const im = model.internalModel;
+            const baseDraw = im && im.draw;
+            if (typeof baseDraw === 'function') {
+              im.draw = function patchedDraw(this: Any, ...args: Any[]) {
+                applyHiddenDrawables();
+                return baseDraw.apply(this, args);
+              };
+              hiddenDrawablePatchOk = true;
+            }
+          } catch (err) {
+            console.warn('[live2d] hiddenDrawables 无法挂到 draw 上（该功能停用）:', err);
+          }
+          if (!hiddenDrawablePatchOk) {
+            console.warn('[live2d] hiddenDrawables 已配置但未能接管绘制，已停用：', hiddenDrawableIds.join(', '));
+          }
+          try {
+            const core = model && model.internalModel && model.internalModel.coreModel;
+            const resolved = hiddenDrawableIds.map((id) => ({ id, index: core ? hiddenDrawableIndex(core, id) : -1 }));
+            const missing = resolved.filter((item) => item.index < 0).map((item) => item.id);
+            log('hiddenDrawables（按 drawable ID）:', resolved.map((item) => `${item.id}@${item.index}`).join(', '));
+            if (missing.length) console.warn('[live2d] hiddenDrawables 在当前模型里找不到（已忽略）:', missing.join(', '));
+          } catch { /* 仅日志 */ }
+        }
 
         const handle: RenderHandle = {
           kind: 'moc3',
@@ -1428,6 +1541,40 @@
                 eyeballX: readParam(paramIds.eyeBallX),
                 eyeballY: readParam(paramIds.eyeBallY),
               },
+              /** 隐藏遗留贴图自查：配置的 drawable ID、当前按 ID 解析到的位置、实际不透明度 */
+              hidden: (() => {
+                if (!hiddenDrawableIds.length) return null;
+                const core = model && model.internalModel ? model.internalModel.coreModel : null;
+                const raw = core && typeof core.getModel === 'function' ? core.getModel() : null;
+                const ops = raw && raw.drawables && raw.drawables.opacities;
+                return {
+                  patched: hiddenDrawablePatchOk,
+                  items: hiddenDrawableIds.map((id) => {
+                    const index = hiddenDrawableIndex(core, id);
+                    return { id, index, opacity: ops && index >= 0 && index < ops.length ? ops[index] : null };
+                  }),
+                };
+              })(),
+              vts: hasVtsMapping
+                ? {
+                    mapping: vtsMapping.length,
+                    mappedOutputs: mappedOutputs.size,
+                    inputs: { ...vtsInputs },
+                    debug: {
+                      writes: vtsWrites,
+                      missingOutput: vtsSkips,
+                      unsupportedInput: vtsInputSkips,
+                      firstLimit: vtsFirstLimit,
+                      lastSet: Math.round(vtsLastSet * 1000) / 1000,
+                    },
+                    params: {
+                      angleX: readParam('AngleX'),
+                      positionX: readParam('PositionX'),
+                      eyeBallX: readParam('ParamEyeBallX'),
+                      mouthOpenY: readParam('ParamMouthOpenY'),
+                    },
+                  }
+                : null,
               physicsProbe: {
                 beforeUpdate: bodyBeforeUpdate,
                 afterUpdate: bodyAfterUpdate,
@@ -1449,13 +1596,13 @@
             if (headTrackY > 0 && Number.isFinite(head.pitch)) params[paramIds.angleY] = clamp(head.pitch as number) * headTrackY;
             if (headTrackZ > 0 && Number.isFinite(head.roll)) params[paramIds.angleZ] = clamp(head.roll as number) * headTrackZ;
             const eyes = frame.eyes ?? {};
-            if (eyeLOK && Number.isFinite(eyes.blinkL)) params[paramIds.eyeLOpen] = 1 - Math.max(0, Math.min(1, eyes.blinkL as number));
-            if (eyeROK && Number.isFinite(eyes.blinkR)) params[paramIds.eyeROpen] = 1 - Math.max(0, Math.min(1, eyes.blinkR as number));
-            if (eyeBallXOK && Number.isFinite(eyes.eyeBallX)) params[paramIds.eyeBallX] = clamp(eyes.eyeBallX as number);
-            if (eyeBallYOK && Number.isFinite(eyes.eyeBallY)) params[paramIds.eyeBallY] = clamp(eyes.eyeBallY as number);
+            if (eyeLOK && Number.isFinite(eyes.blinkL) && !mappedOutputs.has(paramIds.eyeLOpen)) params[paramIds.eyeLOpen] = 1 - Math.max(0, Math.min(1, eyes.blinkL as number));
+            if (eyeROK && Number.isFinite(eyes.blinkR) && !mappedOutputs.has(paramIds.eyeROpen)) params[paramIds.eyeROpen] = 1 - Math.max(0, Math.min(1, eyes.blinkR as number));
+            if (eyeBallXOK && Number.isFinite(eyes.eyeBallX) && !mappedOutputs.has(paramIds.eyeBallX)) params[paramIds.eyeBallX] = clamp(eyes.eyeBallX as number);
+            if (eyeBallYOK && Number.isFinite(eyes.eyeBallY) && !mappedOutputs.has(paramIds.eyeBallY)) params[paramIds.eyeBallY] = clamp(eyes.eyeBallY as number);
             const mouth = frame.mouth ?? {};
-            if (mouthOpenOK && Number.isFinite(mouth.openY)) params[paramIds.mouthOpenY] = Math.max(0, Math.min(1, mouth.openY as number));
-            if (mouthFormOK && Number.isFinite(mouth.form)) params[paramIds.mouthForm] = clamp(mouth.form as number);
+            if (mouthOpenOK && Number.isFinite(mouth.openY) && !mappedOutputs.has(paramIds.mouthOpenY)) params[paramIds.mouthOpenY] = Math.max(0, Math.min(1, mouth.openY as number));
+            if (mouthFormOK && Number.isFinite(mouth.form) && !mappedOutputs.has(paramIds.mouthForm)) params[paramIds.mouthForm] = clamp(mouth.form as number);
             lastFrameSource = typeof frame.source === 'string' ? frame.source : 'external';
             lastFrameAt = performance.now();
             if (Object.keys(params).length) mixer.set('tracking', params, 1, 900);
@@ -1463,7 +1610,13 @@
           /** 语音口型：直接驱动嘴部参数，TTL 由调用方按音频/文本长度给 */
           applySpeech(mouth: { openY?: number; form?: number }, ttlMs = 600): void {
             const params: Record<string, number> = {};
-            if (mouthOpenOK && Number.isFinite(mouth?.openY)) params[paramIds.mouthOpenY] = Math.max(0, Math.min(1, mouth.openY as number));
+            if (Number.isFinite(mouth?.openY)) {
+              const openY = Math.max(0, Math.min(1, mouth.openY as number));
+              // 映射模型：口型先写进 VTS 输入（updateFocus 里按映射表落到自定义参数）；
+              // 若标准嘴部参数存在且没被映射占用，仍走语音层，避免"映射表没嘴"时口型失效。
+              vtsInputs.MouthOpen = openY;
+              if (mouthOpenOK && !mappedOutputs.has(paramIds.mouthOpenY)) params[paramIds.mouthOpenY] = openY;
+            }
             if (mouthFormOK && Number.isFinite(mouth?.form)) params[paramIds.mouthForm] = Math.max(-1, Math.min(1, mouth.form as number));
             if (Object.keys(params).length) mixer.set('speech', params, 1, Math.max(120, ttlMs));
           },
@@ -1636,9 +1789,8 @@
               textures: texCount,
               modelTextures: model && model.textures ? model.textures.length : null,
               /**
-               * 贴图 LOD 取证：`source` 是原始资源尺寸，`effective` 是引擎当前**实际采样**的尺寸。
-               * 开了 single-auto 且模型够大时，effective 会明显小于 source（说明降采样已生效）；
-               * 两者相同 = LOD 未生效（贴图没到阈值，或选项被改回 false）。
+               * 贴图采样尺寸取证：`source` 是原始资源尺寸，`effective` 是引擎当前实际采样尺寸。
+               * 当前运行库按原图上传（未启用 LOD），两者通常相同；不同说明贴图被引擎降采样。
                */
               textureLod: (() => {
                 try {
@@ -1747,7 +1899,8 @@
                 z: readParam(paramIds.bodyZ),
               };
 
-              // —— 视线跟踪（moc3，明显跟随）：写在 model.update 之后（避免被 Idle 动作帧覆盖）；
+              // —— 视线跟踪（moc3，明显跟随）：写在这帧 render 之前，作为下一帧动作/物理的基座；
+              //    真正落在画面上的头/眼由 SDK focus（updateFocus）或 VTS 映射在 update 阶段写入。
               //    眼球快（k≈dt*12）、头部慢（dt*4 独立滞后）→ 眼先头后的自然延迟 ——
               const dt = Math.min(0.25, Math.max(0.001, deltaSec || 1 / 60));
               const tracking = gazeTX !== 0 || gazeTY !== 0;
@@ -1761,30 +1914,72 @@
               headCY += (gazeCY - headCY) * hk;
               const bodyCX = headCX * 0.8; // body follows head with smaller/lagging amplitude
               const bodyCY = headCY * 0.8;
+              // VTS 映射模型：updateFocus 里写的那次会被引擎在 update 末尾的 loadParameters() 还原，
+              // 这里用平滑后的视线值再写一次，保证参数状态/读回一致（物理在 updateFocus 之后已算过）。
+              if (hasVtsMapping) vtsApply();
+              // hiddenDrawables 的清理在内部 draw 包装里做（引擎 update 会把不透明度重算回去）
+              // 映射写到的参数不再走标准参数通道（否则同帧双写）；未被映射覆盖的仍按标准名驱动。
+              const standardWritable = (id: string): boolean => !mappedOutputs.has(id);
               if (gazeCX !== 0 || gazeCY !== 0) {
                 // AngleX=左右，AngleY=上下；使用较慢的 headC* 保持自然滞后。
-                if (headTrackX > 0) setBaseParam(paramIds.angleX, headCX * headTrackX);
-                if (headTrackY > 0) setBaseParam(paramIds.angleY, headCY * headTrackY);
-                if (headTrackZ > 0) setBaseParam(paramIds.angleZ, headCX * headTrackZ);
+                if (headTrackX > 0 && standardWritable(paramIds.angleX)) setBaseParam(paramIds.angleX, headCX * headTrackX);
+                if (headTrackY > 0 && standardWritable(paramIds.angleY)) setBaseParam(paramIds.angleY, headCY * headTrackY);
+                if (headTrackZ > 0 && standardWritable(paramIds.angleZ)) setBaseParam(paramIds.angleZ, headCX * headTrackZ);
                 // 眼球按满量程驱动（除掉取景增益），否则半身取景下几乎看不出在动
                 const eyeScale = framingGazeGain() > 0 ? 1 / framingGazeGain() : 1;
-                if (eyeBallXOK) setBaseParam(paramIds.eyeBallX, Math.max(-1, Math.min(1, gazeCX * eyeScale * 0.55)));
-                if (eyeBallYOK) setBaseParam(paramIds.eyeBallY, Math.max(-1, Math.min(1, gazeCY * eyeScale * 0.8)));
+                if (eyeBallXOK && standardWritable(paramIds.eyeBallX)) setBaseParam(paramIds.eyeBallX, Math.max(-1, Math.min(1, gazeCX * eyeScale * 0.55)));
+                if (eyeBallYOK && standardWritable(paramIds.eyeBallY)) setBaseParam(paramIds.eyeBallY, Math.max(-1, Math.min(1, gazeCY * eyeScale * 0.8)));
               } else if (headTrackOK && !idleMotionAvailable) {
                 // 没有原生 Idle 时才补充幅度很小的头部游移。
-                if (headTrackX > 0) setBaseParam(paramIds.angleX, Math.sin(nowSec * 0.45 + phase * 0.7) * Math.min(headTrackX, 2.2));
-                if (headTrackY > 0) setBaseParam(paramIds.angleY, Math.sin(nowSec * 0.33 + phase * 1.1) * Math.min(headTrackY, 2.0));
-                if (headTrackZ > 0) setBaseParam(paramIds.angleZ, Math.sin(nowSec * 0.27 + phase * 0.9) * Math.min(headTrackZ, 2.4));
+                if (headTrackX > 0 && standardWritable(paramIds.angleX)) setBaseParam(paramIds.angleX, Math.sin(nowSec * 0.45 + phase * 0.7) * Math.min(headTrackX, 2.2));
+                if (headTrackY > 0 && standardWritable(paramIds.angleY)) setBaseParam(paramIds.angleY, Math.sin(nowSec * 0.33 + phase * 1.1) * Math.min(headTrackY, 2.0));
+                if (headTrackZ > 0 && standardWritable(paramIds.angleZ)) setBaseParam(paramIds.angleZ, Math.sin(nowSec * 0.27 + phase * 0.9) * Math.min(headTrackZ, 2.4));
               }
               // 身体摆动·第一层预案：模型有 ParamBodyAngle* → 参数级跟随（跟着物理走，最自然）
               if (bodyTrackOK) {
-                if (bodyTrackX > 0) setBaseParam(paramIds.bodyX, bodyCX * bodyTrackX);
-                if (bodyTrackY > 0) setBaseParam(paramIds.bodyY, bodyCY * bodyTrackY);
-                if (bodyTrackZ > 0) setBaseParam(paramIds.bodyZ, swayDeg);
+                if (bodyTrackX > 0 && standardWritable(paramIds.bodyX)) setBaseParam(paramIds.bodyX, bodyCX * bodyTrackX);
+                if (bodyTrackY > 0 && standardWritable(paramIds.bodyY)) setBaseParam(paramIds.bodyY, bodyCY * bodyTrackY);
+                if (bodyTrackZ > 0 && standardWritable(paramIds.bodyZ)) setBaseParam(paramIds.bodyZ, swayDeg);
               }
               // 呼吸·有 ParamBreath 就交给它，没有则只靠整体缩放呼吸（frameModel 的 breathe）
-              if (breathParamOK) {
+              if (breathParamOK && standardWritable(paramIds.breath)) {
                 setBaseParam(paramIds.breath, (Math.sin(nowSec * 1.22 + phase * 2.1) * 0.5 + 0.5) * 0.8 + 0.1);
+              }
+              // 自动眨眼：没有外部追踪、模型动画也不带眨眼时会一直睁眼（像静止贴图）。
+              // 以"开始眨眼前读到的睁眼值"为基线按比例压闭再还原：不直接写 0/1，避免覆盖表情，
+              // 也不会像逐帧相乘那样把眼睛越眨越小。表情已闭眼（或半闭）时不眨。
+              // 眨眼参数被映射占用时交给引擎 EyeBlink，避免两套眨眼逻辑叠加。
+              const autoBlinkAllowed =
+                (eyeLOK || eyeROK) &&
+                standardWritable(paramIds.eyeLOpen) &&
+                standardWritable(paramIds.eyeROpen);
+              if (autoBlinkAllowed) {
+                const nowMs = nowSec * 1000;
+                if (blinkStartedAt === 0 && nowMs >= nextBlinkAt) {
+                  const rawL = eyeLOK ? readParam(paramIds.eyeLOpen) : 1;
+                  const rawR = eyeROK ? readParam(paramIds.eyeROpen) : 1;
+                  const curL = rawL === null ? 1 : rawL;
+                  const curR = rawR === null ? 1 : rawR;
+                  if (curL > 0.5 || curR > 0.5) {
+                    blinkStartedAt = nowMs;
+                    blinkBaseL = curL;
+                    blinkBaseR = curR;
+                  }
+                  nextBlinkAt = nowMs + 2200 + Math.random() * 3800;
+                }
+                if (blinkStartedAt > 0) {
+                  const BLINK_MS = 150;
+                  const t = (nowMs - blinkStartedAt) / BLINK_MS;
+                  if (t >= 1) {
+                    blinkStartedAt = 0;
+                    if (eyeLOK) setBaseParam(paramIds.eyeLOpen, blinkBaseL);
+                    if (eyeROK) setBaseParam(paramIds.eyeROpen, blinkBaseR);
+                  } else {
+                    const close = t < 0.45 ? t / 0.45 : Math.max(0, (1 - t) / 0.55); // 闭得比睁得快，更像真眨眼
+                    if (eyeLOK) setBaseParam(paramIds.eyeLOpen, blinkBaseL * (1 - close));
+                    if (eyeROK) setBaseParam(paramIds.eyeROpen, blinkBaseR * (1 - close));
+                  }
+                }
               }
               bodyAfterDrive = {
                 x: readParam(paramIds.bodyX),
@@ -1858,7 +2053,7 @@
                   setParam(param, base * (1 - weight) + value * weight);
                 }
               }
-              // Pixi 8：走 renderer.render(stage)（实测 app.render() 在这个组合下不出画面）
+              // 渲染逐帧由本层 RAF 驱动：直接 render stage（Pixi6 下 app.render 会再走一遍 ticker 语义）
               if (app.renderer && app.stage) app.renderer.render(app.stage);
               renderedThisFrame = true;
               // 命中遮罩必须在**绘制刚结束、缓冲尚未被清空**时取样，见 captureHitMaskNow 注释

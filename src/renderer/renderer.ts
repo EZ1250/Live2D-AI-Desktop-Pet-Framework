@@ -37,6 +37,18 @@ type VtsTrackingValues = import('../shared/contracts').VtsTrackingValues;
 type VtsEventDto = import('../shared/contracts').VtsEventDto;
 type TtsAudioPayload = import('../shared/contracts').TtsAudioPayload;
 
+/** 渲染层微内核（kernel.js 暴露；缺失时返回 null，调用方自行降级） */
+interface RendererKernelHandle {
+  provide(name: string, impl: unknown): void;
+  setActionBridge(bridge: (action: string, payload: Any) => void): void;
+  emit(event: string, payload: Any): void;
+  call<T = unknown>(name: string, ...args: Any[]): T | null;
+  start(): Promise<void>;
+}
+function rendererKernel(): RendererKernelHandle | null {
+  return ((window as Any).PetKernel as RendererKernelHandle | undefined) ?? null;
+}
+
 /* ================================================================
    1. 内部类型与常量
    ================================================================ */
@@ -48,6 +60,22 @@ interface RenderLib {
   mountPortrait(input: { container: HTMLElement; url: string }): RenderHandle | null;
   mountPlaceholder(input: { container: HTMLElement; name: string; hint?: string }): RenderHandle | null;
 }
+
+/** 对话/气泡出现时按设置自动朗读；每次生成新的 requestId，旧音频由 playTtsAudio 丢弃 */
+function speakConversation(bridge: RendererBridge, text: string): void {
+  const clean = text.trim();
+  if (!ttsEnabled || !clean || typeof bridge.ttsSpeak !== 'function') return;
+  // 与主进程 edgeTts.MAX_TEXT_CHARS 对齐：超长整段合成会直接失败，这里先截断并留一条日志
+  const speakable = clean.length > TTS_MAX_CHARS ? clean.slice(0, TTS_MAX_CHARS) : clean;
+  if (speakable.length < clean.length) {
+    console.warn(`[renderer] 回复过长（${clean.length} 字），自动朗读只读前 ${TTS_MAX_CHARS} 字`);
+  }
+  const requestId = beginTtsRequest();
+  void bridge.ttsSpeak(speakable, ttsVoice, requestId).catch((err: unknown) => {
+    console.warn('[renderer] 自动朗读失败', err);
+  });
+}
+
 interface RenderHandle {
   kind: 'moc3' | 'portrait' | 'placeholder';
   update?(nowSec: number, deltaSec: number): void;
@@ -530,10 +558,10 @@ async function mountManifest(manifest: ModelManifest): Promise<void> {
       return;
     }
     // 兜底：没拿到体检结果时，仍按 mocVersion 自己判一次（老版本主进程也能跑）
-    if (typeof manifest.mocVersion === 'number' && manifest.mocVersion > (compat?.coreMax ?? 4)) {
+    if (typeof manifest.mocVersion === 'number' && manifest.mocVersion > (compat?.coreMax ?? 5)) {
       currentHandle = libMountPlaceholder(
         name,
-        `模型为 Cubism ${manifest.mocVersion}，当前引擎仅支持到 Cubism 4.2。请用 Cubism 4.2 导出后重新导入。`,
+        `模型为 moc3 v${manifest.mocVersion}，当前运行库最高支持 moc3 v${compat?.coreMax ?? 5}。请用更低版本导出后重新导入。`,
       );
       showBubble(`${name}：Cubism ${manifest.mocVersion} 暂不支持渲染`, { tone: 'info', ttlMs: 4200 });
       flashStatus(`${name}（版本不支持）`);
@@ -943,10 +971,12 @@ function pushTrackingFrame(sourceId: string, frame: TrackingInput): boolean {
   lastTrackingPushAt = entry.lastAt;
   const h = trackingHandle();
   if (!h) return false;
-  // 情绪字段也走这里：有 label 就顺手切表情（模型没有对应表情时保持原样）
+  // 情绪字段也走这里：有 label 就交给 emotion 插件（阈值判断在插件里，表情应用走动作桥）
   if (frame && frame.emotion && typeof frame.emotion.label === 'string' && frame.emotion.label) {
     const conf = typeof frame.emotion.confidence === 'number' ? frame.emotion.confidence : 1;
-    if (conf >= 0.34) h.applyEmotionLabel?.(frame.emotion.label);
+    if (conf >= 0.34) {
+      rendererKernel()?.emit('tracking:emotion', { label: frame.emotion.label, confidence: conf });
+    }
   }
   h.applyTrackingFrame?.({ ...frame, source: frame?.source ?? 'external' });
   return true;
@@ -970,28 +1000,20 @@ function ttsMouthActive(): boolean {
   }
 }
 
-/** 文本 → 情绪 → 表情；返回实际应用的表情名（没有对应表情/未就绪 → null） */
-function applyEmotionFromText(text: string): string | null {
+/** 情绪标签 → 模型表情（pet-model.json 的 emotionMap 优先）；返回实际应用的表情名 */
+function applyEmotionLabel(label: string): string | null {
   if (!trackingEnabled) return null;
-  const emotion = (window as Any).PetEmotion as
-    | { classify?: (t: unknown) => { label?: string; confidence?: number } }
-    | undefined;
-  if (!emotion || typeof emotion.classify !== 'function') return null;
   const h = trackingHandle();
   if (!h || typeof h.applyEmotionLabel !== 'function') return null;
-  let result: { label?: string; confidence?: number } | null = null;
-  try {
-    result = emotion.classify(text);
-  } catch {
-    return null;
-  }
-  if (!result || !result.label || result.label === 'neutral') return null;
-  if (typeof result.confidence === 'number' && result.confidence < 0.34) return null;
-  // 模型自带映射优先（pet-model.json 的 emotionMap：把情绪对到该模型真实存在的表情名）
-  const mapped = activeModelPreset?.emotionMap?.[result.label];
-  const applied = h.applyEmotionLabel(result.label, typeof mapped === 'string' ? mapped : undefined);
-  if (applied) lastEmotion = { label: result.label, expression: applied, at: Date.now() };
+  const mapped = activeModelPreset?.emotionMap?.[label];
+  const applied = h.applyEmotionLabel(label, typeof mapped === 'string' ? mapped : undefined);
+  if (applied) lastEmotion = { label, expression: applied, at: Date.now() };
   return applied;
+}
+
+/** 文本 → 情绪 → 表情：判定在 emotion 插件里，这里只转调（保住同步返回值给 petTracking/__petDebug） */
+function applyEmotionFromText(text: string): string | null {
+  return rendererKernel()?.call<string | null>('emotion.applyText', text) ?? null;
 }
 
 /* —— 语音口型循环（打字机说话时嘴动；停止后自然回到基座）—— */
@@ -1096,74 +1118,52 @@ function installTrackingHub(): void {
 /** 留给 __petDebug 与测试引用（window.petTracking 可能被外部脚本覆盖） */
 let currentTrackingApi: Any = null;
 
+/**
+ * 渲染层微内核接线：注册 render 服务与动作桥，再启动内置策略插件。
+ * 必须在订阅推送之前完成，否则第一句对话的情绪事件会丢。
+ */
+async function installRendererKernel(): Promise<void> {
+  const kernel = rendererKernel();
+  if (!kernel) {
+    console.warn('[renderer] 未加载 kernel.js：策略插件不可用，其余功能照常');
+    return;
+  }
+  kernel.provide('render', {
+    applyEmotion: applyEmotionLabel,
+    ready: () => Boolean(currentHandle),
+    playMotion: (name: string) => currentHandle?.playMotion?.(name),
+    holdExpression: (name: string) => playBehaviorExpression(name),
+  });
+  // 模型能力只读服务：插件据此判断"目标在当前模型上存不存在"
+  kernel.provide('model', {
+    motions: listCurrentMotions,
+    expressions: listCurrentExpressions,
+    capabilities: () => activeModelCapabilities,
+    emotionMap: () => activeModelPreset?.emotionMap ?? {},
+  });
+  kernel.setActionBridge((action, payload) => {
+    if (action === 'expression') {
+      const label = payload && typeof payload.label === 'string' ? payload.label : '';
+      if (label && trackingEnabled) trackingHandle()?.applyEmotionLabel?.(label);
+    } else if (action === 'motion') {
+      const group = payload && typeof payload.group === 'string' ? payload.group : '';
+      if (group) currentHandle?.playMotion?.(group);
+    } else if (action === 'speak') {
+      const text = payload && typeof payload.text === 'string' ? payload.text : '';
+      if (text) showBubble(text);
+    }
+  });
+  await kernel.start();
+}
+
 /* ================================================================
   7.6 拖拽移动窗口 + 滚轮缩放
    ================================================================ */
 const DRAG_IGNORE_SELECTOR = '#bubble, #context-menu, #todo-panel, #ask-box, #think-panel, #settings-panel, #chatbar input, .chat-input, input, button, select, textarea';
 
 /* ================================================================
-   7.7 点击特效：粉色星星小范围扩散（不挡视野、初始半透明、与主题统一）
+   7.7 点击特效（实现在 fx.ts，挂 window.PetFx）
    ================================================================ */
-let lastSparkleAt = 0;
-const SPARKLE_COOLDOWN_MS = 120;
-const SPARKLE_GLYPHS = ['★', '✦', '✧', '✩'];
-
-function ensureFxLayer(): HTMLElement {
-  let layer = document.getElementById('fx-layer');
-  if (!layer) {
-    layer = document.createElement('div');
-    layer.id = 'fx-layer';
-    layer.className = 'fx-layer';
-    layer.setAttribute('aria-hidden', 'true');
-    document.body.appendChild(layer);
-  }
-  return layer;
-}
-
-/** 在 (x,y) 生成一小簇粉色星星（外加一圈极淡光晕），动画结束自动清理 */
-function spawnClickSparkles(x: number, y: number): void {
-  const now = Date.now();
-  if (now - lastSparkleAt < SPARKLE_COOLDOWN_MS) return;
-  lastSparkleAt = now;
-  const layer = ensureFxLayer();
-  if (layer.childElementCount > 80) return; // 极端情况防堆积
-
-  // 光晕：极淡、快速淡出，仅增加设计感
-  const halo = document.createElement('div');
-  halo.className = 'sparkle-halo';
-  halo.style.left = `${x}px`;
-  halo.style.top = `${y}px`;
-  layer.appendChild(halo);
-  window.setTimeout(() => halo.remove(), 360);
-
-  const count = 8 + Math.floor(Math.random() * 7); // 8~14 颗
-  for (let i = 0; i < count; i++) {
-    const angle = Math.random() * Math.PI * 2;
-    const distance = 22 + Math.random() * 42; // 22~64px（整体 ≤70px，小范围不挡视野）
-    const size = 7 + Math.random() * 7; // 7~14px
-    const duration = 520 + Math.random() * 320;
-    const delay = Math.random() * 90;
-    // 粉色为主，少量冷色星呼应主题蓝
-    const palette = ['#ffd6ea', '#ff9fd0', '#ff7fc0', '#9ecbff'];
-    const color = palette[Math.floor(Math.random() * palette.length)];
-
-    const star = document.createElement('span');
-    star.className = 'sparkle';
-    star.textContent = SPARKLE_GLYPHS[Math.floor(Math.random() * SPARKLE_GLYPHS.length)];
-    star.style.left = `${x}px`;
-    star.style.top = `${y}px`;
-    star.style.setProperty('--dx', `${Math.cos(angle) * distance}px`);
-    star.style.setProperty('--dy', `${Math.sin(angle) * distance}px`);
-    star.style.setProperty('--size', `${size}px`);
-    star.style.setProperty('--color', color);
-    star.style.setProperty('--rot', `${(Math.random() * 50 - 25).toFixed(1)}deg`);
-    star.style.setProperty('--dur', `${duration}ms`);
-    star.style.setProperty('--delay', `${delay}ms`);
-    layer.appendChild(star);
-    star.addEventListener('animationend', () => star.remove());
-    window.setTimeout(() => star.remove(), duration + delay + 60);
-  }
-}
 
 /** 把角色在窗口里的实际可见范围报给主进程（气泡窗据此贴到角色头顶上方） */
 function reportPetBounds(bridge: RendererBridge | null): void {
@@ -1418,7 +1418,7 @@ function playTapChime(): void {
 /** 日常点击模型：触发「点一下」（若模型有该表情）并播放星星特效与音效 */
 function triggerPetTap(x: number, y: number): void {
   playTapChime(); // 轻灵音效（可在设置里关闭/调音量）
-  spawnClickSparkles(x, y); // 星星特效（所有模型都有）
+  (window as Any).PetFx?.spawnSparkles?.(x, y); // 星星特效（所有模型都有；实现在 fx.ts）
   const h = currentHandle;
   if (!h || typeof h.setExpression !== 'function') return;
   let tapName = '点一下';
@@ -1475,63 +1475,35 @@ const BEHAVIOR_LABELS: Record<BehaviorKey, string> = {
   model_idle: '待机搭话',
   error: '出错',
 };
-/** 同一行为的两次触发最小间隔 */
-const BEHAVIOR_DEBOUNCE_MS: Record<BehaviorKey, number> = {
-  user_message: 500,
-  tool_call: 300,
-  command_exec: 300,
-  ai_start: 0,
-  model_idle: 8000,
-  error: 1000,
-};
-/** auto 模式的候选顺序：'motion:x' / 'expr:x' / 'emotion:标签' / 'click' / 'costume' */
-const BEHAVIOR_AUTO: Record<BehaviorKey, string[]> = {
-  user_message: ['click', 'motion:Tap', 'motion:TapBody', 'motion:wave'],
-  tool_call: ['motion:Idle', 'motion:Tap', 'costume'],
-  command_exec: ['motion:Idle', 'motion:Tap'],
-  ai_start: ['motion:Idle'],
-  model_idle: ['motion:Idle'],
-  error: ['emotion:surprised', 'emotion:angry', 'emotion:sad', 'motion:Shake'],
-};
-/** 触发目标是动作组还是表情 */
-type BehaviorTarget = { kind: 'motion' | 'expression'; name: string };
-/** 命令类工具 */
-const COMMAND_TOOLS = new Set(['shell_run', 'shell_bg', 'shell_output', 'shell_kill']);
 /** 行为触发表情后恢复默认的时长 */
 const BEHAVIOR_EXPRESSION_HOLD_MS = 2600;
+/** 命令类工具 */
+const COMMAND_TOOLS = new Set(['shell_run', 'shell_bg', 'shell_output', 'shell_kill']);
 
-/** 设置里的行为触发映射（当前模型生效的那一份） */
+/** 设置里的行为触发映射（当前模型生效的那一份，供设置页回显） */
 let motionTriggers: Record<string, string> = {};
 /** 行为触发映射（按模型分桶，保存时合并回去；见 AppSettings.motionTriggersByModel） */
 let motionTriggersByModel: Record<string, Record<string, string>> = {};
-/** 各行为上次触发时刻 */
-const behaviorLastAt: Partial<Record<BehaviorKey, number>> = {};
-/** 已经提醒过"目标在当前模型上不存在"的行为（每种只警告一次，避免刷屏） */
-const behaviorWarned = new Set<BehaviorKey>();
 /** 本轮回复是否已触发过「开始回答」 */
 let aiStartEmitted = false;
 
 /**
- * 把设置里的触发映射落到"当前模型"上。
- *
- * 优先取**按模型分桶**的那一份（`motionTriggersByModel[当前模型]`），没有才退回旧版的全局
- * `motionTriggers`。这样换模型时各用各的绑定，不会出现"模型 A 的表情在模型 B 上全部失效"。
+ * 把触发配置交给 behavior 插件（候选解析/去抖/失效告警都在插件里），再把生效映射取回来给设置页。
+ * 按模型分桶的取用规则、旧版全局映射的可用性判断都留在插件里，渲染层只负责设置状态与 UI 回显。
  */
 function applyBehaviorTriggersFromSettings(settings: AppSettings): void {
-  const byModel = (settings.motionTriggersByModel as Record<string, Record<string, string>> | undefined) ?? {};
-  motionTriggersByModel = byModel;
+  motionTriggersByModel = (settings.motionTriggersByModel as Record<string, Record<string, string>> | undefined) ?? {};
   const legacy = (settings.motionTriggers as Record<string, string> | undefined) ?? {};
-  const perModel = activeModelName ? byModel[activeModelName] : undefined;
-  // 没有这个模型自己的桶时，才退回旧版全局映射；且**只在它的目标确实存在于当前模型上**时沿用。
-  // 否则换个模型（例如模型 A 的某个表情在模型 B 上不存在）整块都会被标成
-  // 「（当前模型没有）」，看起来就像"设置没被记住"。那种情况当作没配（= 自动）更诚实。
-  let effective = perModel;
-  if (!effective && Object.keys(legacy).length) {
-    const usable = Object.values(legacy).some((value) => resolveTriggerCandidate(String(value ?? '')) !== null);
-    effective = usable ? legacy : {};
-  }
-  motionTriggers = effective ?? {};
-  behaviorWarned.clear(); // 配置变了，允许再警告一次
+  const kernel = rendererKernel();
+  kernel?.emit('behavior:config', {
+    byModel: motionTriggersByModel,
+    legacy,
+    modelName: activeModelName,
+    labels: BEHAVIOR_LABELS,
+    keys: BEHAVIOR_KEYS,
+  });
+  // 内核缺失时退回旧版全局映射（正常装配下不会走到）
+  motionTriggers = kernel?.call<Record<string, string>>('behavior.triggers') ?? legacy;
   // 设置面板若已经渲染过，下拉的候选与选中值也跟着刷新（没渲染时是空操作）
   refreshMotionTriggerOptions();
   populateMotionTriggerSelects();
@@ -1561,48 +1533,6 @@ function listCurrentExpressions(): string[] {
   return currentHandle && typeof currentHandle.listExpressions === 'function' ? currentHandle.listExpressions() : [];
 }
 
-/** 能力别名 → 该模型真实拥有的动作组或表情名 */
-function resolveCapabilityAlias(alias: 'click' | 'costume'): BehaviorTarget | null {
-  const cap = activeModelCapabilities;
-  if (!cap) return null;
-  const name = (alias === 'click' ? cap.click?.[0] ?? cap.costume?.[0] : cap.costume?.[0]) ?? '';
-  if (!name) return null;
-  if (listCurrentMotions().includes(name)) return { kind: 'motion', name };
-  if (listCurrentExpressions().includes(name)) return { kind: 'expression', name };
-  return null;
-}
-
-/** 解析一个候选；目标不存在返回 null */
-function resolveTriggerCandidate(candidate: string): BehaviorTarget | null {
-  if (candidate === 'click' || candidate === 'costume') return resolveCapabilityAlias(candidate);
-  if (candidate.startsWith('motion:')) {
-    const name = candidate.slice(7);
-    return name && listCurrentMotions().includes(name) ? { kind: 'motion', name } : null;
-  }
-  if (candidate.startsWith('expr:')) {
-    const name = candidate.slice(5);
-    return name && listCurrentExpressions().includes(name) ? { kind: 'expression', name } : null;
-  }
-  if (candidate.startsWith('emotion:')) {
-    const label = candidate.slice(8);
-    const name = activeModelPreset?.emotionMap?.[label] ?? activeModelCapabilities?.emotion?.[label] ?? '';
-    return name && listCurrentExpressions().includes(name) ? { kind: 'expression', name } : null;
-  }
-  return null;
-}
-
-/** 解析某行为的触发目标；命中不了返回 null */
-function resolveBehaviorTarget(behavior: BehaviorKey): BehaviorTarget | null {
-  const raw = (motionTriggers[behavior] ?? 'auto').trim();
-  if (!raw) return null;
-  const candidates = raw === 'auto' ? BEHAVIOR_AUTO[behavior] ?? [] : [raw];
-  for (const candidate of candidates) {
-    const target = resolveTriggerCandidate(candidate);
-    if (target) return target;
-  }
-  return null;
-}
-
 /** 播放行为目标的表情，并到点恢复默认 */
 function playBehaviorExpression(name: string): void {
   if (!currentHandle || typeof currentHandle.setExpression !== 'function') return;
@@ -1624,27 +1554,9 @@ function playBehaviorExpression(name: string): void {
   }, BEHAVIOR_EXPRESSION_HOLD_MS);
 }
 
-/** 触发一次行为：去抖 → 解析目标 → 没有就不播放 */
+/** 触发一次行为：策略在 behavior 插件里，这里只走内核事件（事件缺失时自然不触发） */
 function emitBehavior(behavior: BehaviorKey): void {
-  if (!currentHandle) return;
-  const now = Date.now();
-  if (now - (behaviorLastAt[behavior] ?? 0) < BEHAVIOR_DEBOUNCE_MS[behavior]) return;
-  behaviorLastAt[behavior] = now;
-  const target = resolveBehaviorTarget(behavior);
-  if (!target) {
-    // 明确配了目标却解析不出来（换了模型 / 名字写错）：提醒一次，否则就是"配了完全没反应"
-    const raw = (motionTriggers[behavior] ?? 'auto').trim();
-    if (raw && raw !== 'auto' && !behaviorWarned.has(behavior)) {
-      behaviorWarned.add(behavior);
-      console.warn(
-        `[renderer] 行为触发「${BEHAVIOR_LABELS[behavior]}」配的目标 ${raw} 在当前模型上不存在（` +
-          `动作组：${listCurrentMotions().join('/') || '无'}；表情：${listCurrentExpressions().join('/') || '无'}），已跳过`
-      );
-    }
-    return;
-  }
-  if (target.kind === 'motion') currentHandle.playMotion?.(target.name);
-  else playBehaviorExpression(target.name);
+  rendererKernel()?.emit('behavior', behavior);
 }
 
 /* ================================================================
@@ -2141,6 +2053,7 @@ function subscribeOptionalPushes(bridge: RendererBridge): void {
     bridge.onBubble((payload) => {
       if (payload && typeof payload.text === 'string') {
         showBubble(payload.text, { ttlMs: payload.ttlMs });
+        speakConversation(bridge, payload.text);
         emitBehavior('model_idle'); // 主进程主动搭话 = 待机行为
       }
       return;
@@ -2158,8 +2071,9 @@ function subscribeOptionalPushes(bridge: RendererBridge): void {
         if (!aiStartEmitted) emitBehavior('ai_start'); // 非流式回复：补一次
         aiStartEmitted = false;
         showBubble(payload.full, { immediate: true });
-        // 文本情感 → 表情（emotion.js 规则判定；模型没有对应表情就保持原样）
-        applyEmotionFromText(payload.full);
+        speakConversation(bridge, payload.full);
+        // 文本情感 → 表情：交给 emotion 插件（事件总线），渲染层不再自己判定
+        rendererKernel()?.emit('chat:reply', payload.full);
         // 对话记录：整段结束才落盘（流式过程中那一行不逐段持久化）。
         // 独立聊天窗口接管时由它落盘，这里跳过，否则同一条回复会被写两次。
         if (!chatOwnedByChatWindow) {
@@ -3114,6 +3028,11 @@ async function populateSettings(bridge: RendererBridge): Promise<void> {
     const el = elementById<HTMLInputElement>(id);
     if (el) el.value = value;
   };
+  ttsEnabled = settings.ttsEnabled === true;
+  ttsVoice = settings.ttsVoice || TTS_DEFAULT_VOICE;
+  setChecked('setting-tts-enabled', ttsEnabled);
+  const ttsVoiceSelect = elementById<HTMLSelectElement>('setting-tts-voice');
+  if (ttsVoiceSelect) ttsVoiceSelect.value = ttsVoice;
   setChecked('setting-mcp-server-enabled', settings.mcpServerEnabled === true);
   setChecked('setting-mcp-server-lan', settings.mcpServerLanEnabled === true);
   setInputValue('setting-mcp-server-port', String(settings.mcpServerPort ?? 37653));
@@ -3572,6 +3491,14 @@ const SILENT_WAV_DATA_URL =
   'data:audio/wav;base64,UklGRrQBAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YZABAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA';
 
 let ttsAudioEl: HTMLAudioElement | null = null;
+/** 与主进程 edgeTts.DEFAULT_VOICE 同一默认值（渲染层拿不到主进程模块，只能各留一份） */
+const TTS_DEFAULT_VOICE = 'zh-CN-XiaoxiaoNeural';
+/** 与主进程 edgeTts.MAX_TEXT_CHARS 对齐：超过这个长度的合成请求一定会失败 */
+const TTS_MAX_CHARS = 2000;
+let ttsEnabled = false;
+let ttsVoice = TTS_DEFAULT_VOICE;
+let ttsRequestSeq = 0;
+let latestTtsRequestId = '';
 /** 音频通道是否已经在用户手势里解锁过 */
 let ttsUnlocked = false;
 let ttsAudioContext: AudioContext | null = null;
@@ -3608,6 +3535,32 @@ function ttsMouth(): TtsMouthDriverLike | null {
 /** 停止 TTS 本地口型并归零（音频结束/出错/暂停、开始播下一段时调用） */
 function stopTtsMouth(): void {
   ttsMouth()?.stop();
+}
+
+/** 朗读开关/音色立刻生效（无需重启）；关闭时停掉正在播的那一段，并让在途请求作废 */
+function applyTtsSettings(settings: AppSettings): void {
+  ttsEnabled = settings.ttsEnabled === true;
+  ttsVoice = settings.ttsVoice || TTS_DEFAULT_VOICE;
+  if (!ttsEnabled) {
+    // 合成可能要几秒：关闭后旧请求晚到的音频不能再播（playTtsAudio 只认最新 requestId）
+    latestTtsRequestId = '';
+    ttsAudioEl?.pause();
+    stopTtsMouth();
+  }
+}
+
+/** 登记最新一次朗读请求：返回 requestId，并先停掉上一段（旧结果晚到时按 id 丢弃） */
+function beginTtsRequest(): string {
+  ttsRequestSeq += 1;
+  const requestId = `renderer-${Date.now().toString(36)}-${ttsRequestSeq}`;
+  latestTtsRequestId = requestId;
+  stopTtsMouth();
+  try {
+    ttsAudioEl?.pause();
+  } catch (err) {
+    console.warn('[renderer] 停止上一段 TTS 失败', err);
+  }
+  return requestId;
 }
 
 /**
@@ -3682,6 +3635,8 @@ function ttsDebugState(): Any {
  *      首次点击会走 unlockTtsAudio()，失败时这里给可操作提示并保留原始错误（__petDebug.tts()）。
  */
 function playTtsAudio(payload: TtsAudioPayload): void {
+  // 只播最新一次请求的结果：上一句的音频可能晚到（合成耗时不固定），不能打断当前这句
+  if (!payload || !payload.requestId || payload.requestId !== latestTtsRequestId) return;
   if (!payload || payload.ok !== true || typeof payload.dataUrl !== 'string' || !payload.dataUrl) {
     if (payload && payload.error) setSettingsStatus(`语音合成失败：${payload.error}`, true);
     return;
@@ -3753,7 +3708,10 @@ async function speakSampleFromUi(bridge: RendererBridge): Promise<void> {
   if (btn) btn.disabled = true;
   if (el) el.textContent = '合成中…';
   try {
-    const result = await bridge.ttsSpeak('你好，我是你的桌面宠物，语音已经接好了。');
+    // 试听用设置页当前选中的音色（未点保存也要即时生效）
+    const voice = elementById<HTMLSelectElement>('setting-tts-voice')?.value || ttsVoice;
+    const requestId = beginTtsRequest();
+    const result = await bridge.ttsSpeak('你好，我是你的桌面宠物，语音已经接好了。', voice, requestId);
     if (el) el.textContent = result.ok ? `已合成 ${result.bytes ?? 0} 字节，开始播放` : `失败：${result.error ?? '未知原因'}`;
     if (!result.ok) setSettingsStatus(`语音合成失败：${result.error ?? '未知原因'}`, true);
   } catch (err) {
@@ -3800,6 +3758,8 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
     showThinking: elementById<HTMLInputElement>('setting-show-thinking')?.checked !== false,
     sfxEnabled: elementById<HTMLInputElement>('setting-sfx')?.checked !== false,
     sfxVolume: readNumber('setting-sfx-volume', 0.6),
+    ttsEnabled: elementById<HTMLInputElement>('setting-tts-enabled')?.checked === true,
+    ttsVoice: elementById<HTMLSelectElement>('setting-tts-voice')?.value || TTS_DEFAULT_VOICE,
     devWorkspaceRoot: value('setting-dev-root'),
     allowShell: elementById<HTMLInputElement>('setting-allow-shell')?.checked !== false,
     permissionMode: (elementById<HTMLSelectElement>('setting-permission-mode')?.value as AppSettings['permissionMode']) ?? 'ask',
@@ -3843,11 +3803,12 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
     setSettingsStatus(result.error ?? '保存失败', true);
     return;
   }
-  motionTriggers = (settings.motionTriggers as Record<string, string> | undefined) ?? {}; // 行为触发立刻生效
   motionTriggersByModel = (settings.motionTriggersByModel as Record<string, Record<string, string>> | undefined) ?? motionTriggersByModel;
-  behaviorWarned.clear();
+  // 触发配置变更后让插件重算，并把生效映射取回来给设置页
+  applyBehaviorTriggersFromSettings(settings);
   applyPetName(settings.petName); // 名字立刻生效（输入框提示/问候语）
   applySfxSettings(settings); // 音效开关/音量立刻生效（无需重启）
+  applyTtsSettings(settings); // 朗读开关/音色立刻生效（无需重启）
   applyFraming(settings.displayMode === 'half' ? 'half' : 'full'); // 取景立刻生效
   setVtsTrackingEnabled(settings.vtsEnabled === true); // VTS 视线同步随开关立刻生效
   void refreshVtsStatus(bridge); // VTS 状态行跟着更新（主进程可能刚重连）
@@ -4735,191 +4696,32 @@ async function sendChat(bridge: RendererBridge): Promise<void> {
 }
 
 /* ================================================================
-   9.7 待办笔记本面板（数据经 IPC 走主进程 ToolBox，持久化 %APPDATA%）
+   9.7 待办笔记本面板（实现见 panels/todo.ts；数据仍经 IPC 走主进程 ToolBox）
    ================================================================ */
-type TodoDto = import('../shared/contracts').TodoDto;
-
-function renderTodoList(bridge: RendererBridge): void {
-  const listEl = elementById<HTMLElement>('todo-list');
-  const emptyEl = elementById<HTMLElement>('todo-empty');
-  if (!listEl || !emptyEl) return;
-  bridge
-    .todoList()
-    .then((todos) => {
-      if (!todos.length) {
-        listEl.replaceChildren();
-        emptyEl.hidden = false;
-        return;
-      }
-      emptyEl.hidden = true;
-      listEl.replaceChildren();
-      for (const todo of todos) {
-        const li = document.createElement('div');
-        li.className = 'todo-item';
-        li.setAttribute('data-id', String(todo.id));
-        const cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.className = 'todo-item-checkbox';
-        cb.checked = todo.done;
-        const text = document.createElement('span');
-        text.className = `todo-item-text${todo.done ? ' done' : ''}`;
-        text.textContent = todo.text;
-        const del = document.createElement('button');
-        del.type = 'button';
-        del.className = 'todo-item-delete';
-        del.textContent = '×';
-        del.setAttribute('aria-label', '删除待办');
-        li.append(cb, text, del);
-        listEl.appendChild(li);
-      }
-    })
-    .catch((err: unknown) => console.warn('[renderer] 读取待办失败', err));
-}
-
-function openTodoPanel(bridge: RendererBridge): void {
-  const panel = elementById<HTMLElement>('todo-panel');
-  const chatBar = elementById<HTMLElement>('chatbar');
-  hideContextMenu();
-  if (chatBar) chatBar.classList.remove('is-open');
-  if (!panel) return;
-  panel.hidden = false;
-  renderTodoList(bridge);
-  try {
-    elementById<HTMLInputElement>('todo-input')?.focus();
-  } catch { /* ignore */ }
-}
-
 function closeTodoPanel(): void {
-  const panel = elementById<HTMLElement>('todo-panel');
-  if (panel) panel.hidden = true;
+  (window as Any).PetTodoPanel?.close();
 }
 
 function installTodoPanel(bridge: RendererBridge): void {
-  elementById<HTMLButtonElement>('todo-close')?.addEventListener('click', closeTodoPanel);
-  elementById<HTMLButtonElement>('todo-close2')?.addEventListener('click', closeTodoPanel); // 页脚“关闭”按钮
-
-  const refreshAfter = (p: Promise<unknown>): void => {
-    p.then(() => renderTodoList(bridge)).catch((err: unknown) => console.warn('[renderer] 待办操作失败', err));
-  };
-
-  const addFromInput = (): void => {
-    const input = elementById<HTMLInputElement>('todo-input');
-    const text = input?.value.trim();
-    if (!text) return;
-    if (input) input.value = '';
-    refreshAfter(bridge.todoAdd(text));
-  };
-  elementById<HTMLButtonElement>('todo-add')?.addEventListener('click', addFromInput);
-  elementById<HTMLInputElement>('todo-input')?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      addFromInput();
-    }
-  });
-
-  // 列表事件委托：勾选 / 删除
-  elementById<HTMLElement>('todo-list')?.addEventListener('click', (e) => {
-    const item = (e.target as HTMLElement).closest?.('.todo-item') as HTMLElement | null;
-    const btn = (e.target as HTMLElement).closest?.('button') as HTMLElement | null;
-    if (!item) return;
-    const id = Number(item.getAttribute('data-id'));
-    if (!Number.isFinite(id)) return;
-    if (btn) {
-      refreshAfter(bridge.todoDel(id));
-    } else if ((e.target as HTMLInputElement).type === 'checkbox') {
-      refreshAfter(bridge.todoToggle(id));
-    }
-  });
-
-  // 聊天说“打开待办/笔记本” → 主进程 push IPC_TODO_SHOW
-  bridge.onTodoShow?.(() => {
-    openTodoPanel(bridge);
-  });
+  (window as Any).PetTodoPanel?.install({ byId: elementById, bridge, hideContextMenu });
 }
 
 /* ================================================================
-   9.8 AI 提问框（ask_user）：选项按钮 + 自由文本回答
+   9.8 AI 提问框（实现见 panels/askBox.ts；思考浮窗状态经注入回调联动）
    ================================================================ */
-type AskQuestionPayload = { id: string; question: string; options: Array<{ label: string; description?: string }> };
-
-function hideAskBox(): void {
-  const box = elementById<HTMLElement>('ask-box');
-  if (!box) return;
-  box.hidden = true;
-  box.setAttribute('aria-hidden', 'true');
-  delete box.dataset.questionId;
-  setThinkWaiting(false); // 用户已作答 → 结束"暂停"状态，思考浮窗恢复
-}
-
-function showAskBox(bridge: RendererBridge, payload: AskQuestionPayload): void {
-  const box = elementById<HTMLElement>('ask-box');
-  const questionEl = elementById<HTMLElement>('ask-question');
-  const optionsEl = elementById<HTMLElement>('ask-options');
-  const input = elementById<HTMLInputElement>('ask-input');
-  if (!box || !questionEl || !optionsEl || !input) return;
-  // 折叠态看不到提问框 → 先展开
-  if (CHAT_PANEL_MODE && chatCollapsed) setChatCollapsed(bridge, false);
-  // 思考浮窗里提问 = "思考到一半停下来问你"：面板必须展开着，否则问题被折叠藏住
-  if (THINK_PANEL_MODE) expandThinkPanel();
-  hideContextMenu();
-  const chatBar = elementById<HTMLElement>('chatbar');
-  if (chatBar) chatBar.classList.remove('is-open'); // 只收输入条，保留思考浮窗
-  box.dataset.questionId = payload.id;
-  questionEl.textContent = payload.question;
-  optionsEl.replaceChildren();
-  for (const opt of payload.options.slice(0, 4)) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'ask-option-btn';
-    const label = document.createElement('span');
-    label.className = 'ask-option-label';
-    label.textContent = opt.label;
-    btn.appendChild(label);
-    if (opt.description) {
-      const desc = document.createElement('span');
-      desc.className = 'ask-option-desc';
-      desc.textContent = opt.description;
-      btn.appendChild(desc);
-    }
-    btn.addEventListener('click', () => {
-      void bridge.askAnswer({ id: payload.id, selected: [opt.label] }).catch(() => undefined);
-      hideAskBox();
-    });
-    optionsEl.appendChild(btn);
-  }
-  input.value = '';
-  box.hidden = false;
-  box.setAttribute('aria-hidden', 'false');
-  // 弹窗即"暂停"：思考浮窗切成等待态，并在记录里留一行，避免看起来还在自顾自思考
-  setThinkWaiting(true);
-  pushThinkLine({ kind: 'tool', text: `⏸ 暂停，等待你确认：${String(payload.question ?? '').split('\n')[0]}` });
-  window.setTimeout(() => {
-    try {
-      input.focus();
-    } catch { /* ignore */ }
-  }, 60);
-}
-
 function installAskBox(bridge: RendererBridge): void {
-  installDragScroll(elementById<HTMLElement>('ask-question'));
-  bridge.onAskQuestion?.((payload) => {
-    showAskBox(bridge, payload);
-    return hideAskBox;
-  });
-  // 提问超时/失效：主进程会推 cancel，这里收起弹窗并结束等待态（否则弹窗会一直留在屏幕上）
-  bridge.onAskCancel?.(() => hideAskBox());
-  const input = elementById<HTMLInputElement>('ask-input');
-  input?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      const box = elementById<HTMLElement>('ask-box');
-      const id = box?.dataset.questionId;
-      const text = input.value.trim();
-      if (id && text) {
-        void bridge.askAnswer({ id, text }).catch(() => undefined);
-        hideAskBox();
-      }
-    }
+  (window as Any).PetAskBox?.install({
+    byId: elementById,
+    bridge,
+    hideContextMenu,
+    installDragScroll,
+    setThinkWaiting,
+    pushThinkLine,
+    expandThinkPanel,
+    isChatPanel: CHAT_PANEL_MODE,
+    isThinkPanel: THINK_PANEL_MODE,
+    setChatCollapsed: (collapsed: boolean) => setChatCollapsed(bridge, collapsed),
+    isChatCollapsed: () => chatCollapsed,
   });
 }
 
@@ -5813,25 +5615,25 @@ function installDebugHooks(bridge: RendererBridge): void {
      * 当前映射、模型可用的动作组/表情、每个行为**实际解析出**的目标。
      * 解析结果是 null 就说明这个绑定在当前模型上没有对应目标。
      */
-    behaviors: (): Any => ({
-      triggers: { ...motionTriggers },
-      motions: listCurrentMotions(),
-      expressions: listCurrentExpressions(),
-      debounceMs: { ...BEHAVIOR_DEBOUNCE_MS },
-      resolved: Object.fromEntries(BEHAVIOR_KEYS.map((k) => [k, resolveBehaviorTarget(k)])),
-    }),
+    behaviors: (): Any =>
+      rendererKernel()?.call('behavior.state') ?? {
+        triggers: { ...motionTriggers },
+        motions: listCurrentMotions(),
+        expressions: listCurrentExpressions(),
+        debounceMs: {},
+        resolved: {},
+      },
     /** 立刻触发一次行为（跳过去抖），用于验证绑定是否生效 */
     fireBehavior: (name: string): Any => {
       if (!(BEHAVIOR_KEYS as string[]).includes(name)) return { ok: false, error: `未知行为：${name}` };
-      behaviorLastAt[name as BehaviorKey] = 0;
-      emitBehavior(name as BehaviorKey);
-      return { ok: true, state: { triggers: { ...motionTriggers }, resolved: resolveBehaviorTarget(name as BehaviorKey) } };
+      return rendererKernel()?.call('behavior.fire', name) ?? { ok: false, error: '内核未加载' };
     },
     /**
      * 把一个触发值解析成实际目标（排查"这个值在当前模型上到底指什么"用）。
      * 支持 'motion:<动作组>' / 'expr:<表情>' / 'emotion:<标签>' / 'click' / 'costume'。
      */
-    resolveTrigger: (candidate: string): Any => resolveTriggerCandidate(String(candidate ?? '')),
+    resolveTrigger: (candidate: string): Any =>
+      rendererKernel()?.call('behavior.resolve', String(candidate ?? '')) ?? null,
     voiceCancel: () => finishVoiceCapture(true),
     /**
      * 只用于视觉验证：往对话里插几条"演示行"（user / pet / tool / failed 各一条）+ 驱动声纹。
@@ -5926,6 +5728,7 @@ async function init(): Promise<void> {
   subscribeWindowChanges(bridge);
   chatBridge = bridge; // 聊天记录持久化用
   vtsTrackingBridge = bridge; // VTS 追踪推送目标（主循环里用；未启用时不会被调用）
+  await installRendererKernel(); // 策略插件先就位（行为配置/对话事件都要在触发前有订阅者）
   // 行为触发映射：**必须在这里载入**（不能只在打开设置面板时）——否则不打开设置/重启后，
   // 设置里配好的"动作或表情"永远不会播（退回 'auto' 时多数是看不出变化的 Idle）。
   await loadBehaviorTriggers(bridge);
@@ -5964,6 +5767,7 @@ async function init(): Promise<void> {
       applyFraming(chosen ?? (activeModelPreset?.framing === 'half' ? 'half' : 'full'));
       applyPetName(bootSettings.petName); // 设置里的桌宠名字：问候语/输入框提示立刻用上
       applySfxSettings(bootSettings);
+      applyTtsSettings(bootSettings); // 不打开设置页也要按设置自动朗读
       setVtsTrackingEnabled(bootSettings.vtsEnabled === true); // 不打开设置页也要按设置同步 VTS
       // 模型已挂载完成 → 现在才知道它有哪些动作组/表情：把该模型自己的行为触发绑定套上
       applyBehaviorTriggersFromSettings(bootSettings);

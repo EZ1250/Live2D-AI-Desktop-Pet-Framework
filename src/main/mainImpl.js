@@ -212,7 +212,6 @@ let phoneHitPending = null; // 手机点击命中检测的一次性 resolver
 // 后台自主任务的工具调用预算（防失控/死循环；参考 DSH 的有界工具循环与重复调用保护）
 let autoTaskToolCount = 0;
 let builtinToolExecutor = null;
-let phoneConfirmCount = 0; // 每次手机请求内允许的手机确认次数 // 主对话的内置工具执行器（手机对话复用，保证只读判定/路径校验一致）
 const autoTaskToolRepeat = new Map();
 let tickTimer = null;
 /** activate（macOS）重建窗口所需 */
@@ -2954,7 +2953,9 @@ async function bootstrap() {
         return await toolExecutor(name, rawArgs);
     };
     chat?.setToolExecutor(phoneAwareToolExecutor);
-    builtinToolExecutor = phoneAwareToolExecutor;
+    // 外部聊天/手机聊天复用"内置工具执行器"时必须用原始实现：
+    // 挂 phoneAware 会让同一次调用先弹手机确认、再被这里二次确认（双重确认）。
+    builtinToolExecutor = toolExecutor;
     // 7.2 MCP 服务端（可选）：把桌宠能力暴露成本机 MCP，供 DSH / QQ bridge 等外部 agent 调用
     petMcpServer = new mcpServer_1.PetMcpServer({
         configPath: path.join(electron_1.app.getPath('userData'), 'mcp-server.json'),
@@ -3876,21 +3877,33 @@ async function askPetChatDetail(promptText) {
                 phoneChatThinking += (evt.kind === 'tool' ? '\n[工具] ' : '\n[结果] ') + evt.text;
         },
     });
+    let phoneChatTimer = null;
     try {
-        const raw = await new Promise((resolve, reject) => {
-            phoneChatResolve = resolve;
-            phoneChatReject = reject;
-            chat.startChat(promptText.slice(0, 2000)).catch((err) => {
-                phoneChatResolve = null;
-                phoneChatReject = null;
-                reject(err instanceof Error ? err : new Error(String(err)));
-            });
-        });
+        const raw = await Promise.race([
+            new Promise((resolve, reject) => {
+                phoneChatResolve = resolve;
+                phoneChatReject = reject;
+                chat.startChat(promptText.slice(0, 2000)).catch((err) => {
+                    phoneChatResolve = null;
+                    phoneChatReject = null;
+                    reject(err instanceof Error ? err : new Error(String(err)));
+                });
+            }),
+            // 兜底：模型流挂住时不能永久占用主 chat / phoneChatActive（电脑端输入会被一直拒绝）
+            new Promise((_, reject) => {
+                phoneChatTimer = setTimeout(() => {
+                    try { chat.cancel?.(); } catch { /* ignore */ }
+                    reject(new Error('手机对话超时（180s），已中止本轮回复'));
+                }, 180_000);
+                if (typeof phoneChatTimer.unref === 'function') phoneChatTimer.unref();
+            }),
+        ]);
         const reply = stripToolCallMarkers(String(raw ?? '').trim().slice(0, 4000));
         const thinking = stripToolCallMarkers(phoneChatThinking.trim()).slice(0, 8000);
         scenario?.record('event', '手机对话：AI 回复「' + reply.slice(0, 40) + '」');
         return { reply: reply || '（AI 没有返回内容）', thinking };
     } finally {
+        if (phoneChatTimer) clearTimeout(phoneChatTimer);
         if (prevHandlers) chat.setHandlers(prevHandlers);
         phoneChatActive = false;
         phoneChatResolve = null;
@@ -4007,11 +4020,11 @@ function autoTaskApprovedToolDefs() {
 async function externalChatToolExecutor(name, args) {
     // 只读内置工具：直接执行
     if (builtinToolExecutor && phoneReadonlyToolAllowed(name)) {
-        return await runPhoneToolLimited(name, args, () => builtinToolExecutor(name, args));
+        return await builtinToolExecutor(name, args);
     }
     // 外部 MCP 只读工具：沿用服务器 autoApprove + 只读声明
     if (mcpClient && mcpClient.isMcpTool(name) && mcpClient.isAutoApprovedReadOnly(name)) {
-        return await runPhoneToolLimited(name, args, () => mcpClient.callTool(name, args));
+        return await mcpClient.callTool(name, args);
     }
     // 其余需要电脑端确认的工具：先请手机确认；电脑端原有确认流程完全不动
     if (!petMcpServer)
@@ -4021,30 +4034,32 @@ async function externalChatToolExecutor(name, args) {
         return '用户拒绝执行该操作。';
     if (choice !== 'allow')
         return '手机端未确认（超时/离线），已取消该操作。请到电脑端操作。';
-    phoneConfirmCount += 1;
     // 用一次性覆盖回答工具内部的确认提问（AsyncLocalStorage 保证不泄露到电脑端并发任务）
     const answer = '允许';
     return await toolConfirmOverride.run({ answer, remaining: 3 }, () => builtinToolExecutor ? builtinToolExecutor(name, args) : '工具尚未就绪');
 }
 
-/** 手机对话与电脑端同权限：不再限制次数（保留函数避免调用点分叉） */
-async function runPhoneToolLimited(name, args, run) {
-    return await run();
-}
+/**
+ * 手机/外部聊天可自动执行的只读内置工具（无写入、无命令执行、无隐私采集）。
+ * 这里用显式白名单而非 catalog 注解：工具定义是发给模型 API 的，加 annotations 有兼容风险。
+ */
+const PHONE_READONLY_TOOLS = new Set([
+    'active_window_get',
+    'get_time',
+    'note_list',
+    'todo_list',
+    'reminder_list',
+    'skill_list',
+    'skill_use',
+    'workspace_file_read',
+    'workspace_glob',
+    'workspace_search',
+    'weather_get',
+    'web_fetch',
+]);
 
-
-/** 手机对话可自动执行的只读内置工具：优先看 catalog 的 readOnlyHint，active_window_get 兜底放行 */
 function phoneReadonlyToolAllowed(name) {
-    if (name === 'active_window_get') return true;
-    try {
-        const defs = chatClient_1.TOOL_DEFS || [];
-        const d = defs.find((x) => x.function && x.function.name === name);
-        if (!d) return false;
-        const a = d.function.annotations || {};
-        return a.readOnlyHint === true;
-    } catch {
-        return false;
-    }
+    return PHONE_READONLY_TOOLS.has(String(name || ''));
 }
 
 

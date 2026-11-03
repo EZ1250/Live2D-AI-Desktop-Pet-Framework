@@ -28,6 +28,6 @@
 *.moc binary
 *.psd binary
 
-# 第三方压缩库：由 scripts/vendor-assets.js 之类的流程引入，标记为 vendored
-# 这样 GitHub 不会把它们算进本仓库的代码统计
-src/renderer/lib/*.min.js linguist-vendored
+# 第三方压缩运行库：由 scripts/fetch-live2d-runtime.js 取回；
+# 标记 vendored（不计入代码统计）+ binary（避免换行归一化改动字节）
+src/renderer/lib/*.min.js linguist-vendored binary

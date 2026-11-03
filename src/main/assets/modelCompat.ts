@@ -54,7 +54,7 @@ export function coreMaxMocVersion(): number {
     path.join(app.getAppPath(), 'dist', 'renderer', 'lib', 'live2dcubismcore.min.js'),
     path.join(app.getAppPath(), 'src', 'renderer', 'lib', 'live2dcubismcore.min.js'),
   ];
-  cachedCoreMax = 4; // 保守默认：Cubism 4.2
+  cachedCoreMax = 4; // 解析不到 Core 时的保守默认（当前随包 Core 会解析为 5）
   for (const file of candidates) {
     try {
       const text = fs.readFileSync(file, 'utf8');
@@ -215,7 +215,7 @@ export function inspectModelDir(dirAbs: string, name?: string): ModelCompat {
         verdict: 'unsupported',
         issues: cubism2.slice(0, 3),
         reason: '这是 Cubism 2 时代的老模型（.moc/.model.json），现在的运行库读不了',
-        action: '用 Cubism Editor 打开后重新导出为 .moc3（目标版本 4.2），或换一个 .moc3 模型',
+        action: '用 Cubism Editor 打开后重新导出为 .moc3（目标版本 4.2 或 5），或换一个 .moc3 模型',
       };
     }
     return {
@@ -286,10 +286,10 @@ export function inspectModelDir(dirAbs: string, name?: string): ModelCompat {
     return compat;
   }
   if (mocVersion > coreMax) {
-    const label = mocVersion >= 5 ? 'Cubism 5' : `moc3 v${mocVersion}`;
+    const label = mocVersion >= 6 ? `Cubism 5.3（moc3 v${mocVersion}）` : `moc3 v${mocVersion}`;
     compat.verdict = 'unsupported';
-    compat.reason = `这个模型是 ${label} 导出的，随包的运行库最高只认到 Cubism 4.2`;
-    compat.action = '两个办法：① 用 Cubism Editor 打开后「导出 → 目标版本 4.2」重新导出；② 把 Live2D 官方 SDK 里的 Core（含 .wasm）交给应用升级运行库';
+    compat.reason = `这个模型是 ${label} 导出的，随包运行库最高只认 moc3 v${coreMax}（Cubism 5.1）`;
+    compat.action = `用 Cubism Editor 打开后「导出 → 目标版本 5」重新导出（最高 moc3 v${coreMax}）；或等运行库升级后再试`;
     compat.issues.push(`moc3 v${mocVersion} > 运行库上限 v${coreMax}`);
     return compat;
   }

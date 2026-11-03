@@ -365,8 +365,12 @@ const api: ElectronAPI = {
   /* ---- Edge TTS 播放 ---- */
 
   /** 让主进程合成一句话；音频经 onTtsAudio 推回来（失败时 ok=false + error）。 */
-  ttsSpeak(text: string): Promise<{ ok: boolean; error?: string; bytes?: number }> {
-    return ipcRenderer.invoke(IPC_TTS_SPEAK, text);
+  ttsSpeak(
+    text: string,
+    voice?: string,
+    requestId?: string,
+  ): Promise<{ ok: boolean; requestId?: string; error?: string; bytes?: number }> {
+    return ipcRenderer.invoke(IPC_TTS_SPEAK, text, voice, requestId);
   },
 
   /** 订阅 TTS 合成结果：渲染层用 new Audio(payload.dataUrl).play() 播放。 */

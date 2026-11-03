@@ -27,7 +27,10 @@ const os = require('os');
 const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
-const USER_DATA = path.join(os.homedir(), 'AppData', 'Roaming', 'pet-desktop-app');
+/** 应用把 userData 钉在 %APPDATA%\pet-desktop-app；优先读环境变量，兼容被重定向的机器 */
+const USER_DATA = process.env.APPDATA
+  ? path.join(process.env.APPDATA, 'pet-desktop-app')
+  : path.join(os.homedir(), 'AppData', 'Roaming', 'pet-desktop-app');
 
 /** A. 禁止进包的文件名（小写比对；可用 `*` 通配） */
 const FORBIDDEN_NAMES = [
@@ -133,13 +136,17 @@ function walk(dir, onFile) {
 }
 
 function readLiveKey() {
+  const file = path.join(USER_DATA, 'settings.json');
+  if (!fs.existsSync(file)) return '';
   try {
     // 用户可能用记事本另存成 UTF-8 with BOM：先剥掉 BOM，否则 JSON.parse 直接失败、比对会静默失效
-    const raw = fs.readFileSync(path.join(USER_DATA, 'settings.json'), 'utf8').replace(/^\uFEFF/, '');
+    const raw = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
     const parsed = JSON.parse(raw);
     const key = parsed?.ai?.aiApiKey || parsed?.aiApiKey || '';
     return typeof key === 'string' ? key.trim() : '';
-  } catch {
+  } catch (err) {
+    // 文件存在但读不出来 = 本机真实 Key 比对失效，必须让人知道（否则隐私闸门会"看起来通过"）
+    console.warn(`[privacy] WARN: 读不了本机 settings.json（${err.message}），跳过真实 Key 比对`);
     return '';
   }
 }

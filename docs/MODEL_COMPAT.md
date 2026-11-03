@@ -7,9 +7,9 @@
 
 | 类别 | 支持情况 | 说明 |
 |---|---|---|
-| Live2D **moc3 v3 / v4 / v5**（Cubism 4.0 / 4.2 / 5 导出） | ✅ 正常渲染 | 随包运行库 = Pixi 8.14 + untitled-pixi-live2d-engine 1.4.0 + 官方 Cubism Core 5.0（上限就是 moc3 v5） |
-| Live2D **moc3 v6**（Cubism 5.3 导出） | ❌ 暂不支持 | Core 5.0 读不了；升 Core 6 会与引擎内含的框架不匹配（实测渲染崩溃）。体检会明确标 `unsupported` 并给出出路 |
-| **Cubism 2.1**（`.moc` / `.model.json`） | ❌ 暂不支持 | 仓库保留 legacy 运行库文件，但当前渲染入口未加载它；请重新导出为 moc3 |
+| Live2D **moc3 v3 / v4 / v5**（Cubism 4.0 / 4.2 / 5 导出） | ✅ 正常渲染 | 随包运行库 = Pixi 6.5.10 + pixi-live2d-display 0.4.0 + 官方 Cubism Core 5.1（上限就是 moc3 v5） |
+| Live2D **moc3 v6**（Cubism 5.3 导出） | ❌ 暂不支持 | Core 5.1 读不了 v6；Core 6 与引擎内含的框架不匹配（实测渲染崩溃）。体检会明确标 `unsupported` 并给出出路 |
+| **Cubism 2.1**（`.moc` / `.model.json`） | ❌ 暂不支持 | 当前渲染入口不加载 Cubism 2 运行库；请用 Cubism Editor 重新导出为 moc3 |
 | 只有图片（png/jpg/webp/gif） | ✅ 按**静态立绘**显示 | 有呼吸 / 浮动待机，没有动作与表情 |
 | `*.model3.json` 里没有 `FileReferences.Moc`（立绘壳） | ✅ 按**静态立绘**显示 | 目录里有图片就自动降级 |
 | 引用文件缺失（缺 moc / 缺贴图） | ❌/⚠️ | 缺 moc → 不能渲染；缺贴图 → 能渲染但会提示缺几张 |
@@ -30,41 +30,42 @@ node scripts/check-model.js "<模型文件夹>" --json    # 程序读版（不�
 - **启动日志**：`[ipc] [模型体检] <模型>：… · unsupported · <原因>；怎么办：…`；
 - **模型渲染不出来时**：桌宠窗口中间直接显示原因 + 怎么办（不再是一张没有信息的占位卡）。
 
-## 3. Cubism 5（moc3 v5/v6）现状与升级记录
+## 3. Cubism 5（moc3 v5/v6）现状与运行库
 
-**结论（实测）**：**moc3 v5（Cubism 5）已经支持** —— 运行库已升级为
-**Pixi 8.14 + `untitled-pixi-live2d-engine@1.4.0` + 官方 Cubism Core 5.0**，
-v5 模型实测正常渲染。**moc3 v6（Cubism 5.3）暂不支持**（原因见下）。
+**结论（实测）**：**moc3 v5（Cubism 5）已经支持** —— 运行库为
+**Pixi 6.5.10 + `pixi-live2d-display@0.4.0` + 官方 Cubism Core 5.1**，
+v5 模型实测正常渲染。**moc3 v6（Cubism 5.3）暂不支持**（Core 5.1 读不了 v6，Core 6 与引擎内含框架不匹配）。
+VTS 导出的模型（带 `.vtube.json`）会在挂载前合并表情/动作，并按 `ParameterSettings` 做参数映射
+（自定义 `AngleX/PositionX` 等控制器参数），见 `src/renderer/lib/VERSIONS.md`。
 
-### 3.1 升级过程中踩过的坑（都已在代码里修好）
+### 3.1 已处理的兼容点（都已在代码里修好）
 
 | 现象 | 底层原因 | 我们怎么修的 |
 |---|---|---|
-| 模型没写 `HitAreas` 就 `TypeError: _a.map is not a function` | 引擎把框架设置类的 JSON 键名字符串 `Object.assign` 进了设置对象 | 喂库前在内存里归一化（补 `HitAreas: []` / `url` / 各 FileReferences 形态） |
-| 模型加载成功但画布**全透明** | 引擎的绘制回调需要 `model.renderer` 或全局 `app`，都没有就静默 return | 显式 `model.renderer = app.renderer` + 暴露全局 `app` |
-| `Failed to upload Live2D texture.` | 引擎读 `texture.source._gpuData[uid]`，而 Pixi 8.13+ 的 `TextureSource` 没有该字段 | 挂载后给每个贴图源补 `_gpuData`（空对象，仅供其布尔判断）并预热绑定 |
-| 高精度遮罩分支崩溃 | 引擎默认开高精度遮罩，在这套环境里走进异常分支 | `renderer.useHighPrecisionMask(false)` |
-| 头/眼/口型全失效（`present` 全 false） | 参数容器换代：老栈 `_model.parameters`，新栈 `_parameterValues/_parameterMinimumValues`；且 `getParameterIndex(字符串)` 找不到时返回 count 哨兵，`_parameterIds` 是 csmVector 且 `getString()` 返回 `{s}` | 两代容器都认 + 先按名字扫 `_parameterIds` 再退回索引，并校验区间 |
-| 模型加载晚于挂载瞬间 → 参数解析全空 | 新框架的 `_parameterValues` 不是挂载当刻就绪 | 前 12 帧内再解析几次（`ensureParamsReady`） |
+| 头/眼/口型全失效（`present` 全 false） | 参数容器两代形状不同：`_model.parameters` 与 `_parameterValues/_parameterMinimumValues`；`getParameterIndex(字符串)` 找不到时返回 count 哨兵 | 两种容器都认 + 先按名字扫 `_parameterIds` 再退回索引，并校验区间 |
+| 模型加载晚于挂载瞬间 → 参数解析全空 | 框架的 `_parameterValues` 不是挂载当刻就绪 | 前 12 帧内再解析几次（`ensureParamsReady`） |
 | 贴图解码 `SecurityError: Failed to construct 'Worker'` | CSP 未放行 blob worker | CSP 加 `worker-src 'self' blob:`（index.html + 静态服务两处） |
-| Core 6 渲染每帧 `reading '0'` | SDK R5 的 Core 6 与引擎内含框架的 `getDrawableRenderOrders()` 不匹配 | **随包锁 Core 5.0**；Core 6 只在 `--sdk-core` 实验开关下安装 |
+| VTS 模型右键菜单没有表情/动作 | 表情/动作写在 `.vtube.json`，`model3.json` 的 `FileReferences` 是空的 | 挂载前把 Exp3/Animation 合并进内存 model3（`normalizeModelSettings`） |
+| VTS 模型只有眨眼、头不跟鼠标 | 模型用自定义控制器参数（`AngleX/PositionX`），标准 `ParamAngleX` 并不存在 | 读 `.vtube.json` 的 `ParameterSettings` 做映射，并在 `internalModel.updateFocus` 写参数（物理才会跟随） |
 
 ### 3.2 还想支持 moc3 v6（Cubism 5.3）怎么办
 
-- **等引擎更新**：`untitled-pixi-live2d-engine` / `@laplace.live/pixijs-live2d`（2026-09 仍在更新、
-  已声明 moc3 v6 verified）把内含框架升到与 Core 6 对齐后，跑 `node scripts/fetch-live2d-runtime.js --sdk-core` 即可。
-  体检上限是**解析 Core 得到的**，换 Core 后 `check-model.js` 会自动显示新的上限。
+- **等引擎更新**：`pixi-live2d-display` 把内含框架升到与 Core 6 对齐后，改
+  `scripts/fetch-live2d-runtime.js` 里的 Core URL 重新取库；体检上限是**解析 Core 得到的**，
+  换 Core 后 `check-model.js` 会自动显示新的上限。
 - **或自建打包**：官方 Cubism 5 框架（SDK R5 内 `Framework/` 源码）+ esbuild 打自己的渲染入口，不依赖第三方引擎。
 
 ### 3.3 Cubism 2.1（`.moc`）
 
-引擎的 legacy 构建 `lib/live2d-engine-cubism2.min.js` 已随包，但当前渲染层只加载现代分支；
-要支持老模型需要再加载 legacy 分支并把 `.model.json` 路由过去（两套引擎共用 `PIXI.live2d` 命名空间，需隔离）。当前体检会把 Cubism 2 模型标成 `unsupported` 并提示重新导出。
+当前渲染入口不支持 `.moc` / `.model.json`（`pixi-live2d-display` 的 cubism4 构建只读 moc3）；
+体检会把 Cubism 2 模型标成 `unsupported` 并提示用 Cubism Editor 重新导出为 moc3。
 
-### 3.4 万一要回退到老栈
+### 3.4 换运行库/升级时怎么做
 
-`src/renderer/lib/VERSIONS.md` 末尾写了回退办法（Pixi 6.5.10 + cubism4 0.4.0 + Core 4.2 的取回命令）；
-`live2d.ts` 按 `PIXI.VERSION` 自动分流，两代运行库都能跑，**换文件即回退，不用改代码**。
+运行库三件套由 `scripts/fetch-live2d-runtime.js` 统一取回（原子写 + 体积/版本校验 + 清理旧文件）。
+不要用 `git checkout` 单独回退 `src/renderer/lib/`：当前 `live2d.ts` 只支持这一套单栈
+（Pixi 6 + pixi-live2d-display 0.4），回退文件而不回退代码会直接渲染失败。
+要换版本：改脚本顶部的 URL/版本标记 → 重跑脚本 → `npm run build:all`。
 
 ## 4. 代码在哪里
 
@@ -75,11 +76,11 @@ v5 模型实测正常渲染。**moc3 v6（Cubism 5.3）暂不支持**（原因�
 | `src/main/ipc.ts` | 模型 manifest 里带上 `compat`；不 ok 时打启动日志 |
 | `src/renderer/renderer.ts` | `compat.verdict === 'unsupported'` 时直接提示原因 + 怎么办；`__petDebug.modelCompat()` 可查 |
 | `scripts/check-model.js` | 命令行体检（CI / 排障） |
-| `scripts/fetch-cubism-core.js --from` | 从本地 SDK 安装 Core（备份 + 校验 + 回滚） |
+| `scripts/fetch-live2d-runtime.js` | 取回/升级运行库三件套（原子写 + 校验 + 清理旧文件） |
 
 ## 5. 已知边界
 
 - **Cubism 2 模型**（含 `.moc`）只能用 Cubism Editor 重新导出为 `.moc3`；当前渲染入口不加载 legacy 分支。
 - **只有 `.moc3` 但没有 `.model3.json`**：`pixi-live2d-display` 需要描述文件（贴图列表在里面），应用会提示补描述文件；不自动改写用户的模型目录。
-- moc3 **v5 + 老 Core**：即使强行加载也会失败，所以应用选择"不尝试 + 明确告知"，避免出现半渲染的坏画面。
+- moc3 **v6**：Core 5.1 读不了，应用选择"不尝试 + 明确告知"，等运行库升级后再支持。
 - 体检只读文件、不写用户的模型目录（除了 `pet-model.json` 这类由应用管理的预设文件）。

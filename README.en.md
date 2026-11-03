@@ -1,4 +1,4 @@
-# Pet
+﻿# Pet
 
 Electron-based Live2D desktop pet: model switching, chat, voice input, todos and plugins.
 
@@ -17,7 +17,7 @@ npm start
 
 - Runtime: `active-win` (active window detection)
 - Dev: `electron`, `electron-builder`, `typescript`, `@types/node`
-- Bundled Live2D runtime: PIXI + Cubism Core (in `public/renderer/lib`)
+- Bundled Live2D runtime: PIXI + Cubism Core (source in `src/renderer/lib`)
 
 ## Development (advanced commands)
 
@@ -38,7 +38,7 @@ $env:DEVTOOLS=1
 
 ```bash
 npm test                                          # tsc + assemble + all node:test
-npm run check                                     # CI check
+npm run check                                     # CI (tsc + assemble + node --test)
 node --test tests/mcpServerPhone.test.js          # phone bridge / polling / timeout
 node --test tests/mcpServerPhoneContracts.test.js # phone JSON contracts
 node --test tests/mcpServerRemote.test.js         # remote MCP / WebSocket

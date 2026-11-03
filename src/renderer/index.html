@@ -1,12 +1,12 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <!--
   Pet — 渲染进程页面
   透明无边框窗口：body 背景透明；模型渲染在 #stage，气泡 #bubble，状态小字 #overlay。
 
   Live2D 运行时库加载顺序固定（pixi 全局 → Cubism Core → Live2D 引擎）：
-    ./lib/pixi.min.js               PixiJS 8.14.0 独立全局构建（window.PIXI，MIT）
-    ./lib/live2dcubismcore.min.js   Live2D Cubism Core 5.0（window.Live2DCubismCore，最高 moc3 v5）
-    ./lib/live2d-engine.min.js      untitled-pixi-live2d-engine 1.4.0（Cubism 3/4/5，写入 window.PIXI.live2d）
+    ./lib/pixi.min.js               PixiJS 6.5.10 独立全局构建（window.PIXI，MIT）
+    ./lib/live2dcubismcore.min.js   Live2D Cubism Core 5.1（window.Live2DCubismCore，最高 moc3 v5）
+    ./lib/live2d-engine.min.js      pixi-live2d-display 0.4.0（Cubism 3/4/5，写入 window.PIXI.live2d）
   版本/来源/许可/兼容处理见 ./lib/VERSIONS.md；重取：node scripts/fetch-live2d-runtime.js
   三者在浏览器分支下互相配合，moc3 路径可用（Cubism 3/4/5 导出的 moc3 都能读）；任一缺失时渲染层自动降级为
   portrait <img> / 占位图形，页面照常可用（见 live2d.ts / renderer.ts）。
@@ -21,7 +21,7 @@
   <!-- 模型静态资源由主进程本地 HTTP 服务提供(http://127.0.0.1:<port>/assets/...)，
        端口运行时才知，故 connect-src/img-src 放行 127.0.0.1 与 localhost 任意端口。
        unsafe-eval：Pixi 内部需要 new Function（WebGL 着色器/程序编译路径）。
-       worker-src/child-src blob:：Pixi 8 的贴图解码会用 blob worker（不给就 SecurityError → 模型挂不上）。
+       worker-src/child-src blob:：贴图解码会用到 blob worker（不给就 SecurityError → 模型挂不上）。
        media-src 必须带 data:：TTS 语音是 `data:audio/mpeg;base64,...` 的 data URL，
        缺 data: 时 play() 会被 CSP 拦掉（"Media load rejected by URL safety check"）→ 试听没声音。
        应用只加载本地自带脚本、无任何远程脚本，故放行以保证 moc3 渲染可用。 -->
@@ -173,6 +173,21 @@
       </label>
       <label class="settings-checkbox"><input id="setting-hide-fullscreen" name="hideOnFullscreen" type="checkbox" checked /> 全屏时自动收起</label>
       <label class="settings-checkbox"><input id="setting-click-through" name="clickThrough" type="checkbox" /> 点击穿透（透明区不挡鼠标）</label>
+      <fieldset class="settings-fieldset">
+        <legend>Edge TTS（对话朗读）</legend>
+        <label class="settings-checkbox" title="开启后自动朗读桌宠对话，并同步口型；关闭后停止">
+          <input id="setting-tts-enabled" name="ttsEnabled" type="checkbox" /> 自动朗读所有对话
+        </label>
+        <label>音色
+          <select id="setting-tts-voice" name="ttsVoice">
+            <option value="zh-CN-XiaoxiaoNeural">晓晓（女声，中文）</option>
+            <option value="zh-CN-YunxiNeural">云希（男声，中文）</option>
+            <option value="zh-CN-YunjianNeural">云健（男声，中文）</option>
+            <option value="zh-CN-XiaoyiNeural">晓伊（女声，中文）</option>
+            <option value="en-US-AriaNeural">Aria（女声，英文）</option>
+          </select>
+        </label>
+      </fieldset>
       <!-- 语音识别（转写）：与聊天模型分开配；自检按钮用内置合成音频打两条路由 -->
       <fieldset class="settings-fieldset">
         <legend>语音识别（语音输入转文字）</legend>
@@ -351,7 +366,7 @@
     </form>
   </section>
 
-  <!-- ① Live2D 运行时库（顺序不可变：Pixi 8 → 官方 Cubism Core → Live2D 引擎）
+  <!-- ① Live2D 运行时库（顺序不可变：Pixi 6.5.10 → 官方 Cubism Core → Live2D 引擎）
        版本/来源/许可/兼容处理见 ./lib/VERSIONS.md；重取：node scripts/fetch-live2d-runtime.js -->
   <script src="./lib/pixi.min.js"></script>
   <script src="./lib/live2dcubismcore.min.js"></script>
@@ -365,6 +380,17 @@
   <script src="./gazeController.js"></script>
   <!-- TTS 播放期间的本地口型节拍器：全局脚本，挂 window.PetTtsMouth；必须在 renderer.js 之前 -->
   <script src="./ttsMouth.js"></script>
+  <!-- 渲染层 UI 模块（全局脚本）：只做 DOM，依赖由 renderer.js 的 install(deps) 注入 -->
+  <script src="./fx.js"></script>
+  <script src="./panels/todo.js"></script>
+  <script src="./panels/askBox.js"></script>
+  <!-- 渲染层微内核（事件总线 + 服务注册 + 内置策略插件宿主）：全局脚本，挂 window.PetKernel；
+       必须在插件与 renderer.js 之前（服务由 renderer.js 提供后再启动插件） -->
+  <script src="./kernel.js"></script>
+  <!-- 内置策略插件：情绪判定（复用 emotion.js 规则库；由 kernel.js 启动） -->
+  <script src="./plugins/emotion.js"></script>
+  <!-- 内置策略插件：行为触发（行为 → 动作组/表情；设置 UI 仍留在 renderer.js） -->
+  <script src="./plugins/behavior.js"></script>
   <!-- ③ 渲染辅助层：moc3/portrait/placeholder 挂载（全局脚本，暴露 window.PetLive2d） -->
   <script src="./live2d.js"></script>
   <!-- ④ 渲染入口 -->

@@ -1,4 +1,4 @@
-# 项目目录约定
+﻿# 项目目录约定
 
 分类标准只有两条：这个文件是**人写的**还是**机器生成的**；它属于**生产链路**还是只在**开发/排障**时用。
 下面每个文件都能找到归属；找不到归属的，就是该删的信号。
@@ -49,6 +49,10 @@ src/
 │   ├── index.html / styles.css / renderer.ts / live2d.ts / emotion.ts / voicelab.ts
 │   ├── gazeController.ts     视线控制器（全局脚本 window.PetGaze：换算/SDK focus/兜底）
 │   ├── ttsMouth.ts           TTS 本地口型节拍器（全局脚本 window.PetTtsMouth：90~120ms 打拍/停止归零）
+│   ├── kernel.ts             渲染层微内核（全局脚本 window.PetKernel：事件总线 + 服务表 + 插件宿主）
+│   ├── fx.ts                 点击星星特效（全局脚本 window.PetFx）
+│   ├── plugins/              内置策略插件（emotion 情绪判定 / behavior 行为触发）
+│   ├── panels/               UI 面板（todo 待办 / askBox 提问确认，install(deps) 注入依赖）
 │   └── lib/                  第三方运行库（pixi / Cubism Core / Live2D 引擎）——不要手改
 ├── preload/preload.ts        contextBridge 窄接口
 └── shared/contracts.ts       跨模块契约（IPC 通道、类型）——唯一真源
@@ -70,12 +74,12 @@ src/
 | `import-model.js` | 导入模型/语料/技能到 `public/assets` | ✅ `npm run import` / `npm run build` |
 | `assemble-renderer.js` | 把 `src/renderer` 拼成 `public/renderer` | ✅ `npm run assemble` / `build:all` |
 | `build-portable.js` | 调 electron-builder 出 nsis + portable，并生成 `README_PORTABLE.md` | ✅ `npm run build` |
-| `check-privacy.js` | 扫描源码、生成物和打包产物中的隐私文件与密钥 | ✅ `npm run check:privacy`（`build-portable.js` 在打包前后自动调用） |
+| `check-privacy.js` | 扫描打包输入（`dist/`、`public/`、`local-assets/`）与产物中的隐私文件/密钥，并用本机真实 Key 比对 | ✅ `npm run check:privacy`（`build-portable.js` 在打包前后自动调用） |
 | `check-model.js` | 体检单个模型能否被当前运行库渲染 | 手动：`node scripts/check-model.js "<模型目录>"` |
 | `import-bundled-whale.js` | 从内置立绘重生成 `local-assets/大肥鱼/` | 手动（一次性）；**别删**：它是该资产的唯一再生成途径 |
 | `migrate-models-to-userdata.js` | 把随包模型迁到用户数据目录 | `import-model.js` 导入完成后自动调用，也可手动运行 |
 | `make_launchers.js` | 生成 `release/` 下的双击启动器（`.bat`，纯 ASCII 内容以适配 cmd 的 GBK 解析） | 手动：`node scripts/make_launchers.js` |
-| `fetch-cubism-core.js` / `fetch-live2d-runtime.js` | 升级 Cubism Core / Live2D 运行库 | 手动（升级时才用） |
+| `fetch-live2d-runtime.js` | 取回/升级 Live2D 运行库三件套（原子写 + 版本校验 + 清理旧文件） | 手动（升级时才用） |
 
 > 判定"能不能删"的依据是**有没有再生成途径或调用方**，不是引用次数。
 > 上面标"手动"的脚本被引用次数少是正常的，删掉会永久失去对应能力。
@@ -244,49 +248,19 @@ API Key 丢了 / 设置改了不生效"——两套配置各改各的，排查�
 
 ## 6. 渲染质量的几个关键开关（改动前先读）
 
-1. **`premultipliedAlpha: false`**（两个引擎分支的 PIXI Application 参数）。
+1. **`premultipliedAlpha: false`**（当前 Pixi 6 渲染路径的 Application 参数）。
    透明窗口下预乘 alpha 会让抗锯齿的半透明边缘与桌面底色混合出一圈发白描边。
    实测确认：GPU 审计里 `glAttrs.premultipliedAlpha = false`、`antialias = true`（WebGL2）。
 2. **`hasShadow: false` + `backgroundColor: '#00000000'`**（主窗口与浮窗）。透明无边框窗口上
    系统阴影会渲染成角色外圈的灰色光晕。
 
-### 6.0 贴图：引擎的 `lod` 开关无效，改用**自己降采样**
+### 6.0 贴图与设备像素比
 
-**（a）引擎的 `textureOptions.lod` 是无效的 —— 别再被它误导。**
-`src/renderer/live2d.ts` 里的 `lod: 'single-auto'` 在**当前运行库 + 本工程加载路径**下
-对画面没有可测量影响。同一模型、同一取景、只改这一个值实测：
-
-| 取值 | GPU 审计里贴图 source→effective |
-|---|---|
-| `false` | 8192² → 8192² |
-| `'single-auto'` | 8192² → 8192² |
-| `'full'` | 8192² → 8192² |
-
-`effective` 始终等于 `source`，说明纹理**没有**走引擎那条 LOD 分支（走了的话 `effective` 会明显更小）。
-**不要用这个开关当作"毛边已解决"或"显存已下降"的依据。**
-
-**（b）真正生效的是 `downscaleModelTextures()`（`TEXTURE_MAX_EDGE = 2048`）。**
-在贴图**进显存之前**（必须在 `texture.bind` 之前调用，见源码里的时序注释）把原图 drawImage 到
-缩小后的 canvas，再换掉 Pixi TextureSource 的 `resource`。实测（`PET_GPU_AUDIT=1`）：
-
-```
-改前 textureLod: 4096x4096, 4096x4096, 8192x8192, 8192x8192
-改后 textureLod: 2048x2048, 2048x2048, 2048x2048, 2048x2048
-```
-
-- 显存：**640 MB → 64 MB（降约 90%）**
-- 帧耗时：6.03ms → 5.44ms
-- 依据：桌宠里模型只占屏约 200×470 逻辑像素（DPR 1.5 约 300×700 设备像素），
-  2048² 余量充足（即便 DPR=2 且半身放大 2.5 倍也不到 1200 设备像素）。
-
-**（c）关于"有没有变好看"：现有像素指标判定不了，别拿它下结论。**
-加了 A/A 对照（**同一配置**跑两次）后发现：`aliasEnergy` 波动达 **±39%**、`hardEdgeRate` ±38.7%，
-因为模型一直在呼吸/动作，两次截图的动画相位不同（实测两张 PNG 逐字节不同）。
-这个噪声远大于要检测的效应，所以早期"改前 28.47 → 改后 34.17"之类的数字**都是噪声**。
-要判定画质，得先冻结动画（固定参数+固定时间步）再比；这一步尚未做。
-
-设备像素比（DPR）在 `refit()` 内每帧检测：窗口跨屏拖动或改系统缩放时 DPR 会变而宽高不变，
-漏检会让画布缓冲停在旧倍率上（发虚或白耗显存）。
+- 运行库为 Pixi 6.5.10 + pixi-live2d-display 0.4.0（见 `src/renderer/lib/VERSIONS.md`）：
+  贴图按模型原始尺寸上传；旧栈里 `textureOptions.lod` 的实验与自研降采样随换栈一并删除，
+  不要再加回 `lod`/`downscaleModelTextures` 这类代码。
+- 设备像素比（DPR）在 `refit()` 内每次重排时检测：窗口跨屏拖动或改系统缩放时 DPR 会变而宽高不变，
+  漏检会让画布缓冲停在旧倍率上（发虚或白耗显存）。
 
 ### 6.0.1 WebGL 上下文必须成对释放（长期挂机的稳定性前提）
 
@@ -298,7 +272,7 @@ API Key 丢了 / 设置改了不生效"——两套配置各改各的，排查�
 
 | 退出路径 | 处理 |
 |---|---|
-| `app.init()` 失败 | `app.destroy(true)` |
+| `PIXI.Application` 构造失败 | 直接 `return null`（构造失败时没有可销毁的渲染器） |
 | 拿不到 canvas（`!view`） | `app.destroy(true)` |
 | `.from()` 期间被弃用（`destroyed`） | `model.destroy()` **且** `app.destroy()` ← 曾漏掉 app，已修 |
 | 加载 reject（`.catch`） | `app.destroy(true)` |
@@ -835,13 +809,13 @@ stdio 用 `command/args/cwd/env`，http 用 `url/headers`；`toolCallTimeoutMs` 
 ## 7.11 远程访问 / WebSocket / 手机 MCP 桥接（PC 端）
 
 - **局域网开关**：设置页「允许局域网访问」（`mcpServerLanEnabled`，默认关闭）；关闭时只监听 127.0.0.1，开启时监听 0.0.0.0 并要求 Bearer token（明文 HTTP，仅可信网络；防火墙需放行端口）。
-- **双通道**：HTTP `POST /mcp`（既有）与 WebSocket `/ws`。手机/浏览器 WS 无法自定义 Authorization 头，token 走 query，服务端用 timingSafeEqual 校验；最小 RFC6455 实现（握手/mask/分片合并/ping-pong/close），与 HTTP 共用同一 JSON-RPC dispatch。
+- **双通道**：HTTP `POST /mcp`（既有）与 WebSocket `/ws`。手机/浏览器 WS 无法自定义 Authorization 头，token 走 query，服务端用 timingSafeEqual 校验；自实现的最小 RFC6455 实现（握手/mask/ping-pong/close，**不支持分片/续帧**），与 HTTP 共用同一 JSON-RPC dispatch。
 - **手机原生工具桥**（VCPToolBox 异步插件 + qq-bridge host bridge 思路）：
   - 手机调 `phone/register` 上报工具（名称白名单校验，最多 32 个）；
   - PC 端 `tools/list` 动态合并为 `phone_<name>`，schema/annotations 均来自手机上报，不硬编码；
-  - PC 端调用 `phone_*` → 手机 `phone/poll` 长轮询取任务 → 执行 → `phone/result` 回执 → 调用方拿到结果；默认 30s 超时返回 isError（fail-closed），dispose 清理 pending/等待者；
+- PC 端调用 `phone_*` → 手机 `phone/poll` 长轮询取任务 → 执行 → `phone/result` 回执 → 调用方拿到结果；默认 30s 超时返回 isError（fail-closed）；超时调用会同步从队列摘除，socket 断开/dispose 时确认请求按 disconnect 结算。
   - 手机工具数量/可用列表进入启动日志与 `/mcp` 状态文本。
-- **Android 客户端**：`android-mcp-client/`（Kotlin + Compose，WS 优先、HTTP 回退；工具列表运行时拉取；每调用带超时与错误提示；危险工具二次确认；手机原生能力注册）。构建需 JDK 17 + Android SDK 35，本仓库开发机未装，APK 需在 Android Studio 构建。
+- **Android 客户端**：`android-mcp-client/`（Kotlin + Compose，WS 优先、HTTP 回退；工具列表运行时拉取；每调用带超时与错误提示；危险工具二次确认；手机原生能力注册）。构建需 JDK 17 + Android SDK 35；预构建 debug 包见 `android-mcp-client/PetMcpClient-debug.apk`，协议/UI/安全设计见 `docs/ANDROID_MCP_CLIENT.md`。
 
 ## 7.12 自主任务思考回看（对话信息）
 
@@ -853,7 +827,7 @@ stdio 用 `command/args/cwd/env`，http 用 `url/headers`；`toolCallTimeoutMs` 
 
 ## 7.13 手机端能力接口（头像流 / 触摸 / 思考对话）
 
-- `pet/avatarStart` / `pet/avatarStop`（WS 扩展）：订阅后电脑端以 ~42ms 间隔抓桌宠窗口（`BrowserWindow.capturePage`，默认缩到 300px 宽）并推 `pet/avatarFrame` 通知（PNG base64）；上一帧未编码完时跳帧（背压）；实测约 21–22fps（目标 24），停止后立即不再推送；
+- `pet/avatarStart` / `pet/avatarStop`（WS 扩展）：订阅后电脑端以 50ms 间隔（20fps）抓桌宠窗口（`BrowserWindow.capturePage`，默认缩到 300px 宽）并推 `pet/avatarFrame` 通知（PNG base64）；上一帧未编码完时跳帧（背压）；停止后立即不再推送；
 - 工具 `pet_avatar`：一次性抓帧（HTTP 回退/单帧预览用）；
 - 工具 `pet_touch`：`{action:'move'|'click', x, y}`，x/y 为桌宠窗口归一化坐标；move 合成全局光标位置触发视线跟随（触摸后 1.5s 内真实鼠标轮询不覆盖）；click 在桌宠窗口内发一次左键单击（不做拖动）；
 - 工具 `pet_chat_detail`：在 `pet_chat` 基础上返回思考过程（手机对话页用，消耗模型额度）；

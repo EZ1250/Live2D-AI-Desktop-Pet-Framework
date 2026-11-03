@@ -37,8 +37,9 @@
 | 开发 | `public/assets` | `public/renderer` |
 | 打包 | `resources/assets` | `resources/renderer` |
 
-`PathResolver` 按打包状态与目录存在性选择资源根，不依赖环境变量。渲染页加载失败时依次回退
-`public/renderer/index.html` → `resources/renderer/index.html` → `dist/renderer/index.html`；
+`PathResolver` 按打包状态与目录存在性选择资源根，不依赖环境变量。渲染页加载顺序：
+静态服务根下 `renderer/index.html`（开发 `public/`、打包 `resources/`）→ 根下 `index.html` →
+asar 内 `renderer/index.html` → asar 内 `public/renderer/index.html` → `dist/renderer/index.html`。
 `dist/renderer/` 因此是**故意的兜底副本**，不是冗余产物。
 
 ## 生成物与命令
@@ -92,6 +93,19 @@
   随机 `openY`（0.15~0.75，TTL 150ms）驱动当前 handle：有 `applySpeech` 走语音层，
   没有则退回 `applyTrackingFrame({ mouth: { openY } })`；音频 `ended`/`error`/`pause`
   时停止并归零。
+
+## 对话朗读（Edge TTS）
+
+- 设置项：`AppSettings.ttsEnabled`（默认关）与 `ttsVoice`（Edge 音色短名，空=默认
+  `zh-CN-XiaoxiaoNeural`）。写入侧 `sanitizeSettings`、读取侧 `loadAppSettings`、契约
+  `contracts.ts`、设置页 UI 四处必须同步（漏读取侧会"保存后重启丢失"）。
+- 请求：渲染层每次朗读生成 `requestId`，经 `ttsSpeak(text, voice, requestId)` →
+  `IPC_TTS_SPEAK`；主进程合成后把音频与同一个 `requestId` 经 `IPC_TTS_AUDIO` 推回。
+- 渲染层**只播放 `requestId` 等于最新一次请求的音频**（旧请求晚到的结果直接丢弃）；
+  关闭朗读时会作废在途请求，关掉后不会再出声。
+- 文本上限：主进程 `edgeTts.MAX_TEXT_CHARS`（2000 字）；渲染层按同一上限截断后再请求，
+  两边常量必须一致（`tests/assetIntegrity.test.js` 有断言）。
+- 合成失败不抛异常：`ttsService.speak()` 返回 `ok:false + error`，渲染层写设置页状态行。
 
 ## 第三方资源授权
 

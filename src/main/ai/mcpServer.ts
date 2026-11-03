@@ -124,7 +124,7 @@ const TOOL_DEFS = [
       },
       required: ['question'],
     },
-    annotations: { readOnlyHint: false },
+    annotations: { readOnlyHint: false, timeoutMs: 120_000 },
   },
   {
     name: 'pet_note_add',
@@ -149,7 +149,7 @@ const TOOL_DEFS = [
     name: 'pet_avatar',
     description: '抓取当前桌宠窗口的一帧画面（手机端 Live2D 头像用）。maxWidth 可选（120~640）。',
     inputSchema: { type: 'object', properties: { maxWidth: { type: 'number' } } },
-    annotations: { readOnlyHint: true },
+    annotations: { readOnlyHint: true, timeoutMs: 15_000 },
   },
   {
     name: 'pet_touch',
@@ -169,19 +169,19 @@ const TOOL_DEFS = [
     name: 'pet_chat_history',
     description: '读取电脑端聊天历史：不传 sessionId 返回会话列表（JSON）；传 sessionId 返回该会话最近消息（JSON，role/text/at）。',
     inputSchema: { type: 'object', properties: { sessionId: { type: 'string' }, limit: { type: 'number' } } },
-    annotations: { readOnlyHint: true },
+    annotations: { readOnlyHint: true, timeoutMs: 15_000 },
   },
   {
     name: 'pet_chat_detail',
     description: '让桌宠 AI 回复；返回 JSON 文本 {"reply": string, "thinking": string}（手机对话页用；会消耗模型额度）。',
     inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
-    annotations: { readOnlyHint: false },
+    annotations: { readOnlyHint: false, timeoutMs: 120_000 },
   },
   {
     name: 'pet_screenshot',
     description: '截取当前整个屏幕（PNG），返回图片与保存路径。注意：内容可能含用户隐私，只在用户知情时调用。',
     inputSchema: { type: 'object', properties: {} },
-    annotations: { readOnlyHint: false },
+    annotations: { readOnlyHint: false, timeoutMs: 30_000 },
   },
 ];
 
@@ -377,9 +377,19 @@ export class PetMcpServer {
     await this.start();
   }
 
+  /** 手机确认请求：socket 断开或 dispose 时必须统一结算，否则工具调用要白等满 120s */
+  private settlePendingConfirms(choice: string): void {
+    for (const [id, pending] of this.pendingConfirms) {
+      clearTimeout(pending.timer);
+      this.pendingConfirms.delete(id);
+      pending.resolve(choice);
+    }
+  }
+
   dispose(): void {
     for (const pending of this.pendingPhoneCalls.values()) clearTimeout(pending.timer);
     this.pendingPhoneCalls.clear();
+    this.settlePendingConfirms('disconnect');
     this.phoneWaiters.clear();
     this.phoneQueue.length = 0;
     const srv = this.server;
@@ -513,10 +523,13 @@ export class PetMcpServer {
       socket.on('close', () => {
         this.stopAvatarStream(socket);
         this.wsSockets.delete(socket);
+        // 最后一个连接断开时，挂着的手机确认立即按 disconnect 结算（fail-closed）
+        if (this.wsSockets.size === 0) this.settlePendingConfirms('disconnect');
       });
       socket.on('error', () => {
         this.stopAvatarStream(socket);
         this.wsSockets.delete(socket);
+        if (this.wsSockets.size === 0) this.settlePendingConfirms('disconnect');
       });
     } catch (err) {
       this.log(`MCP 服务端：WS 握手异常（${(err as Error).message}）`);
@@ -836,6 +849,8 @@ export class PetMcpServer {
   }
 
   private deliverPhoneCall(call: PendingPhoneCall): void {
+    // 调用可能已超时/被取消：只投递仍挂在 pendingPhoneCalls 里的调用
+    if (!this.pendingPhoneCalls.has(call.id)) return;
     for (const waiter of this.phoneWaiters) {
       this.phoneWaiters.delete(waiter);
       waiter(call);
@@ -845,7 +860,9 @@ export class PetMcpServer {
   }
 
   private waitPhoneCall(waitMs: number): Promise<PendingPhoneCall | null> {
-    const queued = this.phoneQueue.shift();
+    // 队列里可能有已超时的残留：只领取仍在 pending 的调用，避免把过期指令发给手机
+    let queued = this.phoneQueue.shift();
+    while (queued && !this.pendingPhoneCalls.has(queued.id)) queued = this.phoneQueue.shift();
     if (queued) return Promise.resolve(queued);
     return new Promise((resolve) => {
       const waiter = (call: PendingPhoneCall | null): void => {
@@ -867,6 +884,9 @@ export class PetMcpServer {
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.pendingPhoneCalls.delete(id);
+        // 同步从投递队列摘掉：否则手机下一次 poll 会领到这条已经超时的调用
+        const at = this.phoneQueue.findIndex((call) => call.id === id);
+        if (at >= 0) this.phoneQueue.splice(at, 1);
         resolve({ isError: true, content: [{ type: 'text' as const, text: `手机端在 ${timeoutMs}ms 内没有返回结果（工具：${name}）` }] });
       }, timeoutMs);
       timer.unref?.();
@@ -881,11 +901,28 @@ export class PetMcpServer {
     });
   }
 
+  /**
+   * 手机端回执。兼容两种载荷：
+   *   标准（当前文档/手机端）：{id, result?:{content}, error?:{code,message}}
+   *   旧版（历史测试）：{id, content} 或 {id, text}
+   */
   private resolvePhoneCall(id: string, params: Record<string, unknown>): void {
     const pending = this.pendingPhoneCalls.get(id);
     if (!pending) return; // 已超时/重复回执：忽略
     this.pendingPhoneCalls.delete(id);
-    const rawContent = Array.isArray(params.content) ? params.content : [];
+    const result = params.result && typeof params.result === 'object' ? (params.result as Record<string, unknown>) : null;
+    const error = params.error && typeof params.error === 'object' ? (params.error as Record<string, unknown>) : null;
+    if (error) {
+      const message = typeof error.message === 'string' && error.message ? error.message : '手机端执行失败';
+      const code = typeof error.code === 'string' ? `（${error.code}）` : '';
+      pending.resolve({ isError: true, content: [{ type: 'text' as const, text: `${message}${code}` }] });
+      return;
+    }
+    const rawContent = Array.isArray(result?.content)
+      ? (result.content as unknown[])
+      : Array.isArray(params.content)
+        ? (params.content as unknown[])
+        : [];
     const content = rawContent.length
       ? rawContent
       : [{ type: 'text' as const, text: typeof params.text === 'string' ? params.text : '手机端已完成' }];

@@ -1,52 +1,31 @@
-# 渲染运行库版本与来源（**已升级到 Cubism 5**，2026-09-23）
+# 渲染运行库版本与来源
 
-> 改运行库前先看 `docs/MODEL_COMPAT.md` §3「运行库升级」——那里记着踩过的坑与验证方法。
-> 重取整套：`node scripts/fetch-live2d-runtime.js`
+> 重取整套：`node scripts/fetch-live2d-runtime.js`；改运行库前先看 `docs/MODEL_COMPAT.md` §3。
 
 ## 当前随包
 
 | 文件 | 版本 / 来源 | 许可 | 能读的 moc3 |
 |---|---|---|---|
-| `pixi.min.js` | PixiJS **8.14.0**（`pixi.js@8.14.0/dist/pixi.min.js`，693KB） | MIT | — |
-| `live2dcubismcore.min.js` | Live2D Cubism Core **5.0**（官方 CDN `sdk-web/cubismcore/live2dcubismcore.min.js`，202KB） | Live2D Proprietary Software License（Redistributable） | **v3 / v4 / v5** |
-| `live2d-engine.min.js` | **`untitled-pixi-live2d-engine@1.4.0`** 的 `dist/cubism.min.js`（218KB，Pixi8 原生 RenderPipe；另有 `cubism-legacy.min.js` 支持 Cubism 2） | MIT（引擎）+ Live2D Cubism SDK 许可（内含 Cubism 5 框架） | v3 / v4 / v5 |
+| `pixi.min.js` | PixiJS **6.5.10**（`pixi.js@6.5.10/dist/browser/pixi.min.js`，460KB） | MIT | — |
+| `live2dcubismcore.min.js` | Live2D Cubism Core **5.1**（官方 CDN `sdk-web/cubismcore/live2dcubismcore.min.js`，207KB；`csmGetVersion()=0x05010000`） | Live2D Proprietary Software License（Redistributable） | **v3 / v4 / v5** |
+| `live2d-engine.min.js` | **`pixi-live2d-display@0.4.0`** 的 `dist/cubism4.min.js`（120KB） | MIT（引擎）+ Live2D Cubism SDK 许可（内含 Cubism 框架） | v3 / v4 / v5 |
 
-**为什么是 Core 5.0 而不是更新的 5.3/Core 6**：引擎 1.4.0 内含的框架镜像与 **Core 5.0 的 API 对齐**；
-换成 SDK R5 的 Core 6（moc3 v6）后，`getDrawableRenderOrders()` 返回 undefined，渲染直接抛
-`TypeError: Cannot read properties of undefined (reading '0')`（实测）。所以随包锁 **Core 5.0**，
-moc3 v6（Cubism 5.3）模型由体检层明确标成超出上限（`unsupported`）并给出出路。
+## 为什么是这套
 
-## 升级后为了让新引擎正常工作，代码里做了这 4 处兼容（都在 `src/renderer/live2d.ts`）
+- **单一渲染路径**：`live2d.ts` 只按 Pixi 6 + pixi-live2d-display 0.4 写，不按 `PIXI.VERSION` 分流，
+  也没有旧栈的 Pixi 8 专属补丁（`_gpuData` / `useHighPrecisionMask` / `registerTicker` / `window.app`）。
+- **VTS 模型支持**（`live2d.ts`，模型目录里有 `.vtube.json` 时）：
+  1) 表情（Exp3）与动作（Animation）合并进 `FileReferences`（否则右键菜单是空的）；
+  2) 读 `ParameterSettings` 做参数映射（`FaceAngleX → AngleX/PositionX` 等自定义控制器参数），
+     在 `internalModel.updateFocus` 里写参数（motion/表情/眨眼之后、呼吸/物理之前，物理会跟随头部）。
+     映射只接管它真正写到的参数：没被映射覆盖的标准参数仍走原有驱动；
+     不支持的输入（如 `VoiceA`）在启动日志里列一次；
+  3) `pet-model.json` 的 `hiddenDrawables` 在每次 draw 前按 **drawable ID** 隐藏指定遗留贴图
+     （不依赖序号/绘制顺序）；接管失败或 ID 找不到会打 warn，不会静默失效。
+- **上限 moc3 v5**：moc3 v6（Cubism 5.3）不支持 —— Core 5.1 读不了 v6，Core 6 与引擎内含框架不匹配。
 
-1. **按 Pixi 版本自动分流**：`PIXI.VERSION` 主版本 ≥8 走 `new Application()` + `await app.init(...)`，
-   否则走旧的构造式写法 —— 同一份代码两代运行库都能跑。
-2. **设置文件归一化**（`normalizeModelSettings`）：新引擎在模型没写 `HitAreas` 时会
-   `TypeError: _a.map is not a function`（框架把 JSON 键名字符串 `Object.assign` 进了设置对象），
-   喂库前在内存里补 `HitAreas: []`（同时补 `url` / Textures / Expressions / Motions 的形态）。
-3. **三处新引擎必需的接线**（仅 Pixi8 分支）：
-   - `Live2DModel.registerTicker(PIXI.Ticker)`：不注册则动作/物理/顶点更新不被驱动；
-   - `model.renderer = app.renderer` + 全局 `window.app`：否则它的绘制回调**静默不画**；
-   - 贴图源补 `_gpuData` 字段（Pixi 8.13+ 的 `TextureSource` 没有这个字段，引擎读它会抛
-     `Failed to upload Live2D texture.`），并关闭高精度遮罩（`useHighPrecisionMask(false)`）。
-4. **参数容器两代兼容**：老栈读 `coreModel._model.parameters`，新栈读
-   `_parameterValues` / `_parameterMinimumValues` / `_parameterMaximumValues`；
-   参数名→索引先扫 `_parameterIds`（csmString 取值），再退回 `getParameterIndex` 且必须落在合法区间
-   （新框架对找不到的 id 会返回 count 这个越界哨兵）。
+## 下载脚本行为
 
-## 实测结果（升级后）
-
-按 **moc3 版本**归纳（不列用户模型名称）：
-
-| moc3 版本 | 结果 |
-|---|---|
-| v3 | ✅ 正常渲染；`ParamAngleX/Y/Z`、眼、嘴参数全部解析到（头/眼跟踪 + 口型可用） |
-| v4 | ✅ 正常渲染 |
-| v5（Cubism 5） | ✅ 正常渲染（升级前只能是占位卡） |
-| 立绘（PNG portrait） | ✅ 正常渲染 |
-| v6（Cubism 5.3） | ⚠️ 体检标 `unsupported`（引擎框架与 Core 6 不匹配，等引擎更新） |
-
-## 回退办法（万一新栈出问题）
-
-老栈三件套可从上游版本重新获取（Core 4.2）；本目录只保留当前运行库。
-`pixi.js@6.5.10/dist/browser/pixi.min.js` 与 `pixi-live2d-display@0.4.0/dist/cubism4.min.js`；
-`live2d.ts` 里两代运行库都兼容，换回文件即可（不需要改代码）。
+`scripts/fetch-live2d-runtime.js`：先写同目录临时文件，校验体积区间与版本标记
+（`pixi.js - v6.5.10`、`MocVersion_50=5`、`Cubism4ModelSettings` + `VERSION="0.4.0"`）后原子 rename；
+任一步失败保留旧运行库并删除临时文件；同时清理清单外的旧文件（如 `live2d-engine-cubism2.min.js`）。

@@ -292,7 +292,7 @@ export function validateModelDir(dir: string): UserModelEntry {
       // 版本上限来自随包运行库自身的 MocVersion 枚举（见 modelCompat.coreMaxMocVersion），
       // 换 Core 后自动跟着变，不再是写死的 Set([3,4])。
       issues.push(
-        `该模型是 Cubism ${entry.mocVersion} 导出，随包运行库最高认到 Cubism 4.2（moc3 v${compat.coreMax}）—— 会显示为占位卡片`
+        `该模型是 moc3 v${entry.mocVersion}，随包运行库最高支持 moc3 v${compat.coreMax} —— 会显示为占位卡片`
       );
     }
   }

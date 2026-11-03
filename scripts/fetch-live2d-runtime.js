@@ -1,135 +1,138 @@
-'use strict';
+#!/usr/bin/env node
 /**
- * fetch-live2d-runtime.js —— 一键安装「最新 Live2D 运行库三件套」到 src/renderer/lib/
+ * fetch-live2d-runtime.js —— 把 Live2D 运行库三件套重新下载到 src/renderer/lib/
  *
- *   1) PixiJS 8 浏览器全局构建（MIT）
- *   2) untitled-pixi-live2d-engine 的 cubism（现代，Cubism 3/4/5）与 cubism-legacy（Cubism 2）构建
- *      —— 引擎内含 Cubism 5 框架镜像，MIT（引擎）+ Live2D Cubism SDK 许可（框架）
- *   3) 官方 Cubism Core：默认取 **Core 5.0**（moc3 v5），因为引擎 1.4.0 的框架与 Core 5.0 对齐；
- *      官方 SDK R5 的 Core（moc3 v6）会让引擎的 getDrawableRenderOrders() 拿到 undefined 而崩，
- *      所以只在需要 v6 时才用 --sdk-core 显式安装（装完记得实跑一遍验证）。
+ *   pixi.min.js               PixiJS 6.5.10 浏览器全局构建（MIT）
+ *   live2dcubismcore.min.js   Live2D Cubism Core 5.x（专有许可，可再分发；最高 moc3 v5）
+ *   live2d-engine.min.js      pixi-live2d-display 0.4.0 的 cubism4 构建（MIT + Cubism SDK 许可）
  *
- * 用法：
- *   node scripts/fetch-live2d-runtime.js                     # 装当前推荐组合（Pixi8 + 引擎1.4.0 + Core 5.0）
- *   node scripts/fetch-live2d-runtime.js --pixi 8.14.0 --engine 1.4.0
- *   node scripts/fetch-live2d-runtime.js --sdk-core --sdk-zip <CubismSdkForWeb-5-r.5.zip>   # 装 Core 6（实验）
- *   node scripts/fetch-live2d-runtime.js --stable             # 回退到 Pixi6 + cubism4 0.4.0 + Core 4.2（老栈）
+ * 写入策略：先下到同目录临时文件 → 校验（体积 / 版本标记）→ 原子 rename 覆盖。
+ * 任一步失败都会保留旧运行库、删除临时文件，不会留下半截文件（半截文件会让渲染层静默降级）。
+ *
+ * 用法：node scripts/fetch-live2d-runtime.js
  */
+'use strict';
+
 const fs = require('fs');
-const path = require('path');
 const https = require('https');
+const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
 const LIB = path.join(ROOT, 'src', 'renderer', 'lib');
-const arg = (name, dflt) => {
-  const i = process.argv.indexOf(name);
-  return i > 0 && process.argv[i + 1] && !process.argv[i + 1].startsWith('--') ? process.argv[i + 1] : dflt;
-};
-const has = (name) => process.argv.includes(name);
-const PIXI_VER = arg('--pixi', '8.14.0');
-const ENGINE_VER = arg('--engine', '1.4.0');
-const SDK_VER = arg('--sdk', '5-r.5');
 
-const CORE_STABLE = 'https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js'; // Core 5.0（moc3 v5）
-const PIXI_STABLE = 'https://cdn.jsdelivr.net/npm/pixi.js@6.5.10/dist/browser/pixi.min.js';
-const LEGACY_ENGINE = 'https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js';
-const CORE_LEGACY = 'https://cdn.jsdelivr.net/gh/guansss/pixi-live2d-display@master/core/live2dcubismcore.min.js';
+const SOURCES = [
+  {
+    file: 'pixi.min.js',
+    url: 'https://cdn.jsdelivr.net/npm/pixi.js@6.5.10/dist/browser/pixi.min.js',
+    minBytes: 400 * 1024,
+    maxBytes: 600 * 1024,
+    mustContain: ['pixi.js - v6.5.10', 'PIXI'],
+  },
+  {
+    file: 'live2dcubismcore.min.js',
+    url: 'https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js',
+    minBytes: 150 * 1024,
+    maxBytes: 400 * 1024,
+    mustContain: ['MocVersion_50=5', 'Live2DCubismCore'],
+  },
+  {
+    file: 'live2d-engine.min.js',
+    url: 'https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js',
+    minBytes: 100 * 1024,
+    maxBytes: 300 * 1024,
+    mustContain: ['Cubism4ModelSettings', 'VERSION="0.4.0"'],
+  },
+];
+
+/** 当前运行库清单之外的旧文件：换栈后必须清掉，否则会被 assemble 整目录拷进安装包 */
+const STALE_FILES = ['live2d-engine-cubism2.min.js'];
 
 function download(url, dest, redirects = 5) {
   return new Promise((resolve, reject) => {
-    https
-      .get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
-        const code = res.statusCode || 0;
-        if (code >= 300 && code < 400 && res.headers.location && redirects > 0) {
-          res.resume();
-          return resolve(download(new URL(res.headers.location, url).toString(), dest, redirects - 1));
-        }
-        if (code !== 200) {
-          res.resume();
-          return reject(new Error(`HTTP ${code} @ ${url}`));
-        }
-        const out = fs.createWriteStream(dest);
-        res.pipe(out);
-        out.on('finish', () => out.close(() => resolve(dest)));
-        out.on('error', reject);
-      })
-      .on('error', reject)
-      .setTimeout(120000, function () {
-        this.destroy(new Error('timeout'));
+    const req = https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      const code = res.statusCode || 0;
+      if (code >= 300 && code < 400 && res.headers.location && redirects > 0) {
+        res.resume();
+        resolve(download(new URL(res.headers.location, url).toString(), dest, redirects - 1));
+        return;
+      }
+      if (code !== 200) {
+        res.resume();
+        reject(new Error(`HTTP ${code} @ ${url}`));
+        return;
+      }
+      const declared = Number(res.headers['content-length']);
+      const out = fs.createWriteStream(dest);
+      let settled = false;
+      const fail = (err) => {
+        if (settled) return;
+        settled = true;
+        out.destroy();
+        try { req.destroy(); } catch { /* already gone */ }
+        reject(err);
+      };
+      out.on('error', fail);
+      out.on('finish', () => {
+        if (settled) return;
+        settled = true;
+        out.close((err) => (err ? reject(err) : resolve({ declared })));
       });
+      res.on('error', fail);
+      res.on('aborted', () => fail(new Error(`下载中断 @ ${url}`)));
+      res.pipe(out);
+    });
+    req.on('error', reject);
+    req.setTimeout(120_000, () => req.destroy(new Error(`下载超时 @ ${url}`)));
   });
 }
 
-const kb = (p) => `${(fs.statSync(p).size / 1024).toFixed(0)}KB`;
-const mocVersionOf = (file) => {
-  const t = fs.readFileSync(file, 'utf8');
-  return Math.max(...[...t.matchAll(/MocVersion_[A-Za-z0-9_]+=(\d+)/g)].map((m) => Number(m[1])), 0);
-};
-
-async function installStable() {
-  await download(PIXI_STABLE, path.join(LIB, 'pixi.min.js'));
-  await download(LEGACY_ENGINE, path.join(LIB, 'cubism4.min.js'));
-  await download(CORE_LEGACY, path.join(LIB, 'live2dcubismcore.min.js'));
-  fs.rmSync(path.join(LIB, 'live2d-engine.min.js'), { force: true });
-  fs.rmSync(path.join(LIB, 'live2d-engine-cubism2.min.js'), { force: true });
-  console.log('[runtime] 已装回老栈：Pixi 6.5.10 + cubism4 0.4.0 + Core（最高 moc3 v%d）', mocVersionOf(path.join(LIB, 'live2dcubismcore.min.js')));
-  console.log('[runtime] 别忘了把 src/renderer/index.html 的脚本名换回 cubism4.min.js');
+function verify(item, file, declared) {
+  const size = fs.statSync(file).size;
+  if (size < item.minBytes || size > item.maxBytes) {
+    throw new Error(`${item.file} 体积异常（${size}B，期望 ${item.minBytes}~${item.maxBytes}B）`);
+  }
+  if (Number.isFinite(declared) && declared > 0 && size !== declared) {
+    throw new Error(`${item.file} 未下完（${size}B / Content-Length ${declared}B）`);
+  }
+  const text = fs.readFileSync(file, 'utf8');
+  for (const marker of item.mustContain) {
+    if (!text.includes(marker)) throw new Error(`${item.file} 内容校验失败：缺少标记 "${marker}"（可能被 CDN 换成了别的版本）`);
+  }
+  return size;
 }
 
-(async () => {
+async function main() {
   fs.mkdirSync(LIB, { recursive: true });
-  if (has('--stable')) return installStable();
-
-  const report = [];
-  await download(`https://cdn.jsdelivr.net/npm/pixi.js@${PIXI_VER}/dist/pixi.min.js`, path.join(LIB, 'pixi.min.js'));
-  report.push(`pixi.min.js            ← pixi.js@${PIXI_VER} (${kb(path.join(LIB, 'pixi.min.js'))})`);
-
-  await download(
-    `https://cdn.jsdelivr.net/npm/untitled-pixi-live2d-engine@${ENGINE_VER}/dist/cubism.min.js`,
-    path.join(LIB, 'live2d-engine.min.js'),
-  );
-  report.push(`live2d-engine.min.js   ← untitled-pixi-live2d-engine@${ENGINE_VER} (${kb(path.join(LIB, 'live2d-engine.min.js'))})`);
-  await download(
-    `https://cdn.jsdelivr.net/npm/untitled-pixi-live2d-engine@${ENGINE_VER}/dist/cubism-legacy.min.js`,
-    path.join(LIB, 'live2d-engine-cubism2.min.js'),
-  );
-  report.push(`live2d-engine-cubism2  ← 同上 legacy 构建（Cubism 2.1，${kb(path.join(LIB, 'live2d-engine-cubism2.min.js'))}）`);
-
-  if (has('--sdk-core')) {
-    // 实验：用官方 SDK R5 的 Core 6（moc3 v6）—— 引擎 1.4.0 不匹配，装完必须实跑验证
-    const zipArg = arg('--sdk-zip', '');
-    let zip = zipArg && fs.existsSync(zipArg) ? zipArg : '';
-    if (!zip) {
-      const cache = path.join(require('os').tmpdir(), 'pet-cubism-sdk-cache');
-      fs.mkdirSync(cache, { recursive: true });
-      zip = path.join(cache, `CubismSdkForWeb-${SDK_VER}.zip`);
-      if (!fs.existsSync(zip) || fs.statSync(zip).size < 5_000_000) {
-        await download(`https://cubism.live2d.com/sdk-web/bin/CubismSdkForWeb-${SDK_VER}.zip`, zip);
+  const downloaded = [];
+  try {
+    for (const item of SOURCES) {
+      const dest = path.join(LIB, item.file);
+      const tmp = `${dest}.download`;
+      process.stdout.write(`下载 ${item.file} … `);
+      try {
+        const { declared } = await download(item.url, tmp);
+        const size = verify(item, tmp, declared);
+        fs.renameSync(tmp, dest); // 同目录 rename：原子替换，失败不会破坏旧文件
+        downloaded.push(item.file);
+        console.log(`${(size / 1024).toFixed(0)}KB`);
+      } catch (err) {
+        try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+        throw err;
       }
     }
-    const tmp = path.join(require('os').tmpdir(), `pet-core-${Date.now()}`);
-    fs.mkdirSync(tmp, { recursive: true });
-    const listFile = path.join(tmp, 'entries.txt');
-    const fd = fs.openSync(listFile, 'w');
-    require('child_process').spawnSync('tar', ['-tf', zip], { stdio: ['ignore', fd, 'inherit'] });
-    fs.closeSync(fd);
-    const entry = fs
-      .readFileSync(listFile, 'utf8')
-      .split('\n')
-      .map((s) => s.replace(/\r$/, '').trim())
-      .find((n) => /Core\/live2dcubismcore\.min\.js$/.test(n));
-    if (!entry) throw new Error('这个 zip 里没有 Core/live2dcubismcore.min.js');
-    require('child_process').spawnSync('tar', ['-xf', zip, '-C', tmp, entry], { stdio: 'inherit' });
-    fs.copyFileSync(path.join(tmp, entry), path.join(LIB, 'live2dcubismcore.min.js'));
-    fs.rmSync(tmp, { recursive: true, force: true });
-    console.log('[runtime] ⚠️ 已装 SDK R5 的 Core 6（moc3 v6）—— 引擎 1.4.0 实测不兼容，请实跑验证后再保留');
-  } else {
-    await download(CORE_STABLE, path.join(LIB, 'live2dcubismcore.min.js'));
+  } catch (err) {
+    console.error(`\n失败：${err && err.message ? err.message : err}`);
+    console.error('已下载完成的文件保留；未完成的三件套仍是旧版本（不会被半截文件覆盖）。');
+    process.exit(1);
   }
-  report.push(
-    `live2dcubismcore.min.js ← ${has('--sdk-core') ? `CubismSdkForWeb-${SDK_VER} 的 Core` : '官方 CDN Core 5.0'}（最高 moc3 v${mocVersionOf(path.join(LIB, 'live2dcubismcore.min.js'))}，${kb(path.join(LIB, 'live2dcubismcore.min.js'))}）`,
-  );
+  for (const stale of STALE_FILES) {
+    const p = path.join(LIB, stale);
+    if (fs.existsSync(p)) {
+      fs.rmSync(p, { force: true });
+      console.log(`已清理旧运行库：${stale}`);
+    }
+  }
+  console.log(`完成：src/renderer/lib/ 已更新（${downloaded.join(' / ')}）。下一步 npm run assemble 让渲染层生效。`);
+}
 
-  console.log('[runtime] 已安装：\n  ' + report.join('\n  '));
-  console.log('[runtime] 下一步：确认 src/renderer/index.html 引的是 lib/live2d-engine.min.js，然后 npm run build:all');
-})();
+main();
