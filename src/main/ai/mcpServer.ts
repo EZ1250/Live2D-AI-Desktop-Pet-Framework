@@ -35,6 +35,8 @@ export interface PetMcpServerDeps {
   chatHistory?(sessionId: string, limit: number): string;
   /** 带思考过程的外部 AI 回复 */
   chatDetail?(prompt: string): Promise<{ reply: string; thinking: string }>;
+  /** 任意一次 MCP 工具调用（含手机工具）成功后通知主进程，用于触发"行为触发 → MCP 调用" */
+  onToolCall?(name: string): void;
 }
 
 export interface PetMcpServerOptions {
@@ -778,6 +780,11 @@ export class PetMcpServer {
       case 'tools/call': {
         const name = typeof params.name === 'string' ? params.name : '';
         const args = (params.arguments ?? {}) as Record<string, unknown>;
+        try {
+          this.opts.deps.onToolCall?.(name);
+        } catch (err) {
+          this.log(`MCP 工具调用通知失败：${(err as Error).message}`);
+        }
         if (name.startsWith(PHONE_PREFIX)) {
           const phoneName = name.slice(PHONE_PREFIX.length);
           if (!this.phoneTools.has(phoneName)) {

@@ -52,7 +52,7 @@ export interface ScenarioOptions {
 export const DEFAULT_MAX_ENTRIES = 120;
 export const DEFAULT_MAX_TEXT_LEN = 160;
 export const DEFAULT_HALF_LIFE_MS = 30 * 60 * 1000;
-export const DEFAULT_INJECT_BUDGET = 1000;
+export const DEFAULT_INJECT_BUDGET = 2400;
 
 /** 情景提示词文件路径：<userData>/prompts/scenario-prompt.md */
 export function scenarioPromptPath(userDataDir: string): string {

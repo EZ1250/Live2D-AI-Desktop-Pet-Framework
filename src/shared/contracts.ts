@@ -411,6 +411,8 @@ export const IPC_VTS_EVENT_PUSH = 'vts:eventPush';
 export const IPC_TTS_SPEAK = 'pet:tts:speak';
 /** 主进程 push→renderer：一段合成好的语音（data URL，渲染层直接 new Audio 播放）。 */
 export const IPC_TTS_AUDIO = 'pet:tts:audio';
+/** invoke renderer→main：拉取 Edge TTS 全部可用音色（设置页"拉取音色列表"用，需联网）。 */
+export const IPC_TTS_VOICES = 'pet:tts:voices';
 
 /**
  * VTS 操作名（IPC_VTS_ACTION 的第一个参数）。
@@ -506,6 +508,23 @@ export interface VtsTrackingValues {
 
 /** 合成语音的 MIME（Edge TTS 输出 mp3） */
 export const TTS_AUDIO_MIME = 'audio/mpeg';
+
+/** 一个 Edge TTS 音色（设置页下拉用） */
+export interface TtsVoiceOption {
+  /** 合成时用的短名，如 zh-CN-XiaoxiaoNeural */
+  shortName: string;
+  /** 语言区域，如 zh-CN */
+  locale: string;
+  gender: string;
+  friendlyName?: string;
+}
+
+/** 拉取音色列表的结果（网络失败时 ok=false，前端保留内置候选） */
+export interface TtsVoiceListResult {
+  ok: boolean;
+  voices?: TtsVoiceOption[];
+  error?: string;
+}
 
 /** 主进程 → 渲染层的 TTS 载荷（ok=false 时 dataUrl 为空、error 有原因）。 */
 export interface TtsAudioPayload {
@@ -727,6 +746,8 @@ export interface ElectronAPI {
   onVtsEvent?(cb: (event: VtsEventDto) => void): () => void;
   /** 让主进程用 Edge TTS 合成一句话；音频经 onTtsAudio 推回来。 */
   ttsSpeak?(text: string, voice?: string, requestId?: string): Promise<{ ok: boolean; requestId?: string; error?: string; bytes?: number }>;
+  /** 拉取 Edge TTS 全部可用音色（需联网；失败返回 ok=false，不影响内置候选）。 */
+  ttsVoices?(): Promise<TtsVoiceListResult>;
   /** 订阅 TTS 合成结果（渲染层用 new Audio(payload.dataUrl).play() 播放）。 */
   onTtsAudio?(cb: (payload: TtsAudioPayload) => void): () => void;
   /** 待办笔记本：读取列表（TodoDto[]）。 */
@@ -800,10 +821,31 @@ export interface ElectronAPI {
 // ---------------------------------------------------------------------------
 
 /** 可绑定动作或表情的行为。 */
-export type BehaviorKey = 'user_message' | 'tool_call' | 'command_exec' | 'ai_start' | 'model_idle' | 'error';
+export type BehaviorKey =
+  | 'user_message'
+  | 'tool_call'
+  | 'command_exec'
+  | 'ai_start'
+  | 'model_idle'
+  | 'error'
+  | 'click'
+  | 'multiClick'
+  | 'drag'
+  | 'mcp';
 
 /** 全部行为键（顺序即设置页顺序）。 */
-export const BEHAVIOR_KEYS: BehaviorKey[] = ['user_message', 'tool_call', 'command_exec', 'ai_start', 'model_idle', 'error'];
+export const BEHAVIOR_KEYS: BehaviorKey[] = [
+  'user_message',
+  'tool_call',
+  'command_exec',
+  'ai_start',
+  'model_idle',
+  'error',
+  'click',
+  'multiClick',
+  'drag',
+  'mcp',
+];
 
 /** 行为中文名。 */
 export const BEHAVIOR_LABELS: Record<BehaviorKey, string> = {
@@ -813,6 +855,10 @@ export const BEHAVIOR_LABELS: Record<BehaviorKey, string> = {
   ai_start: '开始回答',
   model_idle: '待机搭话',
   error: '出错',
+  click: '点击一次',
+  multiClick: '连续点击',
+  drag: '拖动',
+  mcp: 'MCP 调用',
 };
 
 /**
@@ -854,9 +900,13 @@ export interface AppSettings {
   /** 上次用的模型名：启动时接着用它（不在列表里就退回第一项） */
   modelName?: string;
   /**
-   * 前台是全屏应用（游戏/视频/全屏文档）时自动收起桌宠，退出全屏后自动回来。
-   * 默认开启：桌宠是 alwaysOnTop，全屏时压在别人画面会很碍事。经托盘手动隐藏过则不再自动弹出。
+   * 前台全屏（游戏/视频/文档）时是否自动收起桌宠。
+   * **默认 false**：全屏时桌宠改用 screen-saver 顶层覆盖继续显示（不抢焦点、不改变其它窗口顺序）；
+   * 勾选后才会自动收起、退出全屏再自动回来。
+   * 旧字段 hideOnFullscreen 仅作兼容读取，不再决定行为。
    */
+  fullscreenAutoHide?: boolean;
+  /** @deprecated 旧版"全屏自动收起"字段，保留仅防止旧配置读取报错；行为以 fullscreenAutoHide 为准。 */
   hideOnFullscreen?: boolean;
   /**
    * 点击穿透：透明区域不拦截鼠标（点击落到下面的窗口/桌面），只有角色身体范围可交互。
@@ -899,6 +949,15 @@ export interface AppSettings {
   mailImapPass?: string;
   /** 行为触发映射：行为键 → 触发目标；缺失等价 'auto'，目标不存在则不触发。 */
   motionTriggers?: Partial<Record<BehaviorKey, MotionTriggerValue>>;
+  /**
+   * 行为触发时**额外播放**的目标（可选）：行为键 → 触发目标（编码同 motionTriggers，
+   * 可填动作组 `motion:x` 或表情 `expr:x`；旧版直接存表情名的配置按表情兼容）。
+   */
+  motionTriggerExpressions?: Partial<Record<BehaviorKey, string>>;
+  /**
+   * 附加目标的播放方式：`simultaneous`=与主目标同时生效（默认）/ `chain`=主目标之后接着播放。
+   */
+  motionTriggerPairModes?: Partial<Record<BehaviorKey, 'simultaneous' | 'chain'>>;
   /** 桌宠名字（用户在设置里可改）：注入人设（AI 自称）、问候语与输入框提示。空 = 用默认。 */
   petName?: string;
   /** MCP 服务端（反向接入）：是否开启、端口、访问 token（都只存本机 settings.json） */
@@ -934,6 +993,10 @@ export interface AppSettings {
    * 现在按模型名分桶保存；`motionTriggers` 保留为旧版兼容的全局回退。
    */
   motionTriggersByModel?: Record<string, Partial<Record<BehaviorKey, MotionTriggerValue>>>;
+  /** 行为触发时同时播放的表情（按模型分桶，与 motionTriggersByModel 同结构） */
+  motionTriggerExpressionsByModel?: Record<string, Partial<Record<BehaviorKey, string>>>;
+  /** 附加目标播放方式（按模型分桶；缺省 simultaneous） */
+  motionTriggerPairModesByModel?: Record<string, Partial<Record<BehaviorKey, 'simultaneous' | 'chain'>>>;
 }
 
 /** 渲染进程类型增强：window.electron 在全局可用。 */

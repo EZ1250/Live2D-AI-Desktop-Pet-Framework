@@ -588,6 +588,8 @@ body.is-dragover #stage::after {
   flex: 1 1 100%;
   margin: 0;
 }
+/* 空状态行不占高度：否则「试听语音」下面会凭空多出一行空白 */
+.settings-inline .settings-status:empty { display: none; min-height: 0; }
 
 /* MCP 状态是动态多行文本（含本机路径）：独立成卡片、显式换行，避免在 grid 行里被压成一行 */
 .settings-mcp-status {
@@ -819,9 +821,31 @@ body.is-dragover #stage::after {
 .settings-fieldset .settings-row { margin-top: 4px; }
 /* 状态文案（含长 URL）占满一整行：与按钮挤在同一行时既折不开也读不清 */
 .settings-fieldset .settings-status { flex: 1 1 100%; min-width: 0; }
-/* 行为触发行：行为名固定宽度，下拉占剩余宽度 */
+/* 行为触发行：行为名固定宽度，下拉占剩余宽度；中间是「同时/衔接」切换按钮 */
 #motion-trigger-body .settings-row > span { flex: 0 0 7.5em; }
+#motion-trigger-body .settings-row > .settings-row-sub { flex: 0 0 4.5em; opacity: 0.75; font-size: 12px; }
 #motion-trigger-body .settings-row select { flex: 1 1 10em; min-width: 0; }
+/* 「同时/衔接」切换按钮：沿用设置页深色按钮风格，避免浏览器默认白底 */
+#motion-trigger-body .settings-row > button.trigger-pair-mode {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  padding: 4px 10px;
+  font-size: 12px;
+  line-height: 1.2;
+  color: #fff;
+  cursor: pointer;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+}
+#motion-trigger-body .settings-row > button.trigger-pair-mode:hover { background: rgba(255, 255, 255, 0.16); }
+#motion-trigger-body .settings-row > button.trigger-pair-mode[data-mode='chain'] {
+  color: #9fe6bb;
+  border-color: rgba(159, 230, 187, 0.5);
+  background: rgba(159, 230, 187, 0.12);
+}
+/* 设置项旁边的浅色提示文字 */
+.settings-hint { color: rgba(255, 255, 255, 0.55); font-size: 12px; }
 
 /* 转写模型「按地址索引」的提示行：三档颜色复用资产徽章那套语义色 */
 .voice-model-hint.is-ok { color: #9fe6bb; }

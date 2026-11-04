@@ -892,11 +892,13 @@ function savePetBoundsSoon(win) {
 }
 function createWindow(resolver, srv) {
     const saved = restorePetBounds();
+    const winIcon = trayIconPath(resolver); // 窗口/任务栏图标与托盘同一张图
     const win = new electron_1.BrowserWindow({
         width: saved ? saved.width : WINDOW_WIDTH,
         height: saved ? saved.height : WINDOW_HEIGHT,
         // 有记录就按记录摆；否则不指定坐标，交给系统居中
         ...(saved ? { x: saved.x, y: saved.y } : {}),
+        ...(winIcon ? { icon: winIcon } : {}),
         transparent: true,
         frame: false,
         alwaysOnTop: true,
@@ -2974,6 +2976,13 @@ async function bootstrap() {
             }
         },
         deps: {
+            // 任意 MCP 工具被调用 → 渲染层触发"行为触发 → MCP 调用"绑定
+            onToolCall: () => {
+                try {
+                    sendToRenderer(contracts_1.IPC_ACTION, { type: 'behavior', payload: { name: 'mcp' } });
+                }
+                catch { /* 窗口不可用时忽略 */ }
+            },
             say: (text) => {
                 sendToRenderer(contracts_1.IPC_UI_BUBBLE, { text });
                 scenario?.record('event', `外部自动化：气泡「${text.slice(0, 40)}」`);
@@ -3388,6 +3397,44 @@ let currentFullscreen = false;
  * 表现为“点了没用”。所以本次全屏期间一律尊重用户的选择，直到全屏状态结束才复位。
  */
 let petShownDuringFullscreen = false;
+/** 全屏覆盖模式是否已生效（避免每 2s 轮询重复改窗口层级） */
+let fullscreenOverlayActive = false;
+/**
+ * 全屏覆盖：把桌宠提到 screen-saver 层级（Windows 上能压住全屏窗口），
+ * 只改层级、不 show/activate、不 moveTop —— 不抢焦点，也不打乱其它窗口的显示顺序。
+ */
+function setFullscreenOverlay(win, active) {
+    if (!win || win.isDestroyed())
+        return;
+    if (active === fullscreenOverlayActive)
+        return;
+    fullscreenOverlayActive = active;
+    try {
+        if (active) {
+            win.setAlwaysOnTop(true, 'screen-saver');
+            // 不抢焦点：用 showInactive 而不是 show（用户主动隐藏时不打扰）
+            if (!win.isVisible() && !userHiddenPet)
+                win.showInactive();
+            console.log('[main] 全屏覆盖：已切换 screen-saver 层级（不抢焦点、不改其它窗口顺序）');
+        }
+        else {
+            win.setAlwaysOnTop(true); // 恢复普通置顶层级
+            console.log('[main] 全屏覆盖：已退出，恢复普通置顶');
+        }
+    }
+    catch (err) {
+        console.warn('[main] 全屏覆盖层级切换失败：', err);
+    }
+}
+/** 读"全屏时自动收起"设置；读失败按默认（false=置顶显示） */
+function readFullscreenAutoHide() {
+    try {
+        return (0, chatClient_1.loadAppSettings)().fullscreenAutoHide === true;
+    }
+    catch {
+        return false;
+    }
+}
 function setPetVisibleByUser(visible) {
     const win = mainWindow;
     if (!win || win.isDestroyed())
@@ -3399,44 +3446,51 @@ function setPetVisibleByUser(visible) {
         petShownDuringFullscreen = Boolean(currentFullscreen);
         win.show();
         resetHitIgnore(win); // 从"可交互"开始，下一次探测再决定是否穿透
+        // 全屏且没开"自动收起"时，用户手动显示后立即进入覆盖层级（不用等下一次 2s 轮询）
+        if (currentFullscreen && !readFullscreenAutoHide())
+            setFullscreenOverlay(win, true);
     }
     else {
         userHiddenPet = true;
         petAutoHidden = false;
         petShownDuringFullscreen = false;
+        setFullscreenOverlay(win, false);
         resetHitIgnore(win);
         win.hide();
     }
 }
-/** 活动窗口变化 → 视全屏状态收放桌宠（设置里可关） */
+/**
+ * 活动窗口变化 → 全屏策略：
+ *   - 默认（fullscreenAutoHide=false）：桌宠保持显示，切到 screen-saver 顶层覆盖（不抢焦点、不乱序）；
+ *   - 勾选"全屏时自动收起"：沿用旧行为，全屏时隐藏、退出恢复（用户手动显示则本次全屏不再收起）。
+ */
 function applyFullscreenPolicy(info) {
     const win = mainWindow;
     if (!win || win.isDestroyed())
         return;
-    let enabled = true;
-    try {
-        enabled = (0, chatClient_1.loadAppSettings)().hideOnFullscreen !== false;
-    }
-    catch {
-        /* 读设置失败时按默认（开启）处理 */
-    }
-    // 用户自己隐藏的：不因全屏状态变化而去动它
-    if (userHiddenPet)
+    const autoHide = readFullscreenAutoHide();
+    // 用户自己隐藏的：不因全屏状态变化而去动它；退出覆盖层级避免残留
+    if (userHiddenPet) {
+        setFullscreenOverlay(win, false);
         return;
+    }
     const wasFullscreen = currentFullscreen;
     const fullscreen = Boolean(info && info.isFullscreen);
-    currentFullscreen = fullscreen && enabled;
-    // 退出全屏：复位"本次全屏内的用户选择"，下次再进全屏仍按默认收起
-    if (wasFullscreen && !currentFullscreen && !fullscreen)
+    currentFullscreen = fullscreen;
+    // 退出全屏：复位"本次全屏内的用户选择"
+    if (wasFullscreen && !fullscreen)
         petShownDuringFullscreen = false;
-    if (!enabled) {
-        // 关掉该功能时，若之前是自动收起的，应当放出来
+    if (!autoHide) {
+        // 全屏置顶显示：只改窗口层级，不做 show/activate/moveTop
         if (petAutoHidden) {
             petAutoHidden = false;
             win.show();
+            resetHitIgnore(win);
         }
+        setFullscreenOverlay(win, fullscreen);
         return;
     }
+    setFullscreenOverlay(win, false);
     if (fullscreen && win.isVisible()) {
         if (petShownDuringFullscreen)
             return; // 用户已明确要在这次全屏里看着桌宠

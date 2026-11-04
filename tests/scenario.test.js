@@ -175,3 +175,24 @@ test('衰减权重函数：半衰期语义正确', () => {
   assert.ok(Math.abs(sc.decayWeight(0, 2 * halfLife, halfLife) - 0.25) < 1e-9, '两个半衰期后权重应为 0.25');
   assert.equal(sc.decayWeight(1000, 0, halfLife), 1, '未来时间戳按 1 处理');
 });
+
+test('默认注入预算：2400 字（旧值 800 对多任务太少），显式预算仍可覆盖', () => {
+  assert.equal(sc.DEFAULT_INJECT_BUDGET, 2400, '默认注入预算应为 2400 字');
+  const dir = tempUserData();
+  const now = 1_700_000_000_000;
+  const ctx = new sc.ScenarioContext({
+    file: sc.scenarioPromptPath(dir),
+    template: '# 情景提示词\n\n记录格式：- [时间][类型] 内容\n',
+    mustBeUnder: dir,
+    now: () => now,
+  });
+  ctx.ensureFile();
+  for (let i = 0; i < 60; i++) ctx.record('action', `第${i}条记录` + 'x'.repeat(80));
+  const text = ctx.injectText({ now });
+  assert.ok(text.length > 1000, `默认预算不应停留在旧值 800，实际 ${text.length}`);
+  assert.ok(text.length <= 2400 + 120, `默认预算应约为 2400 字（含说明头），实际 ${text.length}`);
+  const tight = ctx.injectText({ budgetChars: 300, now });
+  assert.ok(tight.length <= 300 + 120, `显式预算应生效，实际 ${tight.length}`);
+  ctx.flush();
+  fs.rmSync(dir, { recursive: true, force: true });
+});

@@ -121,3 +121,32 @@ test('TTS 文本上限在渲染层与主进程两侧一致（超长自动朗读�
   assert.ok(rendererMax, '渲染层应定义 TTS_MAX_CHARS');
   assert.equal(rendererMax, mainMax, '渲染层 TTS_MAX_CHARS 必须与 edgeTts.MAX_TEXT_CHARS 一致');
 });
+
+test('TTS 内置音色候选：数量足够、短名不重复、默认音色在列表内', () => {
+  const html = read('src/renderer/index.html');
+  const select = /<select id="setting-tts-voice"[\s\S]*?<\/select>/.exec(html)?.[0];
+  assert.ok(select, 'index.html 应有音色下拉');
+  const values = [...select.matchAll(/value="([^"]+)"/g)].map((m) => m[1]);
+  assert.ok(values.length >= 20, `内置音色候选应 >= 20 个（当前 ${values.length}）`);
+  assert.equal(new Set(values).size, values.length, '内置音色短名不能重复');
+  assert.ok(values.includes('zh-CN-XiaoxiaoNeural'), '内置候选应包含默认音色晓晓');
+});
+
+test('应用图标资源：托盘 PNG 与快捷方式 ICO 存在、格式正确，且随包带出 ICO', () => {
+  const tray = fs.readFileSync(path.join(APP, 'local-assets', 'tray-icon.png'));
+  assert.ok(tray.length > 10_000, '托盘图标应是一张正常大小的 PNG');
+  assert.deepEqual([...tray.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], '托盘图标必须是 PNG');
+
+  const ico = fs.readFileSync(path.join(APP, 'local-assets', 'pet-icon.ico'));
+  assert.equal(ico.readUInt16LE(0), 0, 'ICO 保留字段');
+  assert.equal(ico.readUInt16LE(2), 1, 'ICO 类型应为 icon');
+  assert.ok(ico.readUInt16LE(4) >= 1, 'ICO 至少包含一个尺寸');
+
+  const yml = read('electron-builder.yml');
+  assert.ok(yml.includes('local-assets/pet-icon.ico'), 'electron-builder 应把 pet-icon.ico 作为 extraResource 带出');
+});
+
+test('设置页：空状态行不占高度（「试听语音」下面不应多出空行）', () => {
+  const css = read('src/renderer/styles.css');
+  assert.ok(css.includes('.settings-inline .settings-status:empty'), '空状态行应隐藏占位高度');
+});

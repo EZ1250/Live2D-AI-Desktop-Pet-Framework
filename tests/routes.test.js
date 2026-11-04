@@ -78,7 +78,7 @@ test('preload：每个通道都从 contracts 引用常量，不写裸字符串',
   assert.deepEqual(raw, [], `preload 里出现裸通道字符串：${raw.join(', ')}`);
 });
 
-test('preload：contracts 定义的 70 个通道全部经 preload 暴露（无孤儿契约）', () => {
+test('preload：contracts 定义的所有 IPC 通道都经 preload 暴露（无孤儿契约）', () => {
   const map = contractChannels();
   const { src } = preloadUsage();
   const orphan = [...map.keys()].filter((name) => !src.includes(name));

@@ -105,7 +105,25 @@ asar 内 `renderer/index.html` → asar 内 `public/renderer/index.html` → `di
   关闭朗读时会作废在途请求，关掉后不会再出声。
 - 文本上限：主进程 `edgeTts.MAX_TEXT_CHARS`（2000 字）；渲染层按同一上限截断后再请求，
   两边常量必须一致（`tests/assetIntegrity.test.js` 有断言）。
+- 音色列表：`IPC_TTS_VOICES`（invoke）由主进程 `edgeTts.listVoices()` 联网拉取，返回
+  `{ok, voices:[{shortName,locale,gender,friendlyName}]}`；设置页「↻ 拉取全部音色」按钮触发。
+  内置候选在 `index.html`（>=20 个，不联网可用），拉取失败时保留内置候选。
 - 合成失败不抛异常：`ttsService.speak()` 返回 `ok:false + error`，渲染层写设置页状态行。
+
+## 行为触发（设置 → 行为触发）
+
+- 行为键与中文名以 `contracts.ts` 的 `BEHAVIOR_KEYS` / `BEHAVIOR_LABELS` 为唯一来源：
+  `user_message`、`tool_call`、`command_exec`、`ai_start`、`model_idle`、`error`、
+  `click`（点击一次）、`multiClick`（连点 5 次）、`drag`（拖动结束）、`mcp`（任意 MCP 工具被调用）。
+- 每个行为可绑一个动作组/表情；另可再选一个「附加目标」——动作组或表情都可
+  （`AppSettings.motionTriggerExpressions[模型][行为]`，编码 `motion:`/`expr:`；旧版裸表情名按表情兼容），
+  并用每行的按钮选择播放方式：`simultaneous`（同时，默认）或 `chain`（衔接，主目标之后播放，
+  `motionTriggerPairModes[模型][行为]`）。
+- 事件来源：聊天/工具/命令/回答/待机/出错由主进程经 `IPC_ACTION {type:'behavior'}` 下发；
+  点击/连点/拖动由渲染层本地 `emitBehavior`；MCP 由 `mcpServer` 在 `tools/call` 回调
+  `deps.onToolCall` → 主进程转发 `behavior: mcp`。
+- 绑定按模型分桶（`motionTriggersByModel` / `motionTriggerExpressionsByModel`），
+  旧版全局字段只作回退；目标在当前模型上不存在时插件只 warn 一次、绝不硬播。
 
 ## 第三方资源授权
 

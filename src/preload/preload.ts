@@ -70,6 +70,7 @@ import {
   IPC_TODO_TOGGLE,
   IPC_TTS_AUDIO,
   IPC_TTS_SPEAK,
+  IPC_TTS_VOICES,
   IPC_UI_BUBBLE,
   IPC_VOICE_CHECK,
   IPC_VOICE_MODELS,
@@ -94,6 +95,7 @@ import type {
   ChatWindowResult,
   TodoDto,
   TtsAudioPayload,
+  TtsVoiceListResult,
   VoiceCheckResult,
   VoiceModelIndexResult,
   VoiceStatusResult,
@@ -376,6 +378,10 @@ const api: ElectronAPI = {
   /** 订阅 TTS 合成结果：渲染层用 new Audio(payload.dataUrl).play() 播放。 */
   onTtsAudio(cb: (payload: TtsAudioPayload) => void): () => void {
     return subscribeChannel<TtsAudioPayload>(IPC_TTS_AUDIO, cb);
+  },
+  /** 拉取 Edge TTS 全部可用音色（设置页"拉取音色列表"；失败返回 ok=false）。 */
+  ttsVoices(): Promise<TtsVoiceListResult> {
+    return ipcRenderer.invoke(IPC_TTS_VOICES);
   },
 
   /** 聊天记录：读取快照（当前会话记录 + 会话摘要）。 */

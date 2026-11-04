@@ -1250,7 +1250,8 @@
           vtsLastMs = nowMs;
           // 鼠标视线 → VTS 输入（与 VTS 的 FaceAngle/Eye 语义对齐）
           vtsInputs.FaceAngleX = gazeCX * 30;
-          vtsInputs.FaceAngleY = -gazeCY * 20;
+          // VTS 的 FaceAngleY 正值 = 抬头，与 gazeCY 同号；之前取负会把上下看反
+          vtsInputs.FaceAngleY = gazeCY * 20;
           vtsInputs.FaceAngleZ = gazeCX * 8 + eSway * 0.3;
           vtsInputs.EyeLeftX = -gazeCX * 0.6;
           vtsInputs.EyeLeftY = gazeCY * 0.7;

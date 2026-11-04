@@ -51,6 +51,10 @@ extraResources:
     to: LICENSE
   - from: THIRD_PARTY_NOTICES.md
     to: THIRD_PARTY_NOTICES.md
+  # 桌面快捷方式用的 .ico（signAndEditExecutable=false 时 exe 内嵌图标不会被改写，
+  # 所以快捷方式图标单独引用这个文件；托盘/窗口图标走 assets/tray-icon.png）
+  - from: local-assets/pet-icon.ico
+    to: pet-icon.ico
 
 win:
   # 两个目标：

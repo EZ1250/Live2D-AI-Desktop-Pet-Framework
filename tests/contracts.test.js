@@ -204,6 +204,82 @@ test('Edge TTS 播放接线：speak handler + 渲染层播放 + 说话时 VTS �
   for (const id of ['setting-tts-enabled', 'setting-tts-voice', 'setting-tts-speak']) {
     assert.ok(html.includes(`id="${id}"`), `index.html 应包含 #${id}`);
   }
+  // 音色列表：契约/preload/主进程/设置页按钮四处齐全（"拉取全部音色"）
+  assert.match(readSrc('src/shared/contracts.ts'), /IPC_TTS_VOICES/, '契约应有 IPC_TTS_VOICES');
+  assert.match(readSrc('src/shared/contracts.ts'), /ttsVoices\?\(\)/, 'ElectronAPI 应暴露 ttsVoices');
+  assert.match(readSrc('src/preload/preload.ts'), /ipcRenderer\.invoke\(IPC_TTS_VOICES\)/, 'preload 应转发 IPC_TTS_VOICES');
+  assert.ok(readSrc('src/main/ipc.ts').includes('ipcMain.handle(IPC_TTS_VOICES'), '主进程应注册 IPC_TTS_VOICES');
+  assert.ok(html.includes('id="setting-tts-voices-refresh"'), '设置页应有「拉取全部音色」按钮');
+  // 行为触发：点击/连点/拖动/MCP 四个行为键必须在契约、渲染层、插件三处同步
+  for (const [file, key] of [
+    ['src/shared/contracts.ts', "'mcp'"],
+    ['src/shared/contracts.ts', "'multiClick'"],
+    ['src/renderer/plugins/behavior.ts', 'multiClick'],
+    ['src/renderer/plugins/behavior.ts', 'click'],
+  ]) {
+    assert.ok(readSrc(file).includes(key), `${file} 应包含行为键 ${key}`);
+  }
+  assert.ok(
+    readSrc('src/main/ai/mcpServer.ts').includes('onToolCall'),
+    'MCP 服务端应回调 onToolCall（用于触发"行为触发 → MCP 调用"）',
+  );
+  // 新增设置项的持久化四路必须齐全：契约 / 写入(sanitizeSettings) / 读取(loadAppSettings) / 渲染层保存
+  for (const [file, snippet] of [
+    ['src/shared/contracts.ts', 'motionTriggerExpressions?: Partial<Record<BehaviorKey, string>>'],
+    ['src/main/ipc.ts', 'settings.motionTriggerExpressionsByModel = byModel'],
+    ['src/main/ai/chatClient.ts', "motionTriggerExpressionsByModel: readStringMapByModel('motionTriggerExpressionsByModel')"],
+    ['src/renderer/renderer.ts', 'motionTriggerExpressions: collectMotionTriggerExpressions()'],
+    ['src/renderer/renderer.ts', 'motionTriggerExpressionsByModel: (() => {'],
+    ['src/renderer/renderer.ts', "settings.motionTriggerExpressionsByModel as"],
+    // 联网拉取的音色不在内置候选里时，重开设置必须补选项，否则保存会覆盖回默认
+    ['src/renderer/renderer.ts', 'ensureSelectValue(ttsVoiceSelect'],
+  ]) {
+    assert.ok(readSrc(file).includes(snippet), `${file} 缺少持久化必需片段：${snippet}`);
+  }
+  // 附加目标：可动作可表情 + 同时/衔接 模式，四路持久化 + 插件实现
+  for (const [file, snippet] of [
+    ['src/shared/contracts.ts', 'motionTriggerPairModes?: Partial<Record<BehaviorKey'],
+    ['src/main/ipc.ts', 'cleanModeMap'],
+    ['src/main/ai/chatClient.ts', "motionTriggerPairModesByModel: readModeMapByModel('motionTriggerPairModesByModel')"],
+    ['src/renderer/renderer.ts', 'motionTriggerPairModesByModel: (() => {'],
+    ['src/renderer/renderer.ts', 'collectMotionTriggerPairModes'],
+    ['src/renderer/plugins/behavior.ts', 'pairModes'],
+    ['src/renderer/plugins/behavior.ts', 'PAIR_CHAIN_EXPRESSION_MS'],
+  ]) {
+    assert.ok(readSrc(file).includes(snippet), `${file} 缺少附加目标/模式片段：${snippet}`);
+  }
+  // 拖动行为：检测到拖动的瞬间触发（pointermove），不是松手后
+  const rendererSrc = readSrc('src/renderer/renderer.ts');
+  assert.ok(
+    rendererSrc.indexOf("emitBehavior('drag')") < rendererSrc.indexOf("window.addEventListener('pointerup'"),
+    '「拖动」行为必须在 pointermove 阶段即刻触发',
+  );
+  // TTS 试听按钮已挪到 Edge TTS 区（在 VTS 区之前），且位于「自动朗读」与「音色」之间
+  assert.ok(
+    html.indexOf('id="setting-tts-speak"') < html.indexOf('id="setting-vts-enabled"'),
+    '「试听语音」按钮应位于 TTS 设置区',
+  );
+  assert.ok(
+    html.indexOf('id="setting-tts-enabled"') < html.indexOf('id="setting-tts-speak"') &&
+      html.indexOf('id="setting-tts-speak"') < html.indexOf('id="setting-tts-voice"'),
+    '「试听语音」按钮应位于「自动朗读」与「音色」之间',
+  );
+  // 行为触发行的「同时/衔接」按钮必须有深色主题样式（不能是浏览器默认白底）
+  const stylesSrc = readSrc('src/renderer/styles.css');
+  assert.ok(
+    stylesSrc.includes('button.trigger-pair-mode') && stylesSrc.includes('background: rgba(255, 255, 255, 0.08)'),
+    '「同时/衔接」按钮应有深色主题样式',
+  );
+  // 全屏：默认不再自动收起，而是 screen-saver 顶层覆盖
+  assert.ok(
+    readSrc('src/main/mainImpl.js').includes("setAlwaysOnTop(true, 'screen-saver')"),
+    '全屏覆盖应使用 screen-saver 层级',
+  );
+  assert.ok(
+    readSrc('src/main/mainImpl.js').includes('fullscreenAutoHide'),
+    '全屏策略应读取 fullscreenAutoHide（默认 false=置顶显示）',
+  );
+  assert.match(readSrc('src/main/ai/chatClient.ts'), /fullscreenAutoHide: bool\(false/, '全屏自动收起默认应为 false');
   // 自动播放开关已前移到 earlySwitches（由 main.ts 在 mainImpl 之前 import、mainImpl 顶部也 require）：
   // 位置必须"早于任何 app ready / 创建窗口"，所以不能再只查 mainImpl.js 里那一段。
   assert.ok(

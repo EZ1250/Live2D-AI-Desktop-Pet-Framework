@@ -120,6 +120,10 @@ const TOOL_PREFIX_MCP = 'mcp__';
 const MAX_TOOL_CALLS = 40;
 /** 单轮最多几个"模型↔工具"往返 */
 const MAX_TOOL_ROUNDS = 20;
+/** 情景提示词注入预算：默认 2400 字（旧值 800 对多任务场景太少，看不出"最近在做什么"） */
+const SCENARIO_PROMPT_BUDGET_CHARS = 2400;
+/** system 超体积预算时的降档顺序：先缩情景提示词，再整段省略 */
+const SCENARIO_PROMPT_FALLBACK_BUDGETS = [1200, 600];
 
 /** 读 app.getPath('userData')/settings.json；不存在/非法返回 {}（回退环境变量） */
 export function loadAppSettings(): AppSettings {
@@ -162,6 +166,69 @@ export function loadAppSettings(): AppSettings {
       }
       return dflt;
     };
+    /** 行为触发类字段：只收字符串值（坏项丢弃，不整体失败） */
+    const readStringMap = (...keys: string[]): Record<string, string> => {
+      for (const k of keys) {
+        const src = ai[k] ?? raw[k];
+        if (!src || typeof src !== 'object') continue;
+        const out: Record<string, string> = {};
+        for (const [key, value] of Object.entries(src as Record<string, unknown>)) {
+          if (typeof value === 'string') out[key] = value;
+        }
+        return out;
+      }
+      return {};
+    };
+    /** 行为触发类字段（按模型分桶） */
+    const readStringMapByModel = (...keys: string[]): Record<string, Record<string, string>> => {
+      for (const k of keys) {
+        const src = ai[k] ?? raw[k];
+        if (!src || typeof src !== 'object') continue;
+        const out: Record<string, Record<string, string>> = {};
+        for (const [model, map] of Object.entries(src as Record<string, unknown>)) {
+          const name = String(model).trim();
+          if (!name || !map || typeof map !== 'object') continue;
+          const bucket: Record<string, string> = {};
+          for (const [key, value] of Object.entries(map as Record<string, unknown>)) {
+            if (typeof value === 'string') bucket[key] = value;
+          }
+          if (Object.keys(bucket).length) out[name] = bucket;
+        }
+        return out;
+      }
+      return {};
+    };
+    /** 附加目标播放方式（simultaneous/chain）：坏值丢弃 */
+    const readModeMap = (...keys: string[]): Record<string, string> => {
+      for (const k of keys) {
+        const src = ai[k] ?? raw[k];
+        if (!src || typeof src !== 'object') continue;
+        const out: Record<string, string> = {};
+        for (const [key, value] of Object.entries(src as Record<string, unknown>)) {
+          if (value === 'simultaneous' || value === 'chain') out[key] = value;
+        }
+        return out;
+      }
+      return {};
+    };
+    const readModeMapByModel = (...keys: string[]): Record<string, Record<string, string>> => {
+      for (const k of keys) {
+        const src = ai[k] ?? raw[k];
+        if (!src || typeof src !== 'object') continue;
+        const out: Record<string, Record<string, string>> = {};
+        for (const [model, map] of Object.entries(src as Record<string, unknown>)) {
+          const name = String(model).trim();
+          if (!name || !map || typeof map !== 'object') continue;
+          const bucket: Record<string, string> = {};
+          for (const [key, value] of Object.entries(map as Record<string, unknown>)) {
+            if (value === 'simultaneous' || value === 'chain') bucket[key] = value;
+          }
+          if (Object.keys(bucket).length) out[name] = bucket;
+        }
+        return out;
+      }
+      return {};
+    };
 
     return {
       aiBaseUrl: str('baseUrl', 'baseURL', 'aiBaseUrl', 'base_url'),
@@ -189,8 +256,8 @@ export function loadAppSettings(): AppSettings {
       // "能存进去、重启读不回来"的老坑（confirmTools 当年就是这么失效的）。
       displayMode: ((): 'full' | 'half' => (str('displayMode') === 'half' ? 'half' : 'full'))(),
     modelName: str('modelName') ?? '',
-      // 全屏自动收起：同样必须读回来，否则设置页关了、重启又自动生效
-      hideOnFullscreen: bool(true, 'hideOnFullscreen'),
+      // 全屏自动收起：默认关闭 → 全屏时桌宠以顶层覆盖方式继续显示（不抢焦点、不乱序）
+      fullscreenAutoHide: bool(false, 'fullscreenAutoHide'),
       // 点击穿透：默认关闭（默认开启一旦命中判定有偏差，用户会觉得"桌宠点不动"）
       clickThrough: bool(false, 'clickThrough'),
       // 桌宠窗口位置/尺寸：同样必须读回来，否则"位置记忆"就是假的（存了但重启不生效）。
@@ -219,32 +286,16 @@ export function loadAppSettings(): AppSettings {
       mailImapPass: str('mailImapPass') ?? '',
       // 行为触发映射同样**必须在这里读回来**，否则设置页配好的绑定一重启就没了。
       // 只收字符串值，非法项丢弃（与 sanitizeSettings 的宽松策略一致）。
-      motionTriggers: ((): Record<string, string> => {
-        const src = ai.motionTriggers ?? raw.motionTriggers;
-        if (!src || typeof src !== 'object') return {};
-        const out: Record<string, string> = {};
-        for (const [key, value] of Object.entries(src as Record<string, unknown>)) {
-          if (typeof value === 'string') out[key] = value;
-        }
-        return out;
-      })(),
+      motionTriggers: readStringMap('motionTriggers'),
       // 行为触发（按模型分桶）同样**必须读回来**：漏了的话设置页会看到空映射，
       // 并且保存时只写当前模型这一桶、把其它模型的绑定覆盖掉（丢配置）。
-      motionTriggersByModel: ((): Record<string, Record<string, string>> => {
-        const src = ai.motionTriggersByModel ?? raw.motionTriggersByModel;
-        if (!src || typeof src !== 'object') return {};
-        const out: Record<string, Record<string, string>> = {};
-        for (const [model, map] of Object.entries(src as Record<string, unknown>)) {
-          const name = String(model).trim();
-          if (!name || !map || typeof map !== 'object') continue;
-          const bucket: Record<string, string> = {};
-          for (const [key, value] of Object.entries(map as Record<string, unknown>)) {
-            if (typeof value === 'string') bucket[key] = value;
-          }
-          if (Object.keys(bucket).length) out[name] = bucket;
-        }
-        return out;
-      })(),
+      motionTriggersByModel: readStringMapByModel('motionTriggersByModel'),
+      // 行为触发时附加播放的目标（可动作可表情；按模型分桶，与动作映射同结构）
+      motionTriggerExpressions: readStringMap('motionTriggerExpressions'),
+      motionTriggerExpressionsByModel: readStringMapByModel('motionTriggerExpressionsByModel'),
+      // 附加目标的播放方式：simultaneous（同时）/ chain（衔接）
+      motionTriggerPairModes: readModeMap('motionTriggerPairModes'),
+      motionTriggerPairModesByModel: readModeMapByModel('motionTriggerPairModesByModel'),
       // 桌宠名字同样**必须读回来**，否则"改完名字、重开设置又空了"（写入侧支持、读取侧漏了）。
       petName: str('petName') ?? '',
       // MCP 服务端 + 定时自主任务：新设置项一律在这里补读，否则"能存不能读"
@@ -317,7 +368,7 @@ export function ensureAppSettingsFile(): void {
             allowShell: true,
             permissionMode: 'ask',
             displayMode: 'full',
-            hideOnFullscreen: true,
+            fullscreenAutoHide: false,
             clickThrough: false,
           },
         },
@@ -1566,23 +1617,43 @@ export class ChatClient {
             .map((i) => `  · [${i.status === 'done' ? '✓' : i.status === 'doing' ? '▸' : ' '}] ${i.text}`)
             .join('\n')
         : '');
-    const scenarioText = this.scenario?.injectText({ budgetChars: 800 }) ?? '';
-    const contextParts: string[] = [];
-    if (userRequest) contextParts.push(`用户本轮请求：${userRequest.slice(0, 300)}`);
-    contextParts.push(`当前工作目录：${this.workspaceRoot || '未配置'}`);
-    contextParts.push(devHint);
-    if (memoryHint) contextParts.push(memoryHint);
-    if (scenarioText) contextParts.push(scenarioText);
+    /** 第 3 层正文：任务上下文 + 记忆 + 情景提示词（情景放最后，超预算时优先牺牲） */
+    const buildContextText = (scenarioText: string): string => {
+      const contextParts: string[] = [];
+      if (userRequest) contextParts.push(`用户本轮请求：${userRequest.slice(0, 300)}`);
+      contextParts.push(`当前工作目录：${this.workspaceRoot || '未配置'}`);
+      contextParts.push(devHint);
+      if (memoryHint) contextParts.push(memoryHint);
+      if (scenarioText) contextParts.push(scenarioText);
+      return contextParts.join('\n\n');
+    };
+    let scenarioText = this.scenario?.injectText({ budgetChars: SCENARIO_PROMPT_BUDGET_CHARS }) ?? '';
     let assembled = assembleSystemPrompt(lib, {
       identityExtra,
       toolsCatalog,
-      contextText: contextParts.join('\n\n'),
+      contextText: buildContextText(scenarioText),
     });
-    // 提示词体积护栏：system 最多占 maxContextTokens 的 60%，超了先丢情景提示词
+    // 提示词体积护栏：system 最多占 maxContextTokens 的 60%。
+    // 超了先逐级缩小情景提示词（2400 → 1200 → 600），仍超再整段省掉，最后才硬截断。
     const maxSystemTokens = Math.max(600, Math.floor(this.cfg.maxContextTokens * 0.6));
     if (scenarioText && estimateTokens(assembled) > maxSystemTokens) {
-      const trimmed = contextParts.filter((part) => part !== scenarioText).join('\n\n');
-      assembled = assembleSystemPrompt(lib, { identityExtra, toolsCatalog, contextText: trimmed });
+      for (const budget of SCENARIO_PROMPT_FALLBACK_BUDGETS) {
+        scenarioText = this.scenario?.injectText({ budgetChars: budget }) ?? '';
+        assembled = assembleSystemPrompt(lib, {
+          identityExtra,
+          toolsCatalog,
+          contextText: buildContextText(scenarioText),
+        });
+        if (!scenarioText || estimateTokens(assembled) <= maxSystemTokens) break;
+      }
+      if (estimateTokens(assembled) > maxSystemTokens) {
+        scenarioText = '';
+        assembled = assembleSystemPrompt(lib, {
+          identityExtra,
+          toolsCatalog,
+          contextText: buildContextText(''),
+        });
+      }
     }
     if (estimateTokens(assembled) > maxSystemTokens) {
       // 还超：按字符硬截断（0.6 token/字 的保守估算）
@@ -1591,7 +1662,7 @@ export class ChatClient {
     }
     if (process.env.PET_LOG_PROMPT === '1') {
       console.log(`[chat] 系统提示词：${assembled.length} 字（第 1~3 层）|` +
-        ` 情景提示词：${scenarioText ? `${scenarioText.length} 字` : '暂无记录'} | 第 4 层阶段指令按轮注入`);
+        ` 情景提示词：${scenarioText ? `${scenarioText.length} 字` : '暂无记录'}（预算 ${SCENARIO_PROMPT_BUDGET_CHARS} 字）| 第 4 层阶段指令按轮注入`);
     }
     return assembled;
   }

@@ -1233,6 +1233,8 @@ function installWindowInteractions(bridge: RendererBridge): void {
   // —— 滚轮缩放：档位 ±1（1.08^n），preventDefault 防页面/隐式滚动；拖拽期间忽略 ——
   let dragging = false;
   let moved = false; // 本次按下是否已超过 3px（用于区分"点击"与"拖拽"）
+/** 「拖动」行为是否已在本次拖动中触发过（检测到拖动的瞬间就触发，不等松手） */
+let dragBehaviorEmitted = false;
   let dragFrame = 0;
   let pendingDx = 0;
   let pendingDy = 0;
@@ -1281,6 +1283,7 @@ function installWindowInteractions(bridge: RendererBridge): void {
     dragging = true;
     petDragging = true;
     moved = false;
+    dragBehaviorEmitted = false;
     dragStartedAt = performance.now();
     dragLongReported = false;
     lastDragX = e.screenX;
@@ -1294,6 +1297,11 @@ function installWindowInteractions(bridge: RendererBridge): void {
     // 3px 阈值：微动视为点击；超过才按增量连续移动
     if (Math.abs(dx) + Math.abs(dy) >= 3) {
       moved = true;
+      // 「拖动」行为：检测到拖动的**瞬间**就触发（不等松手），一次拖动只触发一次
+      if (!dragBehaviorEmitted) {
+        dragBehaviorEmitted = true;
+        emitBehavior('drag');
+      }
       pendingDx += dx;
       pendingDy += dy;
       if (!dragFrame) dragFrame = window.requestAnimationFrame(flushDrag);
@@ -1310,7 +1318,7 @@ function installWindowInteractions(bridge: RendererBridge): void {
     const wasDragging = dragging;
     const hasMoved = moved;
     endDrag();
-    // 单击（未拖动）且不在 UI 区域 → 触发「点一下」表情 + 粉色星星特效
+    // 「拖动」行为已经在 pointermove 首次越过阈值时触发过；这里只负责区分"拖动"与"单击"
     if (!wasDragging || hasMoved) return;
     if (e.button !== 0) return;
     const t = e.target as Element | null;
@@ -1320,9 +1328,11 @@ function installWindowInteractions(bridge: RendererBridge): void {
     clickTimes = clickTimes.filter((at) => nowMs - at <= CLICK_WINDOW_MS);
     clickTimes.push(nowMs);
     reportPetEvent('click');
+    emitBehavior('click');
     if (clickTimes.length >= MULTI_CLICK_COUNT) {
       clickTimes = []; // 报完重置，避免持续点数无限刷
       reportPetEvent('multiClick');
+      emitBehavior('multiClick');
     }
     triggerPetTap(e.clientX, e.clientY);
   });
@@ -1464,8 +1474,29 @@ function triggerPetTap(x: number, y: number): void {
    7.6 行为触发：行为 → 动作组 / 表情
    ================================================================ */
 /** 行为键（与 contracts.ts 的 BEHAVIOR_KEYS 同步） */
-type BehaviorKey = 'user_message' | 'tool_call' | 'command_exec' | 'ai_start' | 'model_idle' | 'error';
-const BEHAVIOR_KEYS: BehaviorKey[] = ['user_message', 'tool_call', 'command_exec', 'ai_start', 'model_idle', 'error'];
+type BehaviorKey =
+  | 'user_message'
+  | 'tool_call'
+  | 'command_exec'
+  | 'ai_start'
+  | 'model_idle'
+  | 'error'
+  | 'click'
+  | 'multiClick'
+  | 'drag'
+  | 'mcp';
+const BEHAVIOR_KEYS: BehaviorKey[] = [
+  'user_message',
+  'tool_call',
+  'command_exec',
+  'ai_start',
+  'model_idle',
+  'error',
+  'click',
+  'multiClick',
+  'drag',
+  'mcp',
+];
 /** 行为中文名 */
 const BEHAVIOR_LABELS: Record<BehaviorKey, string> = {
   user_message: '用户发送消息',
@@ -1474,6 +1505,10 @@ const BEHAVIOR_LABELS: Record<BehaviorKey, string> = {
   ai_start: '开始回答',
   model_idle: '待机搭话',
   error: '出错',
+  click: '点击一次',
+  multiClick: '连续点击',
+  drag: '拖动',
+  mcp: 'MCP 调用',
 };
 /** 行为触发表情后恢复默认的时长 */
 const BEHAVIOR_EXPRESSION_HOLD_MS = 2600;
@@ -1484,6 +1519,14 @@ const COMMAND_TOOLS = new Set(['shell_run', 'shell_bg', 'shell_output', 'shell_k
 let motionTriggers: Record<string, string> = {};
 /** 行为触发映射（按模型分桶，保存时合并回去；见 AppSettings.motionTriggersByModel） */
 let motionTriggersByModel: Record<string, Record<string, string>> = {};
+/** 行为触发时附加播放的目标（可动作可表情；当前模型生效的那一份） */
+let motionTriggerExpressions: Record<string, string> = {};
+/** 附加目标（按模型分桶；见 AppSettings.motionTriggerExpressionsByModel） */
+let motionTriggerExpressionsByModel: Record<string, Record<string, string>> = {};
+/** 附加目标的播放方式（'simultaneous' 同时 / 'chain' 衔接；当前模型） */
+let motionTriggerPairModes: Record<string, string> = {};
+/** 附加目标播放方式（按模型分桶） */
+let motionTriggerPairModesByModel: Record<string, Record<string, string>> = {};
 /** 本轮回复是否已触发过「开始回答」 */
 let aiStartEmitted = false;
 
@@ -1493,11 +1536,24 @@ let aiStartEmitted = false;
  */
 function applyBehaviorTriggersFromSettings(settings: AppSettings): void {
   motionTriggersByModel = (settings.motionTriggersByModel as Record<string, Record<string, string>> | undefined) ?? {};
+  motionTriggerExpressionsByModel =
+    (settings.motionTriggerExpressionsByModel as Record<string, Record<string, string>> | undefined) ?? {};
+  motionTriggerPairModesByModel =
+    (settings.motionTriggerPairModesByModel as Record<string, Record<string, string>> | undefined) ?? {};
   const legacy = (settings.motionTriggers as Record<string, string> | undefined) ?? {};
+  const legacyExpressions = (settings.motionTriggerExpressions as Record<string, string> | undefined) ?? {};
+  // 当前模型生效的"附加目标 / 播放方式"：优先按模型分桶，没有就退回旧版全局
+  motionTriggerExpressions = activeModelName
+    ? motionTriggerExpressionsByModel[activeModelName] ?? legacyExpressions
+    : legacyExpressions;
+  motionTriggerPairModes = activeModelName ? motionTriggerPairModesByModel[activeModelName] ?? {} : {};
   const kernel = rendererKernel();
   kernel?.emit('behavior:config', {
     byModel: motionTriggersByModel,
     legacy,
+    expressions: motionTriggerExpressions,
+    legacyExpressions,
+    pairModes: motionTriggerPairModes,
     modelName: activeModelName,
     labels: BEHAVIOR_LABELS,
     keys: BEHAVIOR_KEYS,
@@ -2380,6 +2436,22 @@ function elementById<T extends HTMLElement>(id: string): T | null {
   return document.getElementById(id) as T | null;
 }
 
+/**
+ * 让下拉里一定有这个值并选中它。
+ * 用途：设置的音色可能是「联网拉取」后选的，重启后下拉只剩内置候选；
+ * 直接 `select.value = value` 会变成空串，用户再点保存就把音色覆盖回默认了。
+ */
+function ensureSelectValue(select: HTMLSelectElement, value: string, label?: string): void {
+  if (!value) return;
+  if (!Array.from(select.options).some((option) => option.value === value)) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label ?? value;
+    select.appendChild(option);
+  }
+  select.value = value;
+}
+
 function setSettingsStatus(text: string, isError = false): void {
   const status = elementById<HTMLElement>('settings-status');
   if (status) {
@@ -3032,7 +3104,8 @@ async function populateSettings(bridge: RendererBridge): Promise<void> {
   ttsVoice = settings.ttsVoice || TTS_DEFAULT_VOICE;
   setChecked('setting-tts-enabled', ttsEnabled);
   const ttsVoiceSelect = elementById<HTMLSelectElement>('setting-tts-voice');
-  if (ttsVoiceSelect) ttsVoiceSelect.value = ttsVoice;
+  // 音色可能是联网拉取后选的（不在内置候选里）：补一个选项并选中，避免"重开设置显示空白、一保存就丢"
+  if (ttsVoiceSelect) ensureSelectValue(ttsVoiceSelect, ttsVoice, `${ttsVoice}（当前音色）`);
   setChecked('setting-mcp-server-enabled', settings.mcpServerEnabled === true);
   setChecked('setting-mcp-server-lan', settings.mcpServerLanEnabled === true);
   setInputValue('setting-mcp-server-port', String(settings.mcpServerPort ?? 37653));
@@ -3089,7 +3162,7 @@ async function populateSettings(bridge: RendererBridge): Promise<void> {
   if (framingSelect) framingSelect.value = framing;
   applyFraming(framing);
   const hideFsBox = elementById<HTMLInputElement>('setting-hide-fullscreen');
-  if (hideFsBox) hideFsBox.checked = settings.hideOnFullscreen !== false; // 默认开启
+  if (hideFsBox) hideFsBox.checked = settings.fullscreenAutoHide === true; // 默认关闭 = 全屏置顶显示
   const clickThroughBox = elementById<HTMLInputElement>('setting-click-through');
   if (clickThroughBox) clickThroughBox.checked = settings.clickThrough === true; // 默认关闭
   applySfxSettings(settings); // 音效开关/音量 + 滑杆显示
@@ -3101,20 +3174,51 @@ async function populateSettings(bridge: RendererBridge): Promise<void> {
 }
 
 /* ---------- 设置页：行为触发（行为 → 动作组 / 表情）---------- */
-/** 建出每个行为一行（只建一次） */
+/** 建出每个行为一行（只建一次）：触发目标（动作组/表情）+ 可选的"同时表情" */
+/** 附加目标的播放方式按钮：同时 / 衔接，点一下切换 */
+function setPairModeButton(btn: HTMLButtonElement, mode: string): void {
+  const chain = mode === 'chain';
+  btn.dataset.mode = chain ? 'chain' : 'simultaneous';
+  btn.textContent = chain ? '衔接表情' : '同时表情';
+  btn.title = chain
+    ? '衔接：主目标播完后再播放附加目标（点击切换为"同时"）'
+    : '同时：与主目标一起播放（点击切换为"衔接"）';
+}
+
 function renderMotionTriggerRows(): void {
   const body = elementById<HTMLElement>('motion-trigger-body');
   if (!body || body.childElementCount > 0) return;
   for (const key of BEHAVIOR_KEYS) {
-    const row = document.createElement('label');
+    const row = document.createElement('div');
     row.className = 'settings-row';
     const title = document.createElement('span');
     title.textContent = BEHAVIOR_LABELS[key];
     const select = document.createElement('select');
     select.id = `setting-motion-${key}`;
-    row.append(title, select);
+    select.title = '触发时播放的动作组或表情';
+    const modeBtn = document.createElement('button');
+    modeBtn.type = 'button';
+    modeBtn.id = `setting-motion-mode-${key}`;
+    modeBtn.className = 'trigger-pair-mode';
+    setPairModeButton(modeBtn, 'simultaneous');
+    modeBtn.addEventListener('click', () => {
+      setPairModeButton(modeBtn, modeBtn.dataset.mode === 'chain' ? 'simultaneous' : 'chain');
+    });
+    const exprSelect = document.createElement('select');
+    exprSelect.id = `setting-motion-expr-${key}`;
+    exprSelect.title = '附加目标（可选）：动作组或表情；配合左侧按钮决定"同时"还是"衔接"播放';
+    row.append(title, select, modeBtn, exprSelect);
     body.appendChild(row);
   }
+}
+
+/** 旧配置里的附加目标可能只存了表情名（无前缀）：补齐为 expr:/motion: 编码，避免被判成"当前模型没有" */
+function normalizePairTarget(value: string, motions: string[], expressions: string[]): string {
+  if (!value) return '';
+  if (value.startsWith('motion:') || value.startsWith('expr:')) return value;
+  if (expressions.includes(value)) return `expr:${value}`;
+  if (motions.includes(value)) return `motion:${value}`;
+  return value;
 }
 
 /** 保证下拉里有这个取值；当前模型没有它时也补一个选项留住（换模型不该悄悄丢掉绑定） */
@@ -3168,17 +3272,72 @@ function refreshMotionTriggerOptions(): void {
     // 旧值在当前模型上不存在时也补一个选项留住（换模型不该悄悄丢掉绑定）
     ensureTriggerOption(select, previous);
     select.value = previous;
+
+    // 附加目标（可选）：动作组和表情都能选（不限制种类）
+    const exprSelect = elementById<HTMLSelectElement>(`setting-motion-expr-${key}`);
+    if (!exprSelect) continue;
+    const exprPrevious = normalizePairTarget(
+      exprSelect.options.length ? exprSelect.value : '',
+      motions,
+      expressions,
+    );
+    exprSelect.replaceChildren();
+    const addPair = (value: string, label: string): void => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      exprSelect.appendChild(option);
+    };
+    addPair('', '不附加');
+    if (motions.length) {
+      const group = document.createElement('optgroup');
+      group.label = '动作组';
+      for (const name of motions) {
+        const option = document.createElement('option');
+        option.value = `motion:${name}`;
+        option.textContent = name;
+        group.appendChild(option);
+      }
+      exprSelect.appendChild(group);
+    }
+    if (expressions.length) {
+      const group = document.createElement('optgroup');
+      group.label = '表情';
+      for (const name of expressions) {
+        const option = document.createElement('option');
+        option.value = `expr:${name}`;
+        option.textContent = name;
+        group.appendChild(option);
+      }
+      exprSelect.appendChild(group);
+    }
+    ensureTriggerOption(exprSelect, exprPrevious);
+    exprSelect.value = exprPrevious;
   }
 }
 
-/** 回填已保存的行为触发映射 */
+/** 回填已保存的行为触发映射（含附加目标与播放方式） */
 function populateMotionTriggerSelects(): void {
+  const motions = listCurrentMotions();
+  const expressions = listCurrentExpressions();
   for (const key of BEHAVIOR_KEYS) {
     const select = elementById<HTMLSelectElement>(`setting-motion-${key}`);
     if (!select) continue;
     const saved = typeof motionTriggers[key] === 'string' ? motionTriggers[key] : 'auto';
     ensureTriggerOption(select, saved);
     select.value = saved;
+    const exprSelect = elementById<HTMLSelectElement>(`setting-motion-expr-${key}`);
+    if (exprSelect) {
+      const savedExpr = normalizePairTarget(
+        typeof motionTriggerExpressions[key] === 'string' ? motionTriggerExpressions[key] : '',
+        motions,
+        expressions,
+      );
+      ensureTriggerOption(exprSelect, savedExpr);
+      exprSelect.value = savedExpr;
+    }
+    const modeBtn = elementById<HTMLButtonElement>(`setting-motion-mode-${key}`);
+    if (modeBtn) setPairModeButton(modeBtn, typeof motionTriggerPairModes[key] === 'string' ? motionTriggerPairModes[key] : 'simultaneous');
   }
 }
 
@@ -3188,6 +3347,26 @@ function collectMotionTriggers(): Record<string, string> {
   for (const key of BEHAVIOR_KEYS) {
     const value = elementById<HTMLSelectElement>(`setting-motion-${key}`)?.value ?? 'auto';
     if (value && value !== 'auto') map[key] = value;
+  }
+  return map;
+}
+
+/** 收集附加目标（空 = 不附加） */
+function collectMotionTriggerExpressions(): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const key of BEHAVIOR_KEYS) {
+    const value = elementById<HTMLSelectElement>(`setting-motion-expr-${key}`)?.value ?? '';
+    if (value) map[key] = value;
+  }
+  return map;
+}
+
+/** 收集附加目标的播放方式（缺省 simultaneous，不落盘） */
+function collectMotionTriggerPairModes(): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const key of BEHAVIOR_KEYS) {
+    const mode = elementById<HTMLButtonElement>(`setting-motion-mode-${key}`)?.dataset.mode;
+    if (mode === 'chain') map[key] = 'chain';
   }
   return map;
 }
@@ -3721,6 +3900,64 @@ async function speakSampleFromUi(bridge: RendererBridge): Promise<void> {
   }
 }
 
+/**
+ * 拉取 Edge TTS 全部音色并填充设置页下拉（需联网）。
+ * 失败时保留 index.html 里的内置候选，不影响原有功能。
+ */
+async function refreshTtsVoiceOptions(bridge: RendererBridge): Promise<void> {
+  const select = elementById<HTMLSelectElement>('setting-tts-voice');
+  const btn = elementById<HTMLButtonElement>('setting-tts-voices-refresh');
+  const el = elementById<HTMLElement>('setting-tts-status');
+  if (!select) return;
+  if (typeof bridge.ttsVoices !== 'function') {
+    if (el) el.textContent = '当前版本不支持拉取音色列表';
+    return;
+  }
+  const current = select.value || ttsVoice;
+  if (btn) btn.disabled = true;
+  if (el) el.textContent = '拉取音色列表中…（需要联网）';
+  try {
+    const result = await bridge.ttsVoices();
+    if (!result.ok || !Array.isArray(result.voices) || !result.voices.length) {
+      if (el) el.textContent = `拉取失败：${result.error ?? '没有可用音色'}（保留内置候选）`;
+      return;
+    }
+    const byLocale = new Map<string, typeof result.voices>();
+    for (const voice of result.voices) {
+      const list = byLocale.get(voice.locale) ?? [];
+      list.push(voice);
+      byLocale.set(voice.locale, list);
+    }
+    select.replaceChildren();
+    for (const [locale, voices] of [...byLocale.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+      const group = document.createElement('optgroup');
+      group.label = locale;
+      for (const voice of voices) {
+        const option = document.createElement('option');
+        option.value = voice.shortName;
+        // friendlyName 形如「Microsoft 晓晓 Online (Natural) - Chinese (Mainland)」，去掉前缀更清爽
+        const name = (voice.friendlyName ?? voice.shortName).replace(/^Microsoft\s+/, '');
+        option.textContent = `${name}${voice.gender ? `（${voice.gender}）` : ''}`;
+        group.appendChild(option);
+      }
+      select.appendChild(group);
+    }
+    // 当前选中的音色可能不在返回列表里（自定义/已下线）：补一个选项留住
+    if (!Array.from(select.options).some((o) => o.value === current)) {
+      const option = document.createElement('option');
+      option.value = current;
+      option.textContent = `${current}（当前）`;
+      select.appendChild(option);
+    }
+    select.value = current;
+    if (el) el.textContent = `已拉取 ${result.voices.length} 个音色，可下拉选择后点「试听语音」`;
+  } catch (err) {
+    if (el) el.textContent = `拉取失败：${(err as Error).message ?? String(err)}（保留内置候选）`;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 function openSettings(bridge: RendererBridge): void {
   const panel = elementById<HTMLElement>('settings-panel');
   if (!panel) return;
@@ -3764,7 +4001,7 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
     allowShell: elementById<HTMLInputElement>('setting-allow-shell')?.checked !== false,
     permissionMode: (elementById<HTMLSelectElement>('setting-permission-mode')?.value as AppSettings['permissionMode']) ?? 'ask',
     displayMode: (elementById<HTMLSelectElement>('setting-display-mode')?.value as AppSettings['displayMode']) ?? 'full',
-    hideOnFullscreen: elementById<HTMLInputElement>('setting-hide-fullscreen')?.checked !== false,
+    fullscreenAutoHide: elementById<HTMLInputElement>('setting-hide-fullscreen')?.checked === true,
     clickThrough: elementById<HTMLInputElement>('setting-click-through')?.checked === true,
     // 语音识别（留空即复用 AI 配置）
     voiceModel: value('setting-voice-model'),
@@ -3772,6 +4009,8 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
     voiceBaseUrl: value('setting-voice-base-url'),
     voiceApiKey: value('setting-voice-api-key'),
     motionTriggers: collectMotionTriggers(),
+    motionTriggerExpressions: collectMotionTriggerExpressions(),
+    motionTriggerPairModes: collectMotionTriggerPairModes(),
     // 行为触发按模型分桶：只更新"当前模型"这一桶，其它模型的绑定原样保留
     petName: value('setting-pet-name').slice(0, 24),
     mcpServerEnabled: elementById<HTMLInputElement>('setting-mcp-server-enabled')?.checked === true,
@@ -3796,6 +4035,26 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
       if (name) next[name] = collectMotionTriggers();
       return next;
     })(),
+    motionTriggerExpressionsByModel: (() => {
+      const next = { ...motionTriggerExpressionsByModel };
+      const name = activeModelName || '';
+      if (name) {
+        const expressions = collectMotionTriggerExpressions();
+        if (Object.keys(expressions).length) next[name] = expressions;
+        else delete next[name];
+      }
+      return next;
+    })(),
+    motionTriggerPairModesByModel: (() => {
+      const next = { ...motionTriggerPairModesByModel };
+      const name = activeModelName || '';
+      if (name) {
+        const modes = collectMotionTriggerPairModes();
+        if (Object.keys(modes).length) next[name] = modes;
+        else delete next[name];
+      }
+      return next;
+    })(),
   };
   setSettingsStatus('保存中…');
   const result = await bridge.setSettings(settings);
@@ -3804,6 +4063,12 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
     return;
   }
   motionTriggersByModel = (settings.motionTriggersByModel as Record<string, Record<string, string>> | undefined) ?? motionTriggersByModel;
+  motionTriggerExpressionsByModel =
+    (settings.motionTriggerExpressionsByModel as Record<string, Record<string, string>> | undefined) ??
+    motionTriggerExpressionsByModel;
+  motionTriggerPairModesByModel =
+    (settings.motionTriggerPairModesByModel as Record<string, Record<string, string>> | undefined) ??
+    motionTriggerPairModesByModel;
   // 触发配置变更后让插件重算，并把生效映射取回来给设置页
   applyBehaviorTriggersFromSettings(settings);
   applyPetName(settings.petName); // 名字立刻生效（输入框提示/问候语）
@@ -5128,6 +5393,9 @@ function installSettingsUi(bridge: RendererBridge): void {
   });
   elementById<HTMLButtonElement>('setting-tts-speak')?.addEventListener('click', () => {
     void speakSampleFromUi(bridge);
+  });
+  elementById<HTMLButtonElement>('setting-tts-voices-refresh')?.addEventListener('click', () => {
+    void refreshTtsVoiceOptions(bridge);
   });
   // 「启用 VTS」勾上/取消：立刻决定要不要发视线（保存后配置才落盘，这里只控制发送开关）
   elementById<HTMLInputElement>('setting-vts-enabled')?.addEventListener('change', (event) => {

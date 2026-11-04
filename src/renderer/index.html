@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <!--
   Pet — 渲染进程页面
   透明无边框窗口：body 背景透明；模型渲染在 #stage，气泡 #bubble，状态小字 #overlay。
@@ -171,22 +171,67 @@
           <option value="half">半身（放大头与上半身）</option>
         </select>
       </label>
-      <label class="settings-checkbox"><input id="setting-hide-fullscreen" name="hideOnFullscreen" type="checkbox" checked /> 全屏时自动收起</label>
+      <label class="settings-checkbox" title="默认开启“游戏/视频全屏时置顶显示”：用 screen-saver 层级覆盖全屏窗口，不抢焦点、不改变其它窗口的显示顺序；勾上则改为全屏时自动收起"><input id="setting-hide-fullscreen" name="fullscreenAutoHide" type="checkbox" /> 全屏时自动收起（默认关：全屏置顶显示）</label>
       <label class="settings-checkbox"><input id="setting-click-through" name="clickThrough" type="checkbox" /> 点击穿透（透明区不挡鼠标）</label>
       <fieldset class="settings-fieldset">
         <legend>Edge TTS（对话朗读）</legend>
         <label class="settings-checkbox" title="开启后自动朗读桌宠对话，并同步口型；关闭后停止">
           <input id="setting-tts-enabled" name="ttsEnabled" type="checkbox" /> 自动朗读所有对话
         </label>
+        <div class="settings-inline">
+          <button id="setting-tts-speak" type="button" title="用 Edge TTS 合成一句话并播放（启用 VTS 时会同步张嘴）">🔊 试听语音</button>
+          <span id="setting-tts-status" class="settings-status" role="status"></span>
+        </div>
         <label>音色
           <select id="setting-tts-voice" name="ttsVoice">
-            <option value="zh-CN-XiaoxiaoNeural">晓晓（女声，中文）</option>
-            <option value="zh-CN-YunxiNeural">云希（男声，中文）</option>
-            <option value="zh-CN-YunjianNeural">云健（男声，中文）</option>
-            <option value="zh-CN-XiaoyiNeural">晓伊（女声，中文）</option>
-            <option value="en-US-AriaNeural">Aria（女声，英文）</option>
+            <optgroup label="中文（女声）">
+              <option value="zh-CN-XiaoxiaoNeural">晓晓</option>
+              <option value="zh-CN-XiaoyiNeural">晓伊</option>
+              <option value="zh-CN-XiaochenNeural">晓辰</option>
+              <option value="zh-CN-XiaohanNeural">晓涵</option>
+              <option value="zh-CN-XiaomengNeural">晓梦</option>
+              <option value="zh-CN-XiaomoNeural">晓墨</option>
+              <option value="zh-CN-XiaoqiuNeural">晓秋</option>
+              <option value="zh-CN-XiaoruiNeural">晓睿</option>
+              <option value="zh-CN-XiaoshuangNeural">晓双</option>
+              <option value="zh-CN-XiaoxuanNeural">晓萱</option>
+              <option value="zh-CN-XiaoyanNeural">晓颜</option>
+              <option value="zh-CN-XiaoyouNeural">晓悠</option>
+              <option value="zh-CN-XiaozhenNeural">晓甄</option>
+            </optgroup>
+            <optgroup label="中文（男声）">
+              <option value="zh-CN-YunxiNeural">云希</option>
+              <option value="zh-CN-YunjianNeural">云健</option>
+              <option value="zh-CN-YunxiaNeural">云夏</option>
+              <option value="zh-CN-YunyangNeural">云扬</option>
+              <option value="zh-CN-YunfengNeural">云枫</option>
+              <option value="zh-CN-YunhaoNeural">云皓</option>
+              <option value="zh-CN-YunjieNeural">云杰</option>
+              <option value="zh-CN-YunzeNeural">云泽</option>
+            </optgroup>
+            <optgroup label="中文（童声/其他）">
+              <option value="zh-CN-XiaobeiNeural">晓北（童声）</option>
+              <option value="zh-CN-liaoning-XiaobeiNeural">晓北（东北）</option>
+              <option value="zh-CN-shaanxi-XiaoniNeural">晓妮（陕西）</option>
+              <option value="zh-HK-HiuMaanNeural">晓曼（粤语）</option>
+              <option value="zh-TW-HsiaoChenNeural">晓臻（台湾）</option>
+            </optgroup>
+            <optgroup label="英文">
+              <option value="en-US-AriaNeural">Aria</option>
+              <option value="en-US-JennyNeural">Jenny</option>
+              <option value="en-US-GuyNeural">Guy</option>
+              <option value="en-GB-SoniaNeural">Sonia（英式）</option>
+            </optgroup>
+            <optgroup label="日文">
+              <option value="ja-JP-NanamiNeural">Nanami</option>
+              <option value="ja-JP-KeitaNeural">Keita</option>
+            </optgroup>
           </select>
         </label>
+        <div class="settings-inline">
+          <button id="setting-tts-voices-refresh" type="button" title="联网拉取 Edge TTS 全部音色（数百个，按语言分组）；失败时保留内置候选">↻ 拉取全部音色</button>
+          <span class="settings-hint">内置列表不满意时点这里</span>
+        </div>
       </fieldset>
       <!-- 语音识别（转写）：与聊天模型分开配；自检按钮用内置合成音频打两条路由 -->
       <fieldset class="settings-fieldset">
@@ -242,10 +287,6 @@
           <input id="setting-vts-hotkey" type="text" maxlength="60" placeholder="VTS 里的热键名，例如「开心」" autocomplete="off" spellcheck="false" />
           <button id="setting-vts-hotkey-run" type="button" title="在当前 VTS 模型里按名字找到热键并触发">触发热键</button>
         </label>
-        <div class="settings-inline">
-          <button id="setting-tts-speak" type="button" title="用 Edge TTS 合成一句话并播放（启用 VTS 时会同步张嘴）">🔊 试听语音</button>
-          <span id="setting-tts-status" class="settings-status" role="status"></span>
-        </div>
       </fieldset>
       <label>Provider<input id="setting-provider" name="provider" placeholder="deepseek / openai / azure" /></label>
       <label>API 地址<input id="setting-base-url" name="baseUrl" placeholder="https://api.deepseek.com" /></label>
@@ -273,8 +314,8 @@
         <input id="setting-sfx-volume" name="sfxVolume" type="range" min="0" max="1" step="0.05" value="0.6" />
         <span id="sfx-volume-display" class="settings-range-value">60%</span>
       </label>
-      <!-- 行为触发：把「用户发言 / 调用工具 / 执行命令 / 开始回答 / 待机搭话 / 出错」各绑一个动作组或表情；
-           选项按当前模型真实可用的动作组与表情生成，模型没有的不播放 -->
+      <!-- 行为触发：用户发言/调用工具/执行命令/开始回答/待机搭话/出错/点击一次/连续点击/拖动/MCP 调用，
+           各绑一个动作组或表情（可选再叠加一个"同时表情"，动作+表情可同时生效）； -->
       <fieldset class="settings-fieldset">
         <legend>行为触发（每个行为绑一个动作或表情）</legend>
         <div id="motion-trigger-body"></div>

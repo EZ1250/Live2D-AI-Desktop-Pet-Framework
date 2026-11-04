@@ -56,6 +56,7 @@ import {
   IPC_TODO_SHOW,
   IPC_TODO_TOGGLE,
   IPC_TTS_SPEAK,
+  IPC_TTS_VOICES,
   IPC_VOICE_CHECK,
   IPC_VOICE_MODELS,
   IPC_VOICE_STATUS,
@@ -65,12 +66,13 @@ import {
   IPC_VTS_TRACKING,
 } from '../shared/contracts';
 import type { PetEventType } from '../shared/contracts';
-import type { AiModelListResult, AppSettings, AssetImportResult, AssetKind, AssetPresetResult, AssetScanResult, ChatLogEntry, AutoTaskRound, ChatLogSnapshot, ChatWindowResult, ModelManifest, PluginManifest, VoiceCheckResult, VoiceModelIndexResult, VoiceStatusResult, VoiceTranscribeRequest, VoiceTranscribeResult, VtsActionName, VtsActionResult, VtsStatusDto } from '../shared/contracts';
+import type { AiModelListResult, AppSettings, AssetImportResult, AssetKind, AssetPresetResult, AssetScanResult, ChatLogEntry, AutoTaskRound, ChatLogSnapshot, ChatWindowResult, ModelManifest, PluginManifest, TtsVoiceListResult, VoiceCheckResult, VoiceModelIndexResult, VoiceStatusResult, VoiceTranscribeRequest, VoiceTranscribeResult, VtsActionName, VtsActionResult, VtsStatusDto } from '../shared/contracts';
 import type { PathResolver } from './PathResolver';
 import { fetchAvailableModels, loadAppSettings, saveAppSettings, TOOL_DEFS } from './ai/chatClient';
 import { checkVoiceRoutes, indexVoiceModels, knownRoute, normalizeVoiceConfig, toBytes, transcribeAudio } from './ai/voice';
 import type { VoiceRoute } from './ai/voice';
 import { speak as speakTts } from './voice/ttsService';
+import { listVoices as listTtsVoices } from './voice/edgeTts';
 import {
   listUserModels,
   listUserPlugins,
@@ -961,6 +963,24 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
     };
   });
 
+  // 拉取 Edge TTS 全部音色（联网；失败返回可读原因，设置页保留内置候选）
+  ipcMain.handle(IPC_TTS_VOICES, async (): Promise<TtsVoiceListResult> => {
+    try {
+      const voices = await listTtsVoices({ timeoutMs: 15_000 });
+      return {
+        ok: true,
+        voices: voices.map((v) => ({
+          shortName: v.shortName,
+          locale: v.locale,
+          gender: v.gender,
+          friendlyName: v.friendlyName,
+        })),
+      };
+    } catch (err) {
+      return { ok: false, error: (err as Error)?.message ?? String(err) };
+    }
+  });
+
 
   ipcMain.handle(IPC_CHAT_WINDOW_OPEN, async (): Promise<ChatWindowResult> => {
     if (!deps.openChatWindow) return { ok: false, error: '主进程未实现聊天窗口' };
@@ -1162,7 +1182,12 @@ function sanitizeSettings(raw: unknown): AppSettings | null {
     if (mode !== 'full' && mode !== 'half') return null;
     settings.displayMode = mode;
   }
-  // 全屏自动收起（布尔）
+  // 全屏自动收起（布尔；默认 false = 全屏时置顶显示）
+  if (input.fullscreenAutoHide !== undefined) {
+    if (typeof input.fullscreenAutoHide !== 'boolean') return null;
+    settings.fullscreenAutoHide = input.fullscreenAutoHide;
+  }
+  // 旧字段兼容：只接受、不参与行为判断（升级后旧的 true 不会再让桌宠全屏消失）
   if (input.hideOnFullscreen !== undefined) {
     if (typeof input.hideOnFullscreen !== 'boolean') return null;
     settings.hideOnFullscreen = input.hideOnFullscreen;
@@ -1258,6 +1283,47 @@ function sanitizeSettings(raw: unknown): AppSettings | null {
       if (Object.keys(cleaned).length) byModel[name] = cleaned;
     }
     settings.motionTriggersByModel = byModel;
+  }
+  // 行为触发"同时播放的表情"：结构与动作映射一致（可选）；坏项丢弃
+  if (input.motionTriggerExpressions !== undefined) {
+    if (input.motionTriggerExpressions !== null && typeof input.motionTriggerExpressions !== 'object') return null;
+    settings.motionTriggerExpressions = cleanTriggerMap(input.motionTriggerExpressions);
+  }
+  if (input.motionTriggerExpressionsByModel !== undefined) {
+    if (input.motionTriggerExpressionsByModel !== null && typeof input.motionTriggerExpressionsByModel !== 'object') return null;
+    const byModel: Record<string, Record<string, string>> = {};
+    for (const [model, map] of Object.entries((input.motionTriggerExpressionsByModel ?? {}) as Record<string, unknown>)) {
+      const name = String(model).trim();
+      if (!name || name.length > 120) continue;
+      const cleaned = cleanTriggerMap(map);
+      if (Object.keys(cleaned).length) byModel[name] = cleaned;
+    }
+    settings.motionTriggerExpressionsByModel = byModel;
+  }
+  // 附加目标的播放方式：只收 simultaneous / chain，坏项丢弃
+  const cleanModeMap = (raw: unknown): Record<string, 'simultaneous' | 'chain'> => {
+    const cleaned: Record<string, 'simultaneous' | 'chain'> = {};
+    if (!raw || typeof raw !== 'object') return cleaned;
+    for (const key of BEHAVIOR_KEYS) {
+      const value = (raw as Record<string, unknown>)[key];
+      if (value === 'simultaneous' || value === 'chain') cleaned[key] = value;
+    }
+    return cleaned;
+  };
+  if (input.motionTriggerPairModes !== undefined) {
+    if (input.motionTriggerPairModes !== null && typeof input.motionTriggerPairModes !== 'object') return null;
+    settings.motionTriggerPairModes = cleanModeMap(input.motionTriggerPairModes);
+  }
+  if (input.motionTriggerPairModesByModel !== undefined) {
+    if (input.motionTriggerPairModesByModel !== null && typeof input.motionTriggerPairModesByModel !== 'object') return null;
+    const byModel: Record<string, Record<string, 'simultaneous' | 'chain'>> = {};
+    for (const [model, map] of Object.entries((input.motionTriggerPairModesByModel ?? {}) as Record<string, unknown>)) {
+      const name = String(model).trim();
+      if (!name || name.length > 120) continue;
+      const cleaned = cleanModeMap(map);
+      if (Object.keys(cleaned).length) byModel[name] = cleaned;
+    }
+    settings.motionTriggerPairModesByModel = byModel;
   }
   // 桌宠窗口位置/尺寸：整数、范围宽松夹取（不合法就整体拒绝保存，与其它字段一致）。
   // 范围只防明显的脏值；"是否在可见显示器内"由 mainImpl 在恢复时判断。

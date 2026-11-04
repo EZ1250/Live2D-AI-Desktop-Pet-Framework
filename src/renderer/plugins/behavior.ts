@@ -17,6 +17,10 @@
     ai_start: ['motion:Idle'],
     model_idle: ['motion:Idle'],
     error: ['emotion:surprised', 'emotion:angry', 'emotion:sad', 'motion:Shake'],
+    click: ['click', 'motion:Tap', 'motion:TapBody'],
+    multiClick: ['motion:wave', 'motion:Tap', 'click'],
+    drag: ['motion:Idle', 'costume', 'motion:Tap'],
+    mcp: ['motion:Idle', 'motion:Tap', 'costume'],
   };
   /** 同一行为的两次触发最小间隔 */
   const DEBOUNCE_MS: Record<string, number> = {
@@ -26,6 +30,10 @@
     ai_start: 0,
     model_idle: 8000,
     error: 1000,
+    click: 250,
+    multiClick: 800,
+    drag: 600,
+    mcp: 300,
   };
 
   const plugin = {
@@ -36,12 +44,23 @@
 
       let byModel: Record<string, Record<string, string>> = {};
       let legacy: Record<string, string> = {};
+      /** 行为 → 附加播放的目标（动作组或表情，编码 motion:/expr:；当前模型生效的那一份） */
+      let pairedTargets: Record<string, string> = {};
+      /** 行为 → 附加目标的播放方式：simultaneous（同时，默认）/ chain（衔接） */
+      let pairModes: Record<string, string> = {};
+      /** 衔接模式下的延时回调：换模型/重载配置时清掉，避免旧模型的目标打断新模型 */
+      const chainTimers: Any[] = [];
       let modelName = '';
       let labels: Record<string, string> = {};
       let keys: string[] = [];
       let triggers: Record<string, string> = {};
       const lastAt: Record<string, number> = {};
       const warned = new Set<string>();
+      /** 衔接等待时长：表情等它的保持时长前一点，动作按常见动作时长估 */
+      const PAIR_CHAIN_EXPRESSION_MS = 2400;
+      const PAIR_CHAIN_MOTION_MS = 1600;
+      /** 测试/调试可用 config.chainDelayMs 覆盖衔接延时 */
+      let chainDelayOverride = 0;
 
       const motions = (): string[] => model().motions();
       const expressions = (): string[] => model().expressions();
@@ -102,14 +121,33 @@
         return null;
       };
 
-      /** 触发一次行为：去抖 → 解析目标 → 没有就不播放 */
+      /** 解析附加目标：动作/表情都允许；旧配置只存表情名（无前缀）时按表情兼容 */
+      const resolvePairTarget = (behavior: string): Any => {
+        const raw = typeof pairedTargets[behavior] === 'string' ? pairedTargets[behavior].trim() : '';
+        if (!raw) return null;
+        const direct = resolveCandidate(raw);
+        if (direct) return direct;
+        if (!raw.startsWith('motion:') && !raw.startsWith('expr:') && !raw.startsWith('emotion:')) {
+          return resolveCandidate(`expr:${raw}`) ?? resolveCandidate(`motion:${raw}`);
+        }
+        return null;
+      };
+
+      /** 应用一个已解析目标（动作 → playMotion；表情 → holdExpression） */
+      const applyAction = (target: Any): void => {
+        if (target.kind === 'motion') render().playMotion(target.name);
+        else render().holdExpression(target.name);
+      };
+
+      /** 触发一次行为：去抖 → 解析主目标 + 附加目标 → 按"同时/衔接"应用 */
       const fire = (behavior: string): boolean => {
         if (!render().ready()) return false;
         const now = Date.now();
         if (now - (lastAt[behavior] ?? 0) < (DEBOUNCE_MS[behavior] ?? 0)) return false;
         lastAt[behavior] = now;
         const target = resolveTarget(behavior);
-        if (!target) {
+        const pair = resolvePairTarget(behavior);
+        if (!target && !pair) {
           // 明确配了目标却解析不出来（换了模型 / 名字写错）：提醒一次，否则就是"配了完全没反应"
           const raw = (triggers[behavior] ?? 'auto').trim();
           if (raw && raw !== 'auto' && !warned.has(behavior)) {
@@ -121,13 +159,43 @@
           }
           return false;
         }
-        if (target.kind === 'motion') render().playMotion(target.name);
-        else render().holdExpression(target.name);
+        // 主目标
+        if (target) applyAction(target);
+        // 附加目标：同时=立即一起应用；衔接=主目标之后再应用
+        const sameTarget = Boolean(target && pair && target.kind === pair.kind && target.name === pair.name);
+        if (pair && !sameTarget) {
+          const mode = pairModes[behavior] === 'chain' ? 'chain' : 'simultaneous';
+          if (mode === 'chain') {
+            const delay = chainDelayOverride > 0
+              ? chainDelayOverride
+              : target
+                ? (target.kind === 'expression' ? PAIR_CHAIN_EXPRESSION_MS : PAIR_CHAIN_MOTION_MS)
+                : 0;
+            if (delay <= 0) {
+              applyAction(pair);
+            } else {
+              const timer = setTimeout(() => {
+                if (render().ready()) {
+                  try {
+                    applyAction(pair);
+                  } catch (err) {
+                    console.warn('[renderer] 衔接目标播放失败：', err);
+                  }
+                }
+              }, delay);
+              chainTimers.push(timer);
+            }
+          } else {
+            applyAction(pair);
+          }
+        }
         return true;
       };
 
       const state = (): Any => ({
         triggers: computeTriggers(),
+        pairedTargets: { ...pairedTargets },
+        pairModes: { ...pairModes },
         motions: motions(),
         expressions: expressions(),
         debounceMs: { ...DEBOUNCE_MS },
@@ -138,9 +206,20 @@
       ctx.on('behavior:config', (config: Any) => {
         byModel = config?.byModel ?? {};
         legacy = config?.legacy ?? {};
+        pairedTargets = config?.expressions ?? {};
+        pairModes = config?.pairModes ?? {};
+        chainDelayOverride = Number.isFinite(config?.chainDelayMs) ? Number(config.chainDelayMs) : 0;
         modelName = config?.modelName ?? '';
         labels = config?.labels ?? {};
         keys = Array.isArray(config?.keys) ? config.keys : [];
+        // 换模型/重载配置：清掉尚未执行的"衔接"回调
+        while (chainTimers.length) {
+          try {
+            clearTimeout(chainTimers.pop());
+          } catch {
+            /* ignore */
+          }
+        }
         triggers = computeTriggers();
         warned.clear();
       });

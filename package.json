@@ -16,7 +16,7 @@
     "check": "npm test",
     "build:all": "npm run build:tsc && npm run assemble",
     "start": "chcp 65001 > nul && electron .",
-    "prestart": "npm run build:all",
+    "prestart": "npm run import && npm run build:all",
     "check:tts": "node scripts/check-edge-tts.js",
     "check:vts": "node scripts/check-vts.js",
     "build": "npm run import && npm run build:tsc && npm run assemble && node scripts/build-portable.js",
