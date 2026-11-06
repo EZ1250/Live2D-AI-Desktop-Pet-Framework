@@ -213,7 +213,13 @@ export interface AssetPresetResult {
   /** 重新识别能力(action=detect)时：内容是否真的有变化 */
   changed?: boolean;
   /** 解析后的预设（get） */
-  preset?: { framing?: 'full' | 'half'; emotionMap?: Record<string, string>; parameterMap?: Record<string, string> };
+  preset?: {
+    framing?: 'full' | 'half';
+    /** 静态立绘显示方式：contain=始终完整显示（使用说明类立绘）；缺省/framing=跟随全局取景 */
+    portraitFit?: 'contain' | 'framing';
+    emotionMap?: Record<string, string>;
+    parameterMap?: Record<string, string>;
+  };
   /** 预设文件的问题清单（坏 JSON / 字段类型不对等） */
   issues?: string[];
   /** 该模型可用的表情名（写模板时列出来，省得用户去翻 model3.json） */
@@ -544,6 +550,8 @@ export interface TtsAudioPayload {
   ms: number;
   /** ok=false 时的可读原因 */
   error?: string;
+  /** 选定的音色 Edge 不支持时自动回退默认音色；这里记录原音色名（用于提示用户） */
+  fallbackFrom?: string;
 }
 
 /** 待办条目（渲染层可见形态） */
@@ -599,6 +607,8 @@ export interface ModelManifest {
    */
   preset?: {
     framing?: 'full' | 'half';
+    /** 静态立绘显示方式：contain=始终完整显示（使用说明类立绘）；缺省/framing=跟随全局取景 */
+    portraitFit?: 'contain' | 'framing';
     emotionMap?: Record<string, string>;
     parameterMap?: Record<string, string>;
     /** 自动识别出的能力归类（点击触发/服饰道具/情绪表情/动作组） */
@@ -745,7 +755,7 @@ export interface ElectronAPI {
    */
   onVtsEvent?(cb: (event: VtsEventDto) => void): () => void;
   /** 让主进程用 Edge TTS 合成一句话；音频经 onTtsAudio 推回来。 */
-  ttsSpeak?(text: string, voice?: string, requestId?: string): Promise<{ ok: boolean; requestId?: string; error?: string; bytes?: number }>;
+  ttsSpeak?(text: string, voice?: string, requestId?: string): Promise<{ ok: boolean; requestId?: string; error?: string; bytes?: number; fallbackFrom?: string }>;
   /** 拉取 Edge TTS 全部可用音色（需联网；失败返回 ok=false，不影响内置候选）。 */
   ttsVoices?(): Promise<TtsVoiceListResult>;
   /** 订阅 TTS 合成结果（渲染层用 new Audio(payload.dataUrl).play() 播放）。 */

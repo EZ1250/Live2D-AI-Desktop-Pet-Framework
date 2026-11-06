@@ -1,4 +1,4 @@
-﻿# 第三方资源与许可 / Third-Party Notices
+# 第三方资源与许可 / Third-Party Notices
 
 本仓库原创的代码与文档采用 **MIT**（见 [`LICENSE`](LICENSE)）。
 
@@ -20,14 +20,14 @@ that MIT grant and keep their own terms — verify each one before redistributin
 
 > ⚠️ **Live2D Cubism Core 是最需要注意的一个。** 它是 Live2D Inc. 的产品，
 > 有独立的使用与再分发条款（尤其商用场景）。公开或商用前请到 Live2D 官网确认你符合其许可。
-> 本项目仓库只包含一张静态示例立绘和托盘图标；用户的 Live2D 骨骼模型应放入本机用户数据目录。
+> 本项目仓库只包含一张「使用说明」立绘和托盘图标；用户的 Live2D 骨骼模型应放入本机用户数据目录。
 
 ## 素材 / Assets
 
 | 文件 | 说明 |
 |---|---|
-| `local-assets/大肥鱼/whale.png` | 本项目内置的静态立绘占位图 |
-| `local-assets/tray-icon.png` | 托盘图标 |
+| `local-assets/使用说明/使用说明.png` | 本项目内置的「使用说明」立绘（项目自有素材，非第三方） |
+| `local-assets/tray-icon.png`、`local-assets/pet-icon.ico` | 托盘/窗口/快捷方式图标（项目自有素材） |
 
 ## npm 依赖 / npm dependencies
 

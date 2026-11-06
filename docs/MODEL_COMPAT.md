@@ -47,6 +47,7 @@ VTS 导出的模型（带 `.vtube.json`）会在挂载前合并表情/动作，�
 | 贴图解码 `SecurityError: Failed to construct 'Worker'` | CSP 未放行 blob worker | CSP 加 `worker-src 'self' blob:`（index.html + 静态服务两处） |
 | VTS 模型右键菜单没有表情/动作 | 表情/动作写在 `.vtube.json`，`model3.json` 的 `FileReferences` 是空的 | 挂载前把 Exp3/Animation 合并进内存 model3（`normalizeModelSettings`） |
 | VTS 模型只有眨眼、头不跟鼠标 | 模型用自定义控制器参数（`AngleX/PositionX`），标准 `ParamAngleX` 并不存在 | 读 `.vtube.json` 的 `ParameterSettings` 做映射，并在 `internalModel.updateFocus` 写参数（物理才会跟随） |
+| 头发尖/衣领/肩部边缘出现方块或斜三角"切边" | Cubism 运行库默认把裁剪蒙版画进 **256×256** 离屏纹理；桌宠把模型缩放到窗口尺寸（尤其半身放大）后，蒙版被放大采样 | 挂载后、首帧前把 `ClippingManager` 缓冲提升到 **1024~2048**（按显示像素×2、封顶 2048），并清掉已缓存的蒙版纹理（`live2d.ts` 的 `upgradeClippingMask`）；`__petDebug.moc3Debug().clippingMask` 可查实际值 |
 
 ### 3.2 还想支持 moc3 v6（Cubism 5.3）怎么办
 
@@ -66,6 +67,18 @@ VTS 导出的模型（带 `.vtube.json`）会在挂载前合并表情/动作，�
 不要用 `git checkout` 单独回退 `src/renderer/lib/`：当前 `live2d.ts` 只支持这一套单栈
 （Pixi 6 + pixi-live2d-display 0.4），回退文件而不回退代码会直接渲染失败。
 要换版本：改脚本顶部的 URL/版本标记 → 重跑脚本 → `npm run build:all`。
+
+### 3.5 静态立绘的显示方式（portraitFit）
+
+模型目录里的 `pet-model.json` 可加：
+
+```json
+{ "portraitFit": "contain" }
+```
+
+- 默认（缺省 / `"framing"`）：立绘跟随全局取景，半身模式会放大并裁切；
+- `"contain"`：**始终完整显示整张图**（等比缩放、不裁切），适合「使用说明」这类需要看清文字的立绘。
+  随包的内置模型 `使用说明` 就是用这个模式，否则半身取景会把说明文字裁掉。
 
 ## 4. 代码在哪里
 

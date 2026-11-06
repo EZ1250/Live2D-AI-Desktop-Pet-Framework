@@ -1,0 +1,6 @@
+{
+  "_说明": "内置「使用说明」立绘模型：作为没有模型时的引导图，提示用户如何导入 Live2D 模型。",
+  "_位置说明": "本目录在 local-assets/ 下：npm run import 会合并到 public/assets/ 并参与打包。",
+  "framing": "full",
+  "portraitFit": "contain"
+}

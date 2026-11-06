@@ -254,6 +254,11 @@ test('Edge TTS 播放接线：speak handler + 渲染层播放 + 说话时 VTS �
     rendererSrc.indexOf("emitBehavior('drag')") < rendererSrc.indexOf("window.addEventListener('pointerup'"),
     '「拖动」行为必须在 pointermove 阶段即刻触发',
   );
+  // 裁剪蒙版分辨率：Cubism 默认 256²，桌宠缩放后会出现方块/斜三角边缘，必须提升
+  assert.ok(
+    readSrc('src/renderer/live2d.ts').includes('setClippingMaskBufferSize'),
+    'live2d.ts 应提升裁剪蒙版缓冲分辨率（避免模型边缘方块/斜三角锯齿）',
+  );
   // TTS 试听按钮已挪到 Edge TTS 区（在 VTS 区之前），且位于「自动朗读」与「音色」之间
   assert.ok(
     html.indexOf('id="setting-tts-speak"') < html.indexOf('id="setting-vts-enabled"'),

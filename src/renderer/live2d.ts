@@ -611,6 +611,9 @@
 
     let model: Any = null;
     let destroyed = false;
+    /** 裁剪蒙版诊断：实际设置进去的缓冲尺寸 / 是否找到 manager */
+    let clipMaskSize = 0;
+    let clipMaskManagerFound = false;
     let natW = 0;   // scale=1 时的模型宽(逻辑px)，refit 时记录
     let natH = 0;
     let lastW = 0;
@@ -939,6 +942,40 @@
           return null;
         }
         model = m;
+        /**
+         * 提升 Live2D 裁剪蒙版分辨率。
+         *
+         * Cubism 运行库默认把裁剪蒙版画到 **256×256** 的离屏纹理里
+         * （`CubismClippingManager_WebGL._clippingMaskBufferSize = 256`）。
+         * 桌宠把模型缩放到几百像素高之后，这个 256² 的蒙版被放大采样，
+         * 蒙版边界就会出现明显的方块/斜三角锯齿（头发尖、衣领、肩部最常见，
+         * 看起来像"模型边缘被切成直边/缺了一块"）。
+         * 在**第一次绘制之前**把缓冲提到 1024~2048，边缘会平滑很多。
+         */
+        function upgradeClippingMask(im: Any): void {
+          try {
+            const renderer = im && im.renderer;
+            const manager =
+              (renderer && typeof renderer.getClippingManager === 'function' && renderer.getClippingManager()) ||
+              (renderer && renderer._clippingManager) ||
+              null;
+            if (!manager || typeof manager.setClippingMaskBufferSize !== 'function') return;
+            clipMaskManagerFound = true;
+            const canvasEl = view as HTMLCanvasElement | undefined;
+            const cssW = Math.max(1, (canvasEl && canvasEl.clientWidth) || 418);
+            const cssH = Math.max(1, (canvasEl && canvasEl.clientHeight) || 646);
+            // 至少 1024；按显示像素的 2 倍给，封顶 2048（再大收益很小、显存/填充开销明显）
+            const size = Math.min(2048, Math.max(1024, Math.ceil(Math.max(cssW, cssH) * dpr() * 2)));
+            clipMaskSize = size;
+            manager.setClippingMaskBufferSize(size);
+            // 运行库按帧缓存蒙版纹理；清掉它，确保下一帧按新尺寸重建
+            try { manager._maskTexture = null; } catch { /* 私有字段，缺了也不影响 */ }
+            console.log(`[live2d] 裁剪蒙版分辨率：${size}×${size}（运行库默认 256）`);
+          } catch (err) {
+            console.warn('[live2d] 提升裁剪蒙版分辨率失败（不影响渲染）', err);
+          }
+        }
+        upgradeClippingMask(model.internalModel);
         model.autoUpdate = false; // 由本层 update 手动驱动（与统一 RAF 同步）
         model.interactive = true;
         app.stage.addChild(model);
@@ -1817,6 +1854,8 @@
               })(),
               modelRendererSet: Boolean(model && model.renderer),
               internalModelKeys: im ? Object.keys(im).slice(0, 30) : null,
+              // 裁剪蒙版诊断：0 = 没找到 manager（该模型可能不用蒙版）；>0 = 实际设进去的缓冲尺寸
+              clippingMask: { size: clipMaskSize, manager: clipMaskManagerFound },
               // 网络层证据：贴图/moc3 到底请求了哪些 URL、回了多少字节（换运行库排查最有用）
               resources: (() => {
                 try {
@@ -2173,9 +2212,11 @@
   /* ============================================================
      portrait：<img> + CSS transform 待机动画
      ============================================================ */
-  function mountPortrait(input: { container: HTMLElement; url: string }): RenderHandle | null {
+  function mountPortrait(input: { container: HTMLElement; url: string; fit?: 'contain' | 'framing' }): RenderHandle | null {
     const box = document.createElement('div');
     box.className = 'pet-media';
+    /** contain：始终完整显示整张图（使用说明类立绘），不跟随半身取景放大裁切 */
+    const containMode = input.fit === 'contain';
 
     const img = document.createElement('img');
     img.className = 'pet-portrait';
@@ -2275,16 +2316,17 @@
         // body.framing-half .pet-portrait），放大后画面顶部就是头顶附近，再按 Live2D 的
         // 0.28 往下推会在头顶上方留出一大块空白（实测过），0.05 刚好让头顶贴住上沿。
         const boxH = box.getBoundingClientRect().height || 1;
-        const frameShift = framingMode === 'half' ? boxH * HALF_SHIFT_RATIO_PORTRAIT : 0;
+        const frameShift = !containMode && framingMode === 'half' ? boxH * HALF_SHIFT_RATIO_PORTRAIT : 0;
         const gazeX = gazeCX * 8 + waveX;
         const gazeY = gazeCY * 3;
         const rotateY = gazeCX * 6;
         const tiltGaze = -gazeCY * 2;
+        const fitZoom = containMode ? 1 : framingZoom();
         img.style.transform =
           `perspective(900px) translate3d(${gazeX.toFixed(2)}px, ${(lift + gazeY + frameShift).toFixed(2)}px, 0) ` +
           `rotate(${(tilt + waveRot + tiltGaze).toFixed(2)}deg) ` +
           `rotateY(${rotateY.toFixed(2)}deg) ` +
-          `scale(${(breathe * zoomK * framingZoom()).toFixed(4)})`;
+          `scale(${(breathe * zoomK * fitZoom).toFixed(4)})`;
       },
       destroy(): void {
         box.remove();

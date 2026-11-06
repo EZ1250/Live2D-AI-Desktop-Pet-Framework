@@ -146,6 +146,21 @@ test('应用图标资源：托盘 PNG 与快捷方式 ICO 存在、格式正确�
   assert.ok(yml.includes('local-assets/pet-icon.ico'), 'electron-builder 应把 pet-icon.ico 作为 extraResource 带出');
 });
 
+test('内置模型：使用说明立绘存在，旧的大肥鱼资源已替换', () => {
+  const img = path.join(APP, 'local-assets', '使用说明', '使用说明.png');
+  assert.ok(fs.existsSync(img), '内置模型应使用「使用说明」立绘');
+  assert.ok(fs.statSync(img).size > 100_000, '使用说明立绘不应是空图');
+  assert.ok(!fs.existsSync(path.join(APP, 'local-assets', '大肥鱼')), '旧的大肥鱼内置模型目录应已删除');
+  assert.ok(
+    fs.existsSync(path.join(APP, 'local-assets', '使用说明', 'pet-model.json')),
+    '使用说明模型应带 pet-model.json（framing 等预设）',
+  );
+  assert.ok(
+    read('local-assets/使用说明/pet-model.json').includes('"portraitFit": "contain"'),
+    '使用说明立绘应强制 contain（完整显示整张图，不跟随半身取景裁切）',
+  );
+});
+
 test('设置页：空状态行不占高度（「试听语音」下面不应多出空行）', () => {
   const css = read('src/renderer/styles.css');
   assert.ok(css.includes('.settings-inline .settings-status:empty'), '空状态行应隐藏占位高度');

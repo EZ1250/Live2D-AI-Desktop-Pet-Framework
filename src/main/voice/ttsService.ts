@@ -47,6 +47,16 @@ export interface TtsSpeakResult {
   bytes: number;
   ms: number;
   error?: string;
+  /** 选定的音色 Edge 不支持时自动回退到了默认音色；这里记原音色名 */
+  fallbackFrom?: string;
+}
+
+/**
+ * 音色不可用（Edge 只支持一部分音色；Azure 专属音色会直接关流）。
+ * msedge-tts 对这类情况的报错是 "Stream closed before the synthesis completed (no turn.end received)"。
+ */
+function isVoiceUnavailableError(message: string): boolean {
+  return /stream closed before the synthesis completed|no turn\.end|voice.*(not found|unsupported|invalid)/i.test(message);
 }
 
 /** mp3 → 可直接给 <audio src> 的 data URL */
@@ -83,25 +93,40 @@ export async function speak(
   let payload: TtsAudioPayload;
   try {
     const mp3 = await synth(originalText, options);
-    const bytes = mp3 ? mp3.length : 0;
-    if (!bytes) {
-      payload = {
-        ok: false, requestId, text: originalText, voice, mime: TTS_AUDIO_MIME, dataUrl: '',
-        bytes: 0, ms: Date.now() - startedAt, error: 'Edge TTS 没有返回音频数据',
-      };
-    } else {
-      payload = {
-        ok: true, requestId, text: originalText, voice, mime: TTS_AUDIO_MIME,
-        dataUrl: toAudioDataUrl(mp3), bytes, ms: Date.now() - startedAt,
-      };
-    }
+    if (!mp3 || !mp3.length) throw new Error('Edge TTS 没有返回音频数据');
+    payload = {
+      ok: true, requestId, text: originalText, voice, mime: TTS_AUDIO_MIME,
+      dataUrl: toAudioDataUrl(mp3), bytes: mp3.length, ms: Date.now() - startedAt,
+    };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    options.logger?.(`[tts] 合成失败：${message}`);
-    payload = {
-      ok: false, requestId, text: originalText, voice, mime: TTS_AUDIO_MIME, dataUrl: '',
-      bytes: 0, ms: Date.now() - startedAt, error: message,
-    };
+    // 回退：明确是"音色不被 Edge 支持"且当前不是默认音色 → 用默认音色再合成一次
+    if (voice !== DEFAULT_VOICE && isVoiceUnavailableError(message)) {
+      try {
+        const mp3 = await synth(originalText, { ...options, voice: DEFAULT_VOICE });
+        if (!mp3 || !mp3.length) throw new Error('Edge TTS 没有返回音频数据');
+        options.logger?.(`[tts] 音色 ${voice} 不可用，已自动回退默认音色 ${DEFAULT_VOICE}`);
+        payload = {
+          ok: true, requestId, text: originalText, voice: DEFAULT_VOICE, mime: TTS_AUDIO_MIME,
+          dataUrl: toAudioDataUrl(mp3), bytes: mp3.length, ms: Date.now() - startedAt,
+          fallbackFrom: voice,
+        };
+      } catch (fallbackErr) {
+        const fallbackMessage = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+        options.logger?.(`[tts] 合成失败：${message}；默认音色回退也失败：${fallbackMessage}`);
+        payload = {
+          ok: false, requestId, text: originalText, voice, mime: TTS_AUDIO_MIME, dataUrl: '',
+          bytes: 0, ms: Date.now() - startedAt,
+          error: `${message}（音色 ${voice} 可能不被 Edge 支持，默认音色回退也失败：${fallbackMessage}）`,
+        };
+      }
+    } else {
+      options.logger?.(`[tts] 合成失败：${message}`);
+      payload = {
+        ok: false, requestId, text: originalText, voice, mime: TTS_AUDIO_MIME, dataUrl: '',
+        bytes: 0, ms: Date.now() - startedAt, error: message,
+      };
+    }
   }
 
   if (target) {
@@ -120,6 +145,7 @@ export async function speak(
     voice: payload.voice,
     bytes: payload.bytes,
     ms: payload.ms,
+    ...(payload.fallbackFrom ? { fallbackFrom: payload.fallbackFrom } : {}),
     ...(payload.error ? { error: payload.error } : {}),
   };
 }

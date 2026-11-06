@@ -441,12 +441,12 @@ test('VTS 事件转发给 onEvent：热键事件原样带上名字；模型事�
   assert.equal(received[0].kind, 'hotkeyTriggered');
   assert.equal(received[0].hotkeyName, '开心');
 
-  liveConn.send(eventEnvelope('ModelLoadedEvent', { modelLoaded: true, modelName: '大肥鱼', modelID: 'mid-2' }));
+  liveConn.send(eventEnvelope('ModelLoadedEvent', { modelLoaded: true, modelName: '示例模型', modelID: 'mid-2' }));
   assert.equal(await waitFor(() => received.length >= 2), true);
   const model = received.find((event) => event.kind === 'modelLoaded');
   assert.ok(model);
-  assert.equal(model.modelName, '大肥鱼');
-  assert.equal(service.status().modelName, '大肥鱼', 'ModelLoadedEvent 应顺手刷新 status 里的模型名');
+  assert.equal(model.modelName, '示例模型');
+  assert.equal(service.status().modelName, '示例模型', 'ModelLoadedEvent 应顺手刷新 status 里的模型名');
   assert.equal(service.status().modelLoaded, true);
 });
 

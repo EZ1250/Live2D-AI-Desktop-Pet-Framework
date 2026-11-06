@@ -95,7 +95,7 @@ function hotkeyEvent(hotkeyName, extra = {}) {
     hotkeyAction: 'ToggleExpression',
     hotkeyTriggeredByAPI: false,
     modelID: 'mid',
-    modelName: '大肥鱼',
+    modelName: '示例模型',
     at: '2026-01-01T00:00:00.000Z',
     ...extra,
   };
@@ -168,7 +168,7 @@ test('表情设置抛错时退回同名动作组（不把事件整个吞掉）',
 test('ModelLoadedEvent 只记录、不驱动模型（换模型不等于播动作）', () => {
   const calls = [];
   const harness = createHarness({ handle: stubHandle({ calls }) });
-  harness.apply({ kind: 'modelLoaded', modelLoaded: true, modelName: '大肥鱼', modelID: 'mid', at: '2026-01-01T00:00:00.000Z' });
+  harness.apply({ kind: 'modelLoaded', modelLoaded: true, modelName: '示例模型', modelID: 'mid', at: '2026-01-01T00:00:00.000Z' });
   assert.deepEqual(calls, []);
   assert.equal(harness.context.vtsEventCount, 1);
   assert.equal(harness.context.lastVtsEventAction, 'modelLoaded');

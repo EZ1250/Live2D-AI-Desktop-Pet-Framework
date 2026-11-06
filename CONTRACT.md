@@ -107,7 +107,11 @@ asar 内 `renderer/index.html` → asar 内 `public/renderer/index.html` → `di
   两边常量必须一致（`tests/assetIntegrity.test.js` 有断言）。
 - 音色列表：`IPC_TTS_VOICES`（invoke）由主进程 `edgeTts.listVoices()` 联网拉取，返回
   `{ok, voices:[{shortName,locale,gender,friendlyName}]}`；设置页「↻ 拉取全部音色」按钮触发。
-  内置候选在 `index.html`（>=20 个，不联网可用），拉取失败时保留内置候选。
+  内置候选在 `index.html`，**只列 Edge 实际支持的音色**（Azure 专属音色会让 Edge 直接关流，
+  报 `Stream closed before the synthesis completed`），拉取失败时保留内置候选。
+- 音色兼容回退：合成时若报「音色不被 Edge 支持」类错误，主进程自动改用默认音色
+  （`zh-CN-XiaoxiaoNeural`）重试一次；成功时结果带 `fallbackFrom`，设置页提示「该音色不可用，
+  已自动改用默认音色」。非音色类错误（网络等）不回退，直接按失败返回。
 - 合成失败不抛异常：`ttsService.speak()` 返回 `ok:false + error`，渲染层写设置页状态行。
 
 ## 行为触发（设置 → 行为触发）

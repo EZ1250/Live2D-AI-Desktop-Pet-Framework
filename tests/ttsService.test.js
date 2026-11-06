@@ -121,6 +121,56 @@ test('speak：没有目标窗口时只合成不推送', async () => {
   assert.equal(result.bytes, FAKE_MP3.length);
 });
 
+test('speak：音色不被 Edge 支持时自动回退默认音色，并带 fallbackFrom 提示', async () => {
+  const target = createTarget();
+  const voices = [];
+  const result = await speak(target, '你好', {
+    voice: 'zh-CN-XiaomoNeural',
+    synthesize: async (_text, options) => {
+      voices.push(options.voice);
+      if (options.voice === 'zh-CN-XiaomoNeural') {
+        throw new Error('Edge TTS 合成失败：Stream closed before the synthesis completed (no turn.end received). The audio is likely truncated.');
+      }
+      return FAKE_MP3;
+    },
+  });
+  assert.deepEqual(voices, ['zh-CN-XiaomoNeural', 'zh-CN-XiaoxiaoNeural'], '应先用原音色，再回退默认音色');
+  assert.equal(result.ok, true);
+  assert.equal(result.voice, 'zh-CN-XiaoxiaoNeural');
+  assert.equal(result.fallbackFrom, 'zh-CN-XiaomoNeural');
+  assert.equal(target.pushed[0].payload.voice, 'zh-CN-XiaoxiaoNeural');
+  assert.equal(target.pushed[0].payload.fallbackFrom, 'zh-CN-XiaomoNeural');
+});
+
+test('speak：默认音色本身失败时不再回退，按失败返回', async () => {
+  const target = createTarget();
+  let calls = 0;
+  const result = await speak(target, '你好', {
+    synthesize: async () => {
+      calls += 1;
+      throw new Error('Edge TTS 合成失败：Stream closed before the synthesis completed (no turn.end received).');
+    },
+  });
+  assert.equal(calls, 1, '默认音色失败不应再重试');
+  assert.equal(result.ok, false);
+  assert.match(result.error, /Stream closed/);
+});
+
+test('speak：非音色类错误不触发回退（网络错误直接失败）', async () => {
+  const target = createTarget();
+  let calls = 0;
+  const result = await speak(target, '你好', {
+    voice: 'zh-CN-YunxiNeural',
+    synthesize: async () => {
+      calls += 1;
+      throw new Error('网络不可达');
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.ok, false);
+  assert.equal(result.fallbackFrom, undefined);
+});
+
 test('toAudioDataUrl 与建议频道常量', () => {
   assert.equal(toAudioDataUrl(Buffer.from('ab')), 'data:audio/mpeg;base64,YWI=');
   assert.equal(IPC_TTS_SPEAK, 'pet:tts:speak');

@@ -53,6 +53,12 @@ export interface ModelDescriptor {
 export interface ModelPreset {
   /** 建议取景（仅当用户设置里没选过 displayMode 时作为默认值） */
   framing?: 'full' | 'half';
+  /**
+   * 静态立绘（portrait）的显示方式：
+   *  - 'framing'（默认）：跟随全局取景，半身时放大裁切；
+   *  - 'contain'：始终完整显示整张图（不放大/不裁切），适合「使用说明」这类要看清文字的立绘。
+   */
+  portraitFit?: 'contain' | 'framing';
   /** 情绪标签 → 该模型的表情名（优先于内置模糊匹配，名字不存在则忽略） */
   emotionMap?: Record<string, string>;
   /** 逻辑参数名 → 模型实际参数 ID（不同模型命名不一致时的兼容映射） */
@@ -332,6 +338,11 @@ export class PathResolver {
       preset.framing = obj.framing;
     } else if (obj.framing !== undefined) {
       issues.push(`pet-model.json framing 只能是 "full" 或 "half"（当前 ${JSON.stringify(obj.framing).slice(0, 24)}）`);
+    }
+    if (obj.portraitFit === 'contain' || obj.portraitFit === 'framing') {
+      preset.portraitFit = obj.portraitFit;
+    } else if (obj.portraitFit !== undefined) {
+      issues.push(`pet-model.json portraitFit 只能是 "contain" 或 "framing"（当前 ${JSON.stringify(obj.portraitFit).slice(0, 24)}）`);
     }
     for (const key of ['emotionMap', 'parameterMap'] as const) {
       const val = obj[key];

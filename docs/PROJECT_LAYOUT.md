@@ -11,7 +11,7 @@
 | `scripts/` | 人写的工具脚本 | 构建、导入、迁移、体检、运行库升级 |
 | `tests/` | 人写的测试 | `npm test` 入口（devTools 单测） |
 | `docs/` | 文档 | 模型适配说明与 `pet-model.json` 模板 |
-| `local-assets/` | 种子/覆盖层 | import 时合并进 `public/assets/`；模型投放点 `live2d_models/`、技能 `skills/`、内置立绘 `大肥鱼/`、托盘图标 `tray-icon.png` |
+| `local-assets/` | 种子/覆盖层 | import 时合并进 `public/assets/`；模型投放点 `live2d_models/`、技能 `skills/`、内置立绘 `使用说明/`、托盘图标 `tray-icon.png` |
 | `personas/` | 语料层 | import 时并进 `assets/knowledge/`（同名覆盖） |
 | `public/` | 生成物 | `assets/`（import 产物）、`renderer/`（assemble 产物） |
 | `dist/` | 生成物 | tsc 产物；`dist/renderer` 是加载页面的最后一层兜底 |
@@ -76,7 +76,6 @@ src/
 | `build-portable.js` | 调 electron-builder 出 nsis + portable，并生成 `README_PORTABLE.md` | ✅ `npm run build` |
 | `check-privacy.js` | 扫描打包输入（`dist/`、`public/`、`local-assets/`）与产物中的隐私文件/密钥，并用本机真实 Key 比对 | ✅ `npm run check:privacy`（`build-portable.js` 在打包前后自动调用） |
 | `check-model.js` | 体检单个模型能否被当前运行库渲染 | 手动：`node scripts/check-model.js "<模型目录>"` |
-| `import-bundled-whale.js` | 从内置立绘重生成 `local-assets/大肥鱼/` | 手动（一次性）；**别删**：它是该资产的唯一再生成途径 |
 | `migrate-models-to-userdata.js` | 把随包模型迁到用户数据目录 | `import-model.js` 导入完成后自动调用，也可手动运行 |
 | `make_launchers.js` | 生成 `release/` 下的双击启动器（`.bat`，纯 ASCII 内容以适配 cmd 的 GBK 解析） | 手动：`node scripts/make_launchers.js` |
 | `fetch-live2d-runtime.js` | 取回/升级 Live2D 运行库三件套（原子写 + 版本校验 + 清理旧文件） | 手动（升级时才用） |
@@ -92,7 +91,7 @@ src/
 2. **`public/renderer/lib/`**：开发态页面用的运行库，是 `src/renderer/lib` 的拷贝。
 3. **`local-assets/live2d_models/`**：内置/种子模型的投放点。`public/assets` 会被 import 清空重建，
    所以想内置的模型只能放这里。目录当前为空，说明见其 `README.md`。
-4. **`public/assets/大肥鱼/`**：内置模型，源头在 `local-assets/大肥鱼/`。
+4. **`public/assets/使用说明/`**：内置模型，源头在 `local-assets/使用说明/`。
 5. **`personas/*` 与 `public/assets/knowledge/*` 内容相同**：前者是源，后者是 import 产物，属正常。
 
 ## 4.1 语料（knowledge）的合并顺序
@@ -173,7 +172,7 @@ src/
 
 - `local-assets/model-order.json` **不会**被复制进 `public/assets/`（`import-model.js` 显式跳过配置类文件），
   所以运行期看不到它——不要再去找"为什么运行期不读它"。
-- `npm run import` 会把种子模型**搬进用户数据目录**（不再随包内置），随包只剩内置立绘「大肥鱼」。
+- `npm run import` 会把种子模型**搬进用户数据目录**（不再随包内置），随包只剩内置立绘「使用说明」。
   因此**当前决定默认启动模型的是运行期的 `.order.json`**，`model-order.json` 只在"重新导入"时起作用。
 - **只写"种子目录里真实存在"的模型名**（当前种子目录为空，所以这个文件此刻不产生效果）。
   写了种子目录里没有的名字会触发 `WARN: model-order.json 里的模型不在种子目录，已忽略`。
@@ -243,7 +242,7 @@ API Key 丢了 / 设置改了不生效"——两套配置各改各的，排查�
 优先读模型目录里的那份，读不到才回退 `character.md`——所以个人化不会丢，同时不污染仓库。
 
 **随包不进去的东西**：模型、`settings.json`（含 API Key）、聊天记录、待办、记忆——
-它们全在 `%APPDATA%/pet-desktop-app/`。`public/assets/` 里只有内置立绘（`大肥鱼`）、
+它们全在 `%APPDATA%/pet-desktop-app/`。`public/assets/` 里只有内置立绘（`使用说明`）、
 通用语料、技能与图标。改完运行 `npm run check:privacy` 检查是否有本机路径或密钥进入打包内容。
 
 ## 6. 渲染质量的几个关键开关（改动前先读）
@@ -289,7 +288,7 @@ API Key 丢了 / 设置改了不生效"——两套配置各改各的，排查�
 
 托盘菜单包含「显示/隐藏」「把桌宠摆回屏幕内」「取景」「点击穿透」「设置」「退出」。
 
-- 图标源：`local-assets/tray-icon.png`（256×256，由内置立绘 `大肥鱼/whale.png` 裁头部生成）。
+- 图标源：`local-assets/tray-icon.png`（256×256，用户提供的圆角立绘；`pet-icon.ico` 是快捷方式用的多尺寸版本）。
   `npm run import` 会把它复制进 `public/assets/`，与模型一样随 `extraResources` 打包；
   进程内从 `PathResolver.assetsRoot()` 取，找不到时降级为空图标（不崩、菜单仍可用）。
 - 「把桌宠摆回屏幕内」复用位置记忆的可见性判定（见 §6.2），不另写一套。

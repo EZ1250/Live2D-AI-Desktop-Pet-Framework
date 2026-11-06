@@ -635,7 +635,7 @@ test('subscribeEvents：按事件协议发 EventSubscriptionRequest，VTS 推来
     apiName: 'VTubeStudioPublicAPI',
     apiVersion: '1.0',
     messageType: VTS_EVENT_MODEL_LOADED,
-    data: { modelLoaded: true, modelName: '大肥鱼', modelID: 'mid-2' },
+    data: { modelLoaded: true, modelName: '示例模型', modelID: 'mid-2' },
   });
 
   assert.equal(await waitFor(() => received.length >= 2), true, `只收到 ${received.length} 条事件：${JSON.stringify(received)}`);
@@ -650,7 +650,7 @@ test('subscribeEvents：按事件协议发 EventSubscriptionRequest，VTS 推来
   assert.match(hotkey.at, /^\d{4}-\d{2}-\d{2}T/, '事件要带收到时刻（ISO）');
   assert.ok(model, '必须收到 ModelLoadedEvent');
   assert.equal(model.modelLoaded, true);
-  assert.equal(model.modelName, '大肥鱼');
+  assert.equal(model.modelName, '示例模型');
   assert.equal(model.modelID, 'mid-2');
 
   // 事件不该被当成"无主消息"丢掉（以前 handleMessage 只认 pending requestID）

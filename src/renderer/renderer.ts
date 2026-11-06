@@ -57,7 +57,7 @@ function rendererKernel(): RendererKernelHandle | null {
 interface RenderLib {
   isLive2DAvailable(): boolean;
   mountLive2D(input: { container: HTMLElement; url: string }): Promise<RenderHandle | null>;
-  mountPortrait(input: { container: HTMLElement; url: string }): RenderHandle | null;
+  mountPortrait(input: { container: HTMLElement; url: string; fit?: 'contain' | 'framing' }): RenderHandle | null;
   mountPlaceholder(input: { container: HTMLElement; name: string; hint?: string }): RenderHandle | null;
 }
 
@@ -486,10 +486,10 @@ function destroyCurrent(): void {
   if (stageEl) stageEl.replaceChildren();
 }
 
-function libMountPortrait(url: string, name: string): RenderHandle | null {
+function libMountPortrait(url: string, name: string, fit?: 'contain' | 'framing'): RenderHandle | null {
   if (!stageEl) return null;
   const lib = getRenderLib();
-  if (lib) return lib.mountPortrait({ container: stageEl, url });
+  if (lib) return lib.mountPortrait({ container: stageEl, url, fit });
   return fallbackPortrait(stageEl, url, name);
 }
 
@@ -538,7 +538,7 @@ async function mountManifest(manifest: ModelManifest): Promise<void> {
 
   if (manifest.type === 'portrait') {
     if (url) {
-      currentHandle = libMountPortrait(url, name);
+      currentHandle = libMountPortrait(url, name, activeModelPreset?.portraitFit);
       showBubble(`嗨，我是 ${petName || name}！`, { ttlMs: 3000 });
     } else {
       currentHandle = libMountPlaceholder(name, 'portrait 模型缺少图片地址');
@@ -593,7 +593,7 @@ async function mountManifest(manifest: ModelManifest): Promise<void> {
     const preview = url ? findPreviewUrl(manifest) : null;
     if (preview) {
       // moc3 模型带预览图：以静态图 + 待机动画兜底，可看性更好
-      currentHandle = libMountPortrait(preview, name);
+      currentHandle = libMountPortrait(preview, name, activeModelPreset?.portraitFit);
       showBubble(`${name}（moc3 暂不可用，以预览图显示）`, { tone: 'info', ttlMs: 3600 });
     } else {
       currentHandle = libMountPlaceholder(name, `当前环境无法渲染 Live2D(moc3)。${fallbackReason}`);
@@ -604,7 +604,7 @@ async function mountManifest(manifest: ModelManifest): Promise<void> {
 
   // 未知 type：按“能显示就行”的底线处理
   if (url && /\.(png|jpe?g|webp|gif|svg)($|\?)/i.test(url)) {
-    currentHandle = libMountPortrait(url, name);
+    currentHandle = libMountPortrait(url, name, activeModelPreset?.portraitFit);
   } else {
     currentHandle = libMountPlaceholder(name, `未知模型类型：${String(manifest.type)}`);
   }
@@ -3891,7 +3891,13 @@ async function speakSampleFromUi(bridge: RendererBridge): Promise<void> {
     const voice = elementById<HTMLSelectElement>('setting-tts-voice')?.value || ttsVoice;
     const requestId = beginTtsRequest();
     const result = await bridge.ttsSpeak('你好，我是你的桌面宠物，语音已经接好了。', voice, requestId);
-    if (el) el.textContent = result.ok ? `已合成 ${result.bytes ?? 0} 字节，开始播放` : `失败：${result.error ?? '未知原因'}`;
+    if (el) {
+      el.textContent = result.ok
+        ? result.fallbackFrom
+          ? `该音色不可用，已自动改用默认音色并合成 ${result.bytes ?? 0} 字节`
+          : `已合成 ${result.bytes ?? 0} 字节，开始播放`
+        : `失败：${result.error ?? '未知原因'}`;
+    }
     if (!result.ok) setSettingsStatus(`语音合成失败：${result.error ?? '未知原因'}`, true);
   } catch (err) {
     if (el) el.textContent = `失败：${(err as Error).message ?? String(err)}`;

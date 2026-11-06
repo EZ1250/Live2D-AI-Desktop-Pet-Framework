@@ -959,6 +959,7 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
       ok: result.ok,
       requestId: result.requestId,
       bytes: result.bytes,
+      ...(result.fallbackFrom ? { fallbackFrom: result.fallbackFrom } : {}),
       ...(result.error ? { error: result.error } : {}),
     };
   });

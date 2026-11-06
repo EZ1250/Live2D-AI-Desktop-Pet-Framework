@@ -47,7 +47,7 @@ exe 没有代码签名，Windows SmartScreen 会弹「无法验证发布者 / �
 
 - 模型**没有**打包进 ASAR。构建时 `public/assets` 被 electron-builder 的 extraResources
   整体映射到便携包内 `resources/assets`（含 `models.json` 清单、`knowledge/` 语料、`skills/` 技能，
-  以及随包的内置模型目录）。**当前随包的只有一个静态立绘内置模型「大肥鱼」**：
+  以及随包的内置模型目录）。**当前随包的只有一个静态立绘内置模型「使用说明」**：
   没有随包骨骼模型（骨骼模型体积大、且版本兼容性因机器而异，一律由用户放本机用户数据）。
 - **骨骼模型放在本机用户数据**：`%APPDATA%\pet-desktop-app\live2d-models\<模型名>\`
   （应用启动时按"用户模型优先、内置模型兜底"排序，清单里没有骨骼模型时也会扫这个目录）。
