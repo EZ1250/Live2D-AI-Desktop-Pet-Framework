@@ -4,6 +4,19 @@
 
 基于 Electron 的 Live2D 桌面宠物，支持模型切换、对话、语音转写、待办和插件。
 
+## 下载安装（普通用户）
+
+| 平台 | 文件 | 说明 |
+| --- | --- | --- |
+| Windows（推荐） | `Pet-*-setup.exe` | 安装版，启动快；会创建桌面/开始菜单快捷方式 |
+| Windows（免安装） | `Pet-*-portable.exe` | 便携单文件，启动约 9 秒（每次解包到临时目录） |
+| Android（测试） | `PetMcpClient-*-test-debug.apk` | debug 签名测试版，仅用于手机 MCP 联调 |
+
+👉 **[下载最新版本](https://github.com/EZ1250/Live2D-AI-Desktop-Pet-Framework/releases/latest)**
+
+> 安装包未做代码签名，首次运行若提示"未知发布者"：更多信息 → 仍要运行。
+> 校验和见 Release 页面的 `SHA256SUMS.txt`。
+
 ## 怎么启动
 
 | 方式 | 做法 | 说明 |

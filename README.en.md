@@ -1,6 +1,19 @@
-﻿# Pet
+# Pet
 
 Electron-based Live2D desktop pet: model switching, chat, voice input, todos and plugins.
+
+## Download
+
+| Platform | File | Notes |
+| --- | --- | --- |
+| Windows (recommended) | `Pet-*-setup.exe` | Installer; creates desktop/start-menu shortcuts |
+| Windows (portable) | `Pet-*-portable.exe` | Single exe; unpacks to temp on every start (~9s) |
+| Android (test) | `PetMcpClient-*-test-debug.apk` | Debug-signed test build for phone MCP only |
+
+👉 **[Latest release](https://github.com/EZ1250/Live2D-AI-Desktop-Pet-Framework/releases/latest)**
+
+> The installer is unsigned; if Windows shows "Unknown publisher", choose "More info → Run anyway".
+> Checksums are provided in `SHA256SUMS.txt` on the release page.
 
 [简体中文](README.md) | **English**
 
