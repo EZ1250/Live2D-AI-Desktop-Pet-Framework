@@ -1,0 +1,3 @@
+c3de51a844a4c459e8c8a83ba19caab2d49fd0f5842b5f5ff1112047b1fcb44a  Pet-1.0.1-setup.exe
+91654ed4735b430d41d6b4936b3bd9e8d31cb06246113efaa2e7da887bfba1a1  Pet-1.0.1-portable.exe
+8257a39596be20c40da93d4d43ff8f3cbc31c451bfea01bac11047072e4e7b2d  PetMcpClient-0.3.7-test-debug.apk

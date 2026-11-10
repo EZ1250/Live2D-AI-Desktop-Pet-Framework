@@ -1,7 +1,7 @@
 {
   "name": "pet-desktop-app",
   "productName": "Pet",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Pet — Live2D 桌面宠物",
   "author": "EZ1250",
   "main": "dist/main/main.js",
