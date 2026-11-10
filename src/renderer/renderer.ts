@@ -5290,6 +5290,25 @@ function installSettingsUi(bridge: RendererBridge): void {
   settingsBridge = bridge;
   const menu = elementById<HTMLElement>('context-menu');
 
+  // 设置页顶部的项目链接（Star / Issue / 下载）：交给主进程用系统浏览器打开，
+  // 因为主窗口拦截了所有外部导航与新窗口。
+  for (const link of Array.from(document.querySelectorAll<HTMLButtonElement>('.settings-external-link'))) {
+    link.addEventListener('click', () => {
+      const url = link.dataset.url || '';
+      if (!url) return;
+      if (typeof bridge.openExternal !== 'function') {
+        setSettingsStatus('当前版本不支持打开外部链接', true);
+        return;
+      }
+      void bridge
+        .openExternal(url)
+        .then((err) => {
+          if (err) setSettingsStatus(`打开链接失败：${err}`, true);
+        })
+        .catch((err: unknown) => setSettingsStatus(`打开链接失败：${(err as Error).message ?? String(err)}`, true));
+    });
+  }
+
   // —— 右键菜单：主进程推送坐标（params.x/y 为 DIP client 坐标）→ 定位显示 ——
   bridge.onContextMenu?.((position) => {
     showContextMenu(position.x, position.y);

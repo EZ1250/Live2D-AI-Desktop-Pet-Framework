@@ -36,6 +36,7 @@ import {
   IPC_CHAT_WINDOW_VOICE_STRIP,
   IPC_LOAD_MODEL,
   IPC_MODEL_LIST,
+  IPC_OPEN_EXTERNAL,
   IPC_OPEN_PATH,
   IPC_PET_EVENT,
   IPC_PICK_FOLDER,
@@ -401,6 +402,25 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
     try {
       const err = await shell.openPath(target); // 成功返回空字符串
       return err || '';
+    } catch (err) {
+      return (err as Error).message ?? String(err);
+    }
+  });
+
+  // 只允许 http/https：避免渲染层借系统默认程序打开任意协议（file:/ms-*/自定义协议）
+  ipcMain.handle(IPC_OPEN_EXTERNAL, async (_event, raw: unknown): Promise<string> => {
+    const target = typeof raw === 'string' ? raw.trim() : '';
+    if (!target) return '链接为空';
+    let protocol = '';
+    try {
+      protocol = new URL(target).protocol;
+    } catch {
+      return '链接格式不正确';
+    }
+    if (protocol !== 'http:' && protocol !== 'https:') return '只允许打开 http/https 链接';
+    try {
+      await shell.openExternal(target);
+      return '';
     } catch (err) {
       return (err as Error).message ?? String(err);
     }

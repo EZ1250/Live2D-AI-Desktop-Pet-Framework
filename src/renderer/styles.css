@@ -565,6 +565,20 @@ body.is-dragover #stage::after {
   margin: 4px 0 8px;
 }
 
+/* 设置页顶部可折叠的项目链接：默认收起，避免长期占用表单空间 */
+.settings-links {
+  margin: 4px 0 8px;
+  padding: 6px 8px;
+  border: 1px solid rgba(120, 150, 190, 0.26);
+  border-radius: 8px;
+  background: rgba(12, 16, 26, 0.22);
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.7);
+}
+.settings-links > summary { cursor: pointer; color: rgba(255, 255, 255, 0.86); }
+.settings-links[open] > summary { margin-bottom: 6px; }
+.settings-links p { margin: 0 0 6px; line-height: 1.5; }
+
 .settings-inline button {
   padding: 5px 10px;
   font-size: 12px;

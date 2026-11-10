@@ -158,6 +158,8 @@ export interface ChatLogSnapshot {
 export const IPC_PICK_FOLDER = 'app:pickFolder';
 /** invoke renderer→main：用系统方式打开一个目录/文件（返回空字符串=成功，否则为错误信息）。 */
 export const IPC_OPEN_PATH = 'app:openPath';
+/** invoke renderer→main：用系统默认浏览器打开 http/https 链接（返回空字符串=成功）。 */
+export const IPC_OPEN_EXTERNAL = 'app:openExternal';
 /**
  * invoke renderer→main：从当前 API 地址拉取服务端**可用模型列表**（GET /models）。
  * 设置页用它把"AI 模型"变成可选列表，避免手打一个不存在的模型名（服务端只会回 "Model not exist."）。
@@ -710,6 +712,8 @@ export interface ElectronAPI {
   pickFolder?(): Promise<string>;
   /** 用系统默认方式打开目录或文件；成功返回空字符串，失败返回错误信息。 */
   openPath?(target: string): Promise<string>;
+  /** 用系统默认浏览器打开 http/https 链接；成功返回空字符串，失败返回错误信息。 */
+  openExternal?(url: string): Promise<string>;
   /** 拉取服务端可用 AI 模型列表（设置页的模型选择用）。 */
   aiModelList?(): Promise<AiModelListResult>;
   /** 扫描用户资产（模型 + 插件），带问题清单。 */

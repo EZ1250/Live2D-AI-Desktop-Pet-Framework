@@ -46,6 +46,7 @@ import {
   IPC_LOAD_MODEL,
   IPC_MODEL_LIST,
   IPC_ON_WINDOW_CHANGE,
+  IPC_OPEN_EXTERNAL,
   IPC_OPEN_PATH,
   IPC_PET_BOUNDS,
   IPC_PET_EVENT,
@@ -183,6 +184,10 @@ const api: ElectronAPI = {
   /** 开发辅助：用系统默认方式打开目录/文件（成功返回空字符串）。 */
   openPath(target: string): Promise<string> {
     return ipcRenderer.invoke(IPC_OPEN_PATH, target);
+  },
+  /** 用系统默认浏览器打开 http/https 链接（成功返回空字符串）。 */
+  openExternal(url: string): Promise<string> {
+    return ipcRenderer.invoke(IPC_OPEN_EXTERNAL, url);
   },
 
   /** 拉取服务端可用 AI 模型列表（设置页的模型选择用）。 */
