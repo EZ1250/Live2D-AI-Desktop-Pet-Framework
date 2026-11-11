@@ -117,14 +117,15 @@ asar 内 `renderer/index.html` → asar 内 `public/renderer/index.html` → `di
 ## 行为触发（设置 → 行为触发）
 
 - 行为键与中文名以 `contracts.ts` 的 `BEHAVIOR_KEYS` / `BEHAVIOR_LABELS` 为唯一来源：
-  `user_message`、`tool_call`、`command_exec`、`ai_start`、`model_idle`、`error`、
+  `startup`、`user_message`、`tool_call`、`command_exec`、`ai_start`、`model_idle`、`error`、
   `click`（点击一次）、`multiClick`（连点 5 次）、`drag`（拖动结束）、`mcp`（任意 MCP 工具被调用）。
 - 每个行为可绑一个动作组/表情；另可再选一个「附加目标」——动作组或表情都可
   （`AppSettings.motionTriggerExpressions[模型][行为]`，编码 `motion:`/`expr:`；旧版裸表情名按表情兼容），
   并用每行的按钮选择播放方式：`simultaneous`（同时，默认）或 `chain`（衔接，主目标之后播放，
   `motionTriggerPairModes[模型][行为]`）。
 - 事件来源：聊天/工具/命令/回答/待机/出错由主进程经 `IPC_ACTION {type:'behavior'}` 下发；
-  点击/连点/拖动由渲染层本地 `emitBehavior`；MCP 由 `mcpServer` 在 `tools/call` 回调
+  点击/连点/拖动由渲染层本地 `emitBehavior`；启动由渲染层在模型挂载完成后
+  `fireStartupBehavior` 触发一次（重启才会再触发）；MCP 由 `mcpServer` 在 `tools/call` 回调
   `deps.onToolCall` → 主进程转发 `behavior: mcp`。
 - 绑定按模型分桶（`motionTriggersByModel` / `motionTriggerExpressionsByModel`），
   旧版全局字段只作回退；目标在当前模型上不存在时插件只 warn 一次、绝不硬播。

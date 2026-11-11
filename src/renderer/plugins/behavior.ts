@@ -11,6 +11,7 @@
 
   /** auto 模式的候选顺序：'motion:x' / 'expr:x' / 'emotion:标签' / 'click' / 'costume' */
   const AUTO: Record<string, string[]> = {
+    startup: [],
     user_message: ['click', 'motion:Tap', 'motion:TapBody', 'motion:wave'],
     tool_call: ['motion:Idle', 'motion:Tap', 'costume'],
     command_exec: ['motion:Idle', 'motion:Tap'],
@@ -24,6 +25,7 @@
   };
   /** 同一行为的两次触发最小间隔 */
   const DEBOUNCE_MS: Record<string, number> = {
+    startup: 0,
     user_message: 500,
     tool_call: 300,
     command_exec: 300,

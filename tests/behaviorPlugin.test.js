@@ -15,6 +15,7 @@ const KERNEL = path.join(DIST, 'kernel.js');
 const PLUGIN = path.join(DIST, 'plugins', 'behavior.js');
 
 const ALL_KEYS = [
+  'startup',
   'user_message',
   'tool_call',
   'command_exec',
@@ -83,6 +84,14 @@ test('新增行为键：click / multiClick / drag / mcp 都能触发并解析到
     ['motion', 'Tap'],
     ['motion', 'Idle'],
   ]);
+});
+
+test('启动行为键：可单独绑定动作，启动时播一次', async () => {
+  const { kernel, calls, configure } = boot();
+  await kernel.start();
+  configure({ M: { startup: 'motion:Idle' } });
+  kernel.emit('behavior', 'startup');
+  assert.deepEqual(calls, [['motion', 'Idle']]);
 });
 
 test('动作 + 同时表情：一次触发先播动作再叠表情（可同时生效）', async () => {

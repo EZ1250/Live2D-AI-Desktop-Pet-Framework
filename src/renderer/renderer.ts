@@ -1475,6 +1475,7 @@ function triggerPetTap(x: number, y: number): void {
    ================================================================ */
 /** 行为键（与 contracts.ts 的 BEHAVIOR_KEYS 同步） */
 type BehaviorKey =
+  | 'startup'
   | 'user_message'
   | 'tool_call'
   | 'command_exec'
@@ -1486,6 +1487,7 @@ type BehaviorKey =
   | 'drag'
   | 'mcp';
 const BEHAVIOR_KEYS: BehaviorKey[] = [
+  'startup',
   'user_message',
   'tool_call',
   'command_exec',
@@ -1499,6 +1501,7 @@ const BEHAVIOR_KEYS: BehaviorKey[] = [
 ];
 /** 行为中文名 */
 const BEHAVIOR_LABELS: Record<BehaviorKey, string> = {
+  startup: '启动',
   user_message: '用户发送消息',
   tool_call: '调用工具',
   command_exec: '执行命令',
@@ -1613,6 +1616,14 @@ function playBehaviorExpression(name: string): void {
 /** 触发一次行为：策略在 behavior 插件里，这里只走内核事件（事件缺失时自然不触发） */
 function emitBehavior(behavior: BehaviorKey): void {
   rendererKernel()?.emit('behavior', behavior);
+}
+
+/** 启动行为只在应用启动时触发一次；延后到模型/插件就绪后再播 */
+let startupBehaviorFired = false;
+function fireStartupBehavior(): void {
+  if (startupBehaviorFired) return;
+  startupBehaviorFired = true;
+  window.setTimeout(() => emitBehavior('startup'), 800);
 }
 
 /* ================================================================
@@ -6048,6 +6059,7 @@ async function init(): Promise<void> {
     await mountManifest(manifest);
     bootRecord('模型挂载完成');
     applyPresetParameterMap(); // pet-model.json 的 parameterMap（命名不标准的模型靠它对齐）
+    fireStartupBehavior(); // 启动行为：模型就绪后触发一次（设置里的「启动」绑定）
     // 报告角色实际可见范围：立刻一次 + live2d 二次 refit（250/900ms）之后再补两次
     reportPetBounds(bridge);
     window.setTimeout(() => reportPetBounds(bridge), 1300);

@@ -836,6 +836,7 @@ export interface ElectronAPI {
 
 /** 可绑定动作或表情的行为。 */
 export type BehaviorKey =
+  | 'startup'
   | 'user_message'
   | 'tool_call'
   | 'command_exec'
@@ -849,6 +850,7 @@ export type BehaviorKey =
 
 /** 全部行为键（顺序即设置页顺序）。 */
 export const BEHAVIOR_KEYS: BehaviorKey[] = [
+  'startup',
   'user_message',
   'tool_call',
   'command_exec',
@@ -863,6 +865,7 @@ export const BEHAVIOR_KEYS: BehaviorKey[] = [
 
 /** 行为中文名。 */
 export const BEHAVIOR_LABELS: Record<BehaviorKey, string> = {
+  startup: '启动',
   user_message: '用户发送消息',
   tool_call: '调用工具',
   command_exec: '执行命令',
