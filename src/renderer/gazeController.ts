@@ -106,6 +106,12 @@
 
   /** 窗口内指针（pointermove）→ 归一化视线目标，并直接喂给 SDK focus */
   function setPointer(clientX: number, clientY: number): void {
+    // 鼠标贴近窗口边缘时，pointermove 的窗口内换算与主进程的全局光标换算会同时生效；
+    // 两套坐标系在边界处略有差异，会表现为头部来回抖。全局光标可用时统一走它。
+    if (globalCursorPushes > 0 && performance.now() - lastGlobalCursorAt < 1500) {
+      setGlobal(window.screenX + clientX, window.screenY + clientY);
+      return;
+    }
     const vw = window.innerWidth || 1;
     const vh = window.innerHeight || 1;
     // Half framing: gaze origin at the neck (head lives in the upper part of the window).
@@ -146,6 +152,9 @@
 
   /** 暂停跟随：鼠标离开窗口 / 拖拽窗口期间（主循环下一帧起走"缓缓归零"分支） */
   function pause(): void {
+    // 主进程全局光标仍在持续推送时，窗口边缘的 mouseleave 不应把视线打回 0；
+    // 否则在边缘反复进出会看到"归零 → 重新跟随"的抖动。
+    if (globalCursorPushes > 0 && performance.now() - lastGlobalCursorAt < 1500) return;
     lastGazeMoveAt = 0;
   }
 

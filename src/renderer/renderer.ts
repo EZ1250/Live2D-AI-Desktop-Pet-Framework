@@ -2271,6 +2271,8 @@ function installDropTarget(bridge: RendererBridge): void {
   const canImport = typeof bridge.assetImportPath === 'function' && typeof bridge.pathForFile === 'function';
   const stage = elementById<HTMLElement>('stage');
   const target: HTMLElement = stage ?? document.body;
+  /** 拖放高亮兜底清除：拖到窗口外松手/按 Esc/窗口失焦时收不到 target 的 dragleave */
+  const clearDragHighlight = (): void => document.body.classList.remove('is-dragover');
   // 拖入时给一点视觉反馈（没有 bridge 能力时不提示，免得空欢喜）
   target.addEventListener('dragenter', (e) => {
     e.preventDefault();
@@ -2278,7 +2280,15 @@ function installDropTarget(bridge: RendererBridge): void {
   });
   target.addEventListener('dragleave', (e) => {
     // 只有真正离开舞台才收起高亮（在子元素间移动也会触发 dragleave）
-    if (e.target === target) document.body.classList.remove('is-dragover');
+    if (e.target === target) clearDragHighlight();
+  });
+  window.addEventListener('dragend', clearDragHighlight);
+  window.addEventListener('blur', clearDragHighlight);
+  document.addEventListener('dragleave', (e) => {
+    if (!(e as DragEvent).relatedTarget) clearDragHighlight();
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) clearDragHighlight();
   });
   target.addEventListener('drop', (e) => {
     void (async () => {
