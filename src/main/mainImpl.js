@@ -4164,7 +4164,36 @@ function autoTaskToolHint() {
     return `\n你还可以调用只读 MCP 工具（用户已授权）：${names.join(', ')}。需要时用工具核实事实；不要执行有副作用的操作。`;
 }
 
+let scenePromptConfigTried = false;
+/** 加载用户可编辑的场景 YAML：优先 userData，其次安装包内置副本。 */
+function ensureScenePromptConfig() {
+    if (scenePromptConfigTried)
+        return;
+    scenePromptConfigTried = true;
+    const candidates = [
+        path.join(electron_1.app.getPath('userData'), 'prompts', 'desktop_pet_scenes.yaml'),
+        path.join(electron_1.app.getAppPath(), 'local-assets', 'desktop_pet_scenes.yaml'),
+        path.join(electron_1.app.getAppPath(), 'public', 'assets', 'desktop_pet_scenes.yaml'),
+    ];
+    for (const file of candidates) {
+        try {
+            if (!fs.existsSync(file))
+                continue;
+            const result = sceneContext_1.loadSceneConfig(fs.readFileSync(file, 'utf8'), file);
+            if (result.ok) {
+                console.log(`[autotask] 已加载场景提示词：${file}（${result.count} 类）`);
+                return;
+            }
+            console.warn(`[autotask] 场景提示词格式无效：${file}：${result.error || '未知错误'}`);
+        }
+        catch (err) {
+            console.warn(`[autotask] 读取场景提示词失败：${file}：${err.message}`);
+        }
+    }
+    console.warn('[autotask] 未找到 desktop_pet_scenes.yaml，使用通用兜底提示词');
+}
 function autoTaskContext() {
+    ensureScenePromptConfig();
     const info = monitor?.getCurrentInfo() ?? null;
     const todos = toolbox?.getTodos() ?? [];
     let idleSeconds = 0;

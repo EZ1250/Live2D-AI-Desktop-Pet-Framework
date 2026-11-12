@@ -1,5 +1,7 @@
 'use strict';
 
+const fs = require('node:fs');
+const path = require('node:path');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
@@ -7,7 +9,14 @@ const {
   buildSceneAutoTaskPrompt,
   classifyScene,
   isQuietHours,
+  loadSceneConfig,
+  sceneConfigStatus,
 } = require('../dist/main/ai/sceneContext');
+
+const yamlText = fs.readFileSync(path.join(__dirname, '..', 'local-assets', 'desktop_pet_scenes.yaml'), 'utf8');
+const loaded = loadSceneConfig(yamlText, 'desktop_pet_scenes.yaml');
+assert.equal(loaded.ok, true);
+assert.ok(loaded.count >= 8);
 
 const base = {
   mode: 'scene_brief',
