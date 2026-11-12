@@ -196,7 +196,8 @@ export class ScenarioContext {
       const text = fs.readFileSync(this.file, 'utf8');
       this.entries = parseEntries(text).sort((a, b) => a.at - b.at);
       this.prune();
-    } catch {
+    } catch (err) {
+      console.warn('[scenario] 读取情景提示词失败（按空记录继续）：', (err as Error).message);
       this.entries = [];
     }
   }
