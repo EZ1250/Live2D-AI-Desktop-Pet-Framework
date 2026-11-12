@@ -151,10 +151,11 @@
   }
 
   /** 暂停跟随：鼠标离开窗口 / 拖拽窗口期间（主循环下一帧起走"缓缓归零"分支） */
-  function pause(): void {
+  function pause(force = false): void {
     // 主进程全局光标仍在持续推送时，窗口边缘的 mouseleave 不应把视线打回 0；
     // 否则在边缘反复进出会看到"归零 → 重新跟随"的抖动。
-    if (globalCursorPushes > 0 && performance.now() - lastGlobalCursorAt < 1500) return;
+    // 但拖拽窗口必须强制暂停，否则拖动窗口时视线还会乱追。
+    if (!force && globalCursorPushes > 0 && performance.now() - lastGlobalCursorAt < 1500) return;
     lastGazeMoveAt = 0;
   }
 

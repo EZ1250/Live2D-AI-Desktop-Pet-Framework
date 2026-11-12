@@ -139,34 +139,6 @@ export function shouldRunAutoTask(
   return { run: true, reason: 'ok', state: next };
 }
 
-/** 组装后台任务提示词。 */
-export function buildAutoTaskPrompt(
-  now: number,
-  ctx: {
-    mode: AutoTaskMode;
-    prompt: string;
-    petName: string;
-    model: string;
-    activeWindow: string;
-    todoText: string;
-    mcpText: string;
-  },
-): string {
-  const when = new Date(now).toLocaleString('zh-CN', { hour12: false });
-  const base =
-    `现在是 ${when}。这是一次后台自主任务，不是在回复用户，不要提问、不要寒暄。\n` +
-    `当前活动窗口：${ctx.activeWindow || '未知'}\n待办：${ctx.todoText || '无'}\n本地 MCP：${ctx.mcpText || '未配置'}\n`;
-  const ask =
-    ctx.mode === 'custom'
-      ? `任务：${ctx.prompt}\n`
-      : '任务：看一眼用户现在的状态。只有发现明确、值得打扰的情况（异常、待办临近、长时间连续工作）才提醒一句；否则输出"无需提醒"。不要用“喝水/休息”这类通用话术凑数，也不要重复同类提醒。\n';
-  return (
-    base +
-    ask +
-    `要求：只输出一句中文（不超过 40 字），不要解释、不要加引号；${ctx.petName || '桌宠'}会直接把它当气泡说给用户听。`
-  );
-}
-
 /** 汇总本地 MCP 状态。 */
 export function buildMcpCheckSummary(clientText: string, serverText: string): { ok: boolean; text: string } {
   const clientIssues = /连接失败|错误：|超时|spawn 失败|子进程退出/.test(clientText);

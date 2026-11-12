@@ -86,25 +86,6 @@ test('事件触发：开关/匹配串/冷却/每日上限，与定时互不影�
   assert.equal(a.matchesAutoTaskEvent(cfg({ eventEnabled: true, eventMatch: '' }), 'Edge', 'x'), false);
 });
 
-test('提示词：后台任务口吻 + 一句中文 + 上下文', () => {
-  const now = new Date('2026-10-24T10:00:00').getTime();
-  const prompt = a.buildAutoTaskPrompt(now, {
-    mode: 'scene_brief',
-    prompt: '',
-    petName: '小宠',
-    model: 'm',
-    activeWindow: 'Edge — 文档',
-    todoText: '喝水',
-    mcpText: 'MCP 服务（1 个）',
-  });
-  assert.ok(prompt.includes('后台自主任务'));
-  assert.ok(prompt.includes('不超过 40 字'));
-  assert.ok(prompt.includes('Edge — 文档'));
-  assert.ok(prompt.includes('小宠'));
-  const custom = a.buildAutoTaskPrompt(now, { mode: 'custom', prompt: '提醒喝水', petName: '', model: '', activeWindow: '', todoText: '', mcpText: '' });
-  assert.ok(custom.includes('提醒喝水'));
-});
-
 test('MCP 检查摘要：无异常不打扰，有异常返回 ok=false', () => {
   const ok = a.buildMcpCheckSummary('MCP 服务（1 个）：\n- echo（stdio）：已连接，工具 2 个，需确认', 'MCP 服务端：未启用');
   assert.equal(ok.ok, true);

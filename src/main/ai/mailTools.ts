@@ -238,7 +238,10 @@ export async function mailCheck(args: CheckArgs, cfg: ImapConfig): Promise<strin
     const closeSocket = () => {
       try {
         socket.destroy();
-      } catch {}
+      } catch (err) {
+        // socket 已关闭/已销毁时 destroy 可能抛错；不影响已 resolve 的结果，但保留日志。
+        console.warn('[mail] 关闭 socket 失败（忽略）：', (err as Error).message);
+      }
     };
 
     const failWithMessage = (msg: string) => {

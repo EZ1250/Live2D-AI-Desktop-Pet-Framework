@@ -766,8 +766,8 @@ interface GazeApi {
   setGlobal(screenX: number, screenY: number): void;
   /** 主循环每帧调用：喂视线目标 / 静止归零 */
   tick(nowMs: number): void;
-  /** 暂停跟随（鼠标离开窗口 / 拖拽窗口期间） */
-  pause(): void;
+  /** 暂停跟随（鼠标离开窗口 / 拖拽窗口期间）；force=true 时忽略全局光标保护 */
+  pause(force?: boolean): void;
   /** 渲染层换算结果快照（__petDebug.gaze() 的 renderer 段） */
   state(): { nx: number; ny: number; stale: boolean; sinceMoveMs: number | null; globalCursorPushes: number; sinceGlobalMs: number | null };
   /** 视线驱动模式自查（__petDebug.gazeMode() 委托它） */
@@ -1288,7 +1288,7 @@ let dragBehaviorEmitted = false;
     dragLongReported = false;
     lastDragX = e.screenX;
     lastDragY = e.screenY;
-    gazeApi()?.pause(); // 拖拽期间暂停视线跟随
+    gazeApi()?.pause(true); // 拖拽期间暂停视线跟随（不能被全局光标的边缘保护忽略）
   });
   document.addEventListener('pointermove', (e) => {
     if (!dragging) return;
@@ -3898,10 +3898,11 @@ function playTtsAudio(payload: TtsAudioPayload): void {
 /** 试听文本按音色语言选择：英文音色读中文会得到 0 字节，不能拿中文句子试英文音色 */
 function ttsSampleForVoice(voice: string): string {
   const lang = (voice || '').toLowerCase().split('-')[0];
-  if (lang === 'en') return 'Hello, this is your desktop pet. The voice is ready.';
+  if (lang === 'zh') return '你好，我是你的桌面宠物，语音已经接好了。';
   if (lang === 'ja') return 'こんにちは、あなたのデスクトップペットです。';
   if (lang === 'ko') return '안녕하세요, 데스크톱 펫입니다.';
-  return '你好，我是你的桌面宠物，语音已经接好了。';
+  // 英语及其他拉丁语系音色统一用英文试听句；中文音色不能拿来读英文。
+  return 'Hello, this is your desktop pet. The voice is ready.';
 }
 
 async function speakSampleFromUi(bridge: RendererBridge): Promise<void> {

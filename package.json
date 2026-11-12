@@ -1,7 +1,7 @@
 {
   "name": "pet-desktop-app",
   "productName": "Pet",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Pet — Live2D 桌面宠物",
   "author": "EZ1250",
   "main": "dist/main/main.js",
@@ -24,7 +24,6 @@
   },
   "dependencies": {
     "active-win": "^8",
-    "js-yaml": "^4.3.2",
     "msedge-tts": "^2.1.1",
     "ws": "^8.22.1"
   },
