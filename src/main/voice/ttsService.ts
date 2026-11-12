@@ -59,6 +59,11 @@ function isVoiceUnavailableError(message: string): boolean {
   return /stream closed before the synthesis completed|no turn\.end|voice.*(not found|unsupported|invalid)/i.test(message);
 }
 
+/** Edge 对「音色不支持这段文本的语言」可能返回 0 字节，而不是报错；这也应触发回退。 */
+function isEmptyAudioError(message: string): boolean {
+  return /没有返回音频数据|no audio (?:data|received)/i.test(message);
+}
+
 /** mp3 → 可直接给 <audio src> 的 data URL */
 export function toAudioDataUrl(mp3: Buffer): string {
   return `data:${TTS_AUDIO_MIME};base64,${mp3.toString('base64')}`;
@@ -93,19 +98,20 @@ export async function speak(
   let payload: TtsAudioPayload;
   try {
     const mp3 = await synth(originalText, options);
-    if (!mp3 || !mp3.length) throw new Error('Edge TTS 没有返回音频数据');
+    if (!mp3 || !mp3.length) throw new Error('Edge TTS 没有返回音频数据（该音色可能不支持这段文本的语言）');
     payload = {
       ok: true, requestId, text: originalText, voice, mime: TTS_AUDIO_MIME,
       dataUrl: toAudioDataUrl(mp3), bytes: mp3.length, ms: Date.now() - startedAt,
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    // 回退：明确是"音色不被 Edge 支持"且当前不是默认音色 → 用默认音色再合成一次
-    if (voice !== DEFAULT_VOICE && isVoiceUnavailableError(message)) {
+    // 回退：音色不被支持，或该音色对当前文本语言返回空音频（例如英文音色读中文）
+    // 且当前不是默认音色 → 用默认音色再合成一次
+    if (voice !== DEFAULT_VOICE && (isVoiceUnavailableError(message) || isEmptyAudioError(message))) {
       try {
         const mp3 = await synth(originalText, { ...options, voice: DEFAULT_VOICE });
-        if (!mp3 || !mp3.length) throw new Error('Edge TTS 没有返回音频数据');
-        options.logger?.(`[tts] 音色 ${voice} 不可用，已自动回退默认音色 ${DEFAULT_VOICE}`);
+        if (!mp3 || !mp3.length) throw new Error('Edge TTS 没有返回音频数据（默认音色也没有返回音频）');
+        options.logger?.(`[tts] 音色 ${voice} 不可用或不支持当前文本语言，已自动回退默认音色 ${DEFAULT_VOICE}`);
         payload = {
           ok: true, requestId, text: originalText, voice: DEFAULT_VOICE, mime: TTS_AUDIO_MIME,
           dataUrl: toAudioDataUrl(mp3), bytes: mp3.length, ms: Date.now() - startedAt,
@@ -117,7 +123,7 @@ export async function speak(
         payload = {
           ok: false, requestId, text: originalText, voice, mime: TTS_AUDIO_MIME, dataUrl: '',
           bytes: 0, ms: Date.now() - startedAt,
-          error: `${message}（音色 ${voice} 可能不被 Edge 支持，默认音色回退也失败：${fallbackMessage}）`,
+          error: `${message}（音色 ${voice} 可能不支持这段文本的语言，默认音色回退也失败：${fallbackMessage}）`,
         };
       }
     } else {

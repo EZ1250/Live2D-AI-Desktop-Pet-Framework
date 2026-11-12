@@ -142,6 +142,23 @@ test('speak：音色不被 Edge 支持时自动回退默认音色，并带 fallb
   assert.equal(target.pushed[0].payload.fallbackFrom, 'zh-CN-XiaomoNeural');
 });
 
+test('speak：音色对当前文本语言返回空音频时也回退默认音色', async () => {
+  const target = createTarget();
+  const voices = [];
+  const result = await speak(target, '你好', {
+    voice: 'en-GB-LibbyNeural',
+    synthesize: async (_text, options) => {
+      voices.push(options.voice);
+      return options.voice === 'en-GB-LibbyNeural' ? Buffer.alloc(0) : FAKE_MP3;
+    },
+  });
+  assert.deepEqual(voices, ['en-GB-LibbyNeural', 'zh-CN-XiaoxiaoNeural'], '英文音色读中文返回空音频后应回退默认音色');
+  assert.equal(result.ok, true);
+  assert.equal(result.voice, 'zh-CN-XiaoxiaoNeural');
+  assert.equal(result.fallbackFrom, 'en-GB-LibbyNeural');
+  assert.equal(target.pushed[0].payload.ok, true);
+});
+
 test('speak：默认音色本身失败时不再回退，按失败返回', async () => {
   const target = createTarget();
   let calls = 0;

@@ -3895,6 +3895,15 @@ function playTtsAudio(payload: TtsAudioPayload): void {
 }
 
 /** 设置页「试听语音」：让主进程合成一句（启用 VTS 时同时驱动 MouthOpen） */
+/** 试听文本按音色语言选择：英文音色读中文会得到 0 字节，不能拿中文句子试英文音色 */
+function ttsSampleForVoice(voice: string): string {
+  const lang = (voice || '').toLowerCase().split('-')[0];
+  if (lang === 'en') return 'Hello, this is your desktop pet. The voice is ready.';
+  if (lang === 'ja') return 'こんにちは、あなたのデスクトップペットです。';
+  if (lang === 'ko') return '안녕하세요, 데스크톱 펫입니다.';
+  return '你好，我是你的桌面宠物，语音已经接好了。';
+}
+
 async function speakSampleFromUi(bridge: RendererBridge): Promise<void> {
   const btn = elementById<HTMLButtonElement>('setting-tts-speak');
   const el = elementById<HTMLElement>('setting-tts-status');
@@ -3911,11 +3920,11 @@ async function speakSampleFromUi(bridge: RendererBridge): Promise<void> {
     // 试听用设置页当前选中的音色（未点保存也要即时生效）
     const voice = elementById<HTMLSelectElement>('setting-tts-voice')?.value || ttsVoice;
     const requestId = beginTtsRequest();
-    const result = await bridge.ttsSpeak('你好，我是你的桌面宠物，语音已经接好了。', voice, requestId);
+    const result = await bridge.ttsSpeak(ttsSampleForVoice(voice), voice, requestId);
     if (el) {
       el.textContent = result.ok
         ? result.fallbackFrom
-          ? `该音色不可用，已自动改用默认音色并合成 ${result.bytes ?? 0} 字节`
+          ? `该音色不支持当前文本语言，已自动改用默认音色并合成 ${result.bytes ?? 0} 字节`
           : `已合成 ${result.bytes ?? 0} 字节，开始播放`
         : `失败：${result.error ?? '未知原因'}`;
     }
