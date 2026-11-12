@@ -87,6 +87,7 @@ const scenario_1 = require("./ai/scenario");
 const mcpClient_1 = require("./ai/mcpClient");
 const mcpServer_1 = require("./ai/mcpServer");
 const autonomy_1 = require("./ai/autonomy");
+const sceneContext_1 = require("./ai/sceneContext");
 const userAssets_1 = require("./assets/userAssets");
 const ipc_1 = require("./ipc");
 const gazeInput_1 = require("./gazeInput");
@@ -4166,10 +4167,22 @@ function autoTaskToolHint() {
 function autoTaskContext() {
     const info = monitor?.getCurrentInfo() ?? null;
     const todos = toolbox?.getTodos() ?? [];
+    let idleSeconds = 0;
+    try {
+        idleSeconds = electron_1.powerMonitor.getSystemIdleTime();
+    }
+    catch {
+        idleSeconds = 0;
+    }
     return {
         activeWindow: info ? `${info.app || '未知应用'} — ${info.title || '无标题'}` : '未知',
+        app: info?.app ?? '',
+        title: info?.title ?? '',
+        isFullscreen: info?.isFullscreen === true,
+        idleSeconds,
         todoText: todos.filter((t) => !t.done).map((t) => t.text).slice(0, 5).join('；'),
         mcpText: mcpClient ? mcpClient.statusText().split('\n').slice(0, 2).join(' | ') : '未配置',
+        scenarioText: scenario ? scenario.injectText({ budgetChars: 900 }) : '',
     };
 }
 
@@ -4218,22 +4231,30 @@ async function runAutoTask(trigger, eventMatched = false) {
         }
         else {
             const ctx = autoTaskContext();
-            const prompt = autonomy_1.buildAutoTaskPrompt(Date.now(), {
-            // 记录原始提示词（用于"对话信息"里回看思考）
-                mode: autoTaskCfg.mode,
-                prompt: autoTaskCfg.prompt,
+            // 场景提示词：当前屏幕 + 场景规则 + 近期情景 + MCP 状态一起交给 AI
+            const scenePrompt = sceneContext_1.buildSceneAutoTaskPrompt({
+                now: Date.now(),
+                mode: autoTaskCfg.mode === 'custom' ? 'custom' : 'scene_brief',
+                customPrompt: autoTaskCfg.prompt,
                 petName: settings.petName || '',
-                model: settings.aiModel || '',
-                ...ctx,
+                screen: { app: ctx.app, title: ctx.title, isFullscreen: ctx.isFullscreen, idleSeconds: ctx.idleSeconds },
+                todoText: ctx.todoText,
+                mcpText: ctx.mcpText,
+                scenarioText: ctx.scenarioText,
             });
-            autoTaskRoundPrompt = prompt;
-            if (autoTaskRoundDraft)
-                autoTaskRoundDraft = { ...autoTaskRoundDraft, prompt };
-
-            const reply = (await askAutoTask(prompt + autoTaskToolHint())).trim().replace(/^["「]|["」]$/g, '');
-            autoTaskLastResult = reply;
-            if (reply && !reply.includes('无需提醒'))
-                sendToRenderer(contracts_1.IPC_UI_BUBBLE, { text: reply.slice(0, 120), ttlMs: 12000 });
+            if (scenePrompt.skip) {
+                autoTaskLastResult = `跳过：${scenePrompt.reason}`;
+            }
+            else {
+                const prompt = scenePrompt.prompt;
+                autoTaskRoundPrompt = prompt;
+                if (autoTaskRoundDraft)
+                    autoTaskRoundDraft = { ...autoTaskRoundDraft, prompt };
+                const reply = (await askAutoTask(prompt + autoTaskToolHint())).trim().replace(/^["「]|["」]$/g, '');
+                autoTaskLastResult = reply;
+                if (reply && !reply.includes('无需提醒'))
+                    sendToRenderer(contracts_1.IPC_UI_BUBBLE, { text: reply.slice(0, 120), ttlMs: 12000 });
+            }
         }
         scenario?.record('event', `自主任务（${autoTaskCfg.mode}）：${String(autoTaskLastResult).slice(0, 80)}`);
         const roundAt = autoTaskRoundDraft ? autoTaskRoundDraft.at : Date.now();
@@ -4261,6 +4282,7 @@ async function runAutoTask(trigger, eventMatched = false) {
         return autoTaskLastResult;
     }
     catch (err) {
+        console.error('[autotask] 自主任务失败：', err);
         autoTaskLastResult = `失败：${err instanceof Error ? err.message : String(err)}`;
         const roundAt = autoTaskRoundDraft ? autoTaskRoundDraft.at : Date.now();
         autoTaskLastRound = {
