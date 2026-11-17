@@ -87,6 +87,8 @@ interface RenderHandle {
   listExpressions?(): string[];
   /** 当前模型可用动作组名（无动作 → []） */
   listMotions?(): string[];
+  /** 调试：.vtube.json 参数映射/待机组是否加载 */
+  vtsDebug?(): Any;
   /** 视线目标 nx/ny ∈[-1,1]，向右/向上为正；0 = 归位 */
   setGaze?(nx: number, ny: number): void;
   gazeOriginRatio?(): number | null;
@@ -5874,6 +5876,8 @@ function installDebugHooks(bridge: RendererBridge): void {
      * 若 enabled=true 但 sentCount 不涨 → bridge 没接上（bridgeOk/timerRunning 里能看出来）。
      */
     vts: () => vtsDebugState(),
+    /** 当前 Live2D 模型的 .vtube 映射/待机动作加载情况（换模型后排查映射问题） */
+    vtsModel: () => currentHandle?.vtsDebug?.() ?? null,
     /**
      * VTS 事件反向同步自查（Console 里 `__petDebug.vtsEvents()`）：
      * count 每次 VTS 热键/换模型都应增长；action 说明最近一条事件在本地做了什么

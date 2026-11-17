@@ -46,6 +46,8 @@
     listExpressions?(): string[];
     /** 当前模型可用动作组名（无动作返回空数组） */
     listMotions?(): string[];
+    /** 调试：.vtube.json 参数映射/待机组是否加载 */
+    vtsDebug?(): Any;
     /** 设置视线目标：nx/ny ∈ [-1,1]，向右/向上为正；0 = 归位（项目自建管线/兜底用） */
     setGaze?(nx: number, ny: number): void;
     /** 该模型半身取景的视线原点（窗口高度比例，0..1）；null=用默认脖颈 0.38 */
@@ -479,6 +481,9 @@
             if (!entry || typeof entry.OutputLive2D !== 'string' || !entry.OutputLive2D) continue;
             // Input 为空的是 VTS 自带的呼吸/眨眼等行为，由模型动画负责，不走映射
             if (typeof entry.Input !== 'string' || !entry.Input) continue;
+            // VTS 里标记为呼吸/眨眼的映射行交给引擎的 CubismBreath / EyeBlink；
+            // 如果在这里再写一次会压掉自动眨眼，表现为“眼睛不动/表情不自然”。
+            if (entry.UseBreathing === true || entry.UseBlinking === true) continue;
             const inLow = Number(entry.InputRangeLower);
             const inHigh = Number(entry.InputRangeUpper);
             const outLow = Number(entry.OutputRangeLower);
@@ -1342,7 +1347,7 @@
         // 位置在 motion/表情/眨眼之后、呼吸/物理之前，物理（头发/裙子/尾巴）才会跟着头部动。
         const hasVtsMapping = vtsMapping.length > 0;
         /** 映射会写到的输出参数 ID：标准参数驱动要跳过这些（否则同帧双写，映射会被动作混合打乱） */
-        const mappedOutputs = new Set(vtsMapping.map((entry) => entry.outId));
+        const mappedOutputs = new Set<string>();
         /** 能由本程序提供的 VTS 输入值；不在这里的输入（如 VoiceA、TongueOut）只能跳过并记一次日志 */
         const vtsInputs: Record<string, number> = {
           FaceAngleX: 0,
@@ -1358,7 +1363,22 @@
           MouthOpen: 0,
           JawOpen: 0,
           MouthSmile: 0.55,
+          MouthX: 0,
+          CheekPuff: 0,
+          MouthFunnel: 0,
+          MouthPucker: 0,
+          MouthShrug: 0,
+          MouthPressLipOpen: 0,
+          TongueOut: 0,
+          BrowInnerUp: 0,
         };
+        // 只有“本项目确实会提供输入”的映射才算占用了输出参数。
+        // 否则像 Ellen 的 EyeOpenLeft/EyeOpenRight 这种本项目不提供的输入，
+        // 会把 ParamEyeLOpen/ParamEyeROpen 误标成“已被映射”，导致自动眨眼被跳过、
+        // 映射又写不出值，最后眼睛完全不动。
+        for (const entry of vtsMapping) {
+          if (entry.input in vtsInputs) mappedOutputs.add(entry.outId);
+        }
         const vtsSmoothed = new Map<string, number>();
         let vtsLastMs = 0;
         // 调试自查：本帧写了几条、目标参数缺失跳过几条、输入不支持跳过几条
@@ -1599,6 +1619,17 @@
           },
           gazeOriginRatio(): number | null {
             return activeGazeOriginRatio;
+          },
+          vtsDebug(): Any {
+            return {
+              mapping: vtsMapping.length,
+              mappedOutputs: mappedOutputs.size,
+              unsupportedInputs: [...new Set(vtsMapping.map((entry) => entry.input))].filter(
+                (input) => !(input in vtsInputs),
+              ),
+              idleGroups: vtsMeta.idleGroups,
+              holdMotions: Object.keys(vtsMeta.motionHold),
+            };
           },
           debugSetParam(id: string, value: number): number | null {
             setParam(id, Number(value));
