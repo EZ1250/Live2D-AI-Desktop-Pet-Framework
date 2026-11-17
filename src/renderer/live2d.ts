@@ -432,6 +432,18 @@
     smoothing: number;
   }
 
+  /** .vtube.json 热键里只有 VTS 才知道的元数据（项目侧用来补 SDL 行为） */
+  interface VtsModelMeta {
+    /** 动作组 → 是否要停在最后一帧（StopsOnLastFrame） */
+    motionHold: Record<string, boolean>;
+    /** ChangeIdleAnimation 产生的待机组（group 已写入 model3 的 Motions） */
+    idleGroups: Array<{ group: string; name: string }>;
+  }
+
+  function emptyVtsMeta(): VtsModelMeta {
+    return { motionHold: {}, idleGroups: [] };
+  }
+
   /**
    * 读 model3.json 并合并 .vtube.json，再把结果交给运行库（**不改写用户模型文件**，只改内存对象）。
    *
@@ -441,8 +453,9 @@
    *  - ParameterSettings 是 VTS 的参数映射表（例如 FaceAngleX → AngleX/PositionX），
    *    这类模型用自定义控制器参数，不按表驱动就会"只有眨眼、头僵着"。
    */
-  async function normalizeModelSettings(url: string): Promise<{ json: Any; mapping: VtsParamMap[] } | null> {
+  async function normalizeModelSettings(url: string): Promise<{ json: Any; mapping: VtsParamMap[]; meta: VtsModelMeta } | null> {
     let mapping: VtsParamMap[] = [];
+    const meta = emptyVtsMeta();
     try {
       const res = await fetch(url, { cache: 'no-cache' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -460,8 +473,7 @@
           const vjson = (await vres.json()) as Any;
           const hotkeys = Array.isArray(vjson.Hotkeys) ? vjson.Hotkeys : [];
           // VTS 参数映射：模型用自定义控制器参数时，必须按这张表把追踪/口型写进去
-          const settingsList = Array.isArray(vjson.ParameterSettings) ? vjson.ParameterSettings : [];
-          mapping = [];
+          const settingsList = Array.isArray(vjson.ParameterSettings) ? vjson.ParameterSettings : [];          mapping = [];
           let invalidRangeRows = 0;
           for (const entry of settingsList) {
             if (!entry || typeof entry.OutputLive2D !== 'string' || !entry.OutputLive2D) continue;
@@ -512,6 +524,7 @@
           const motions: Record<string, Any[]> = refs.Motions && typeof refs.Motions === 'object' && !Array.isArray(refs.Motions) ? refs.Motions : {};
           const hotkeyGroups: Record<string, Any[]> = {};
           for (const h of hotkeys) {
+            if (!h || h.IsActive === false) continue;
             const file = h && typeof h.File === 'string' ? h.File : '';
             if (!file) continue;
             if (h.Action === 'ToggleExpression') {
@@ -525,6 +538,18 @@
               const name = String(h.Name || file).replace(/\.motion3\.json$/i, '').trim() || file;
               if (!hotkeyGroups[name]) hotkeyGroups[name] = [];
               hotkeyGroups[name].push({ File: p });
+              if (h.StopsOnLastFrame === true) meta.motionHold[name] = true;
+            } else if (h.Action === 'ChangeIdleAnimation') {
+              // VTS 用 ChangeIdleAnimation 在多个待机动作之间切换（例如艾莲的 idle/idle2）。
+              // 这里把文件注册成独立的 Motion 组，右键菜单可以直接选中，播放时切换 idle 组。
+              const p = await pick(file, ['Animation', 'Motions', '']);
+              if (!p) continue;
+              let seq = 1;
+              while (motions[`Idle${seq}`]) seq += 1;
+              const group = `Idle${seq}`;
+              const name = String(h.Name || file).replace(/\.motion3\.json$/i, '').trim() || group;
+              motions[group] = [{ File: p, FadeInTime: 0.4, FadeOutTime: 0.4 }];
+              meta.idleGroups.push({ group, name });
             }
           }
           for (const [name, list] of Object.entries(hotkeyGroups)) {
@@ -565,7 +590,7 @@
           }
         }
       } catch { /* optional */ }
-      return { json, mapping };
+      return { json, mapping, meta };
     } catch (err) {
       console.warn('[live2d] 设置文件归一化失败，改为直接交给运行库:', err);
       return null;
@@ -917,6 +942,7 @@
     const normalized = await normalizeModelSettings(modelUrl);
     const settings = normalized ? normalized.json : null;
     const vtsMapping = normalized ? normalized.mapping : [];
+    const vtsMeta = normalized ? normalized.meta : emptyVtsMeta();
     activeGazeOriginRatio = settings && Number.isFinite(Number((settings as Any).__petGazeOriginRatio))
       ? Number((settings as Any).__petGazeOriginRatio)
       : null;
@@ -1107,12 +1133,86 @@
             return false;
           }
         }
-        function startMocMotion(group: string, index: number): void {
+        function startMocMotion(group: string, index: number, priority = 3): void {
           try {
-            const r = typeof model.motion === 'function' ? model.motion(group, index) : null;
+            const r = typeof model.motion === 'function' ? model.motion(group, index, priority) : null;
             if (r && typeof r.catch === 'function') r.catch(() => { /* 加载/播放失败静默 */ });
           } catch (err) {
             console.warn('[live2d] 播放动作失败', group, err);
+          }
+        }
+
+        /** 动作停帧保持（VTS StopsOnLastFrame）：播放结束后把最后一帧参数钉住 */
+        let holdPose: { name: string; values: Map<string, number> } | null = null;
+        let holdToken = 0;
+        let holdTimer: ReturnType<typeof setTimeout> | null = null;
+        function clearHoldPose(): void {
+          holdToken += 1;
+          holdPose = null;
+          if (holdTimer !== null) {
+            clearTimeout(holdTimer);
+            holdTimer = null;
+          }
+        }
+        function motionFileUrl(group: string): string | null {
+          try {
+            const im = model && model.internalModel;
+            const defs = (im && im.settings && im.settings.motions) || {};
+            const item = defs[group] && defs[group][0];
+            const file = item && item.File;
+            if (!file) return null;
+            const base = (im && im.settings && im.settings.url) || modelUrl;
+            return new URL(file, base).href;
+          } catch {
+            return null;
+          }
+        }
+        function beginMotionHold(group: string): void {
+          if (!vtsMeta.motionHold[group]) return;
+          clearHoldPose();
+          const token = holdToken;
+          const url = motionFileUrl(group);
+          if (!url) return;
+          fetch(url, { cache: 'no-cache' })
+            .then((r) => (r.ok ? r.json() : null))
+            .then((json: Any) => {
+              if (!json || token !== holdToken) return;
+              const values = new Map<string, number>();
+              for (const curve of (json.Curves || []) as Any[]) {
+                if (!curve || curve.Target !== 'Parameter') continue;
+                const seg = Array.isArray(curve.Segments) ? curve.Segments : [];
+                if (seg.length < 2) continue;
+                const last = Number(seg[seg.length - 1]);
+                if (Number.isFinite(last)) values.set(String(curve.Id), last);
+              }
+              const duration = Math.max(0.1, Number(json.Meta && json.Meta.Duration) || 1);
+              holdTimer = setTimeout(() => {
+                holdTimer = null;
+                if (token !== holdToken || !values.size) return;
+                holdPose = { name: group, values };
+              }, duration * 1000 + 20);
+            })
+            .catch((err) => console.warn('[live2d] 读取动作终帧失败（不保持姿势）', group, err));
+        }
+        /** VTS ChangeIdleAnimation：切换 idle 组并重播一个待机动作 */
+        function switchIdleGroup(group: string): boolean {
+          try {
+            const mm = model && model.internalModel && model.internalModel.motionManager;
+            if (!mm || !mm.definitions || !Array.isArray(mm.definitions[group]) || !mm.definitions[group].length) {
+              return false;
+            }
+            if (mm.groups && typeof mm.groups === 'object') mm.groups.idle = group;
+            if (typeof mm.stopAllMotions === 'function') mm.stopAllMotions();
+            if (typeof mm.startRandomMotion === 'function') {
+              const r = mm.startRandomMotion(group, 1);
+              if (r && typeof r.catch === 'function') r.catch(() => { /* ignore */ });
+            } else {
+              startMocMotion(group, 0, 1);
+            }
+            return true;
+          } catch (err) {
+            console.warn('[live2d] 切换待机动作失败', group, err);
+            return false;
           }
         }
         function expressionManager(): Any {
@@ -1435,18 +1535,28 @@
           kind: 'moc3',
           playMotion(group: string): void {
             const g = group || '';
+            // VTS ChangeIdleAnimation 注册出来的待机组：按名字切换 idle，不当作普通动作播一次
+            const idleMeta = vtsMeta.idleGroups.find((x) => x.group === g || x.name === g);
+            if (idleMeta) {
+              swayStart = 0;
+              clearHoldPose();
+              if (switchIdleGroup(idleMeta.group)) return;
+            }
             if (g === 'wave') {
               if (hasMotionGroup('wave')) {
-                startMocMotion('wave', 0); // 真实 wave 组（未来模型若注入则直接播）
+                startMocMotion('wave', 0, 3); // 真实 wave 组（未来模型若注入则直接播）
               } else {
                 // 当前资产无 wave 组 → 退化为整体左右摇摆 2.5 个周期的挥手手势
                 swayStart = performance.now() / 1000;
               }
             } else if (g === 'Idle' || g === 'idle') {
               swayStart = 0;
-              if (hasMotionGroup('Idle')) startMocMotion('Idle', 0);
+              clearHoldPose();
+              if (hasMotionGroup('Idle')) startMocMotion('Idle', 0, 1);
             } else if (g && hasMotionGroup(g)) {
-              startMocMotion(g, 0);
+              clearHoldPose();
+              startMocMotion(g, 0, 3); // 用户触发的动作抢占待机（对应 VTS TriggerAnimation）
+              beginMotionHold(g);
             }
           },
           setExpression(name: string | null): void {
@@ -2093,6 +2203,10 @@
                   setParam(param, base * (1 - weight) + value * weight);
                 }
               }
+              // VTS StopsOnLastFrame：动作播完后把终帧参数钉住（放在追踪混合之后，姿势不会被下一帧动作冲掉）
+              if (holdPose) {
+                for (const [id, value] of holdPose.values) setParam(id, value);
+              }
               // 渲染逐帧由本层 RAF 驱动：直接 render stage（Pixi6 下 app.render 会再走一遍 ticker 语义）
               if (app.renderer && app.stage) app.renderer.render(app.stage);
               renderedThisFrame = true;
@@ -2174,6 +2288,7 @@
           destroy(): void {
             if (destroyed) return;
             destroyed = true;
+            clearHoldPose();
             window.clearTimeout(t1);
             window.clearTimeout(t2);
             try {
@@ -2194,7 +2309,7 @@
         };
         // 自动进入 Idle 组（若模型有）：让 moc3 自带动画（呼吸/身体微摆）真正动起来，
         // 而不是静止贴图观感；视线参数在 update() 末尾写入，不会被动作帧覆盖。
-        if (idleMotionAvailable) startMocMotion('Idle', 0);
+        if (idleMotionAvailable) startMocMotion('Idle', 0, 1);
         if (headTrackOK) log('头部跟踪参数:', { headTrackX, headTrackY, headTrackZ, ids: paramIds });
         else log('头部跟踪: 当前模型没有头部角度参数', paramIds.angleX, paramIds.angleY, paramIds.angleZ);
         log('moc3 就绪:', modelUrl);
