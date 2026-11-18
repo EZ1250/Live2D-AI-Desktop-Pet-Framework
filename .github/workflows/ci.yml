@@ -9,7 +9,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           # Electron 45 的 engines 要求 node >= 22.12.0（旧的 node 20 装不上）
           node-version: 24
