@@ -260,6 +260,9 @@ export function loadAppSettings(): AppSettings {
       fullscreenAutoHide: bool(false, 'fullscreenAutoHide'),
       // 点击穿透：默认关闭（默认开启一旦命中判定有偏差，用户会觉得"桌宠点不动"）
       clickThrough: bool(false, 'clickThrough'),
+      // 启动时检查更新：默认开启；关闭后启动不再自动联网查 GitHub（手动检查仍可用）。
+      // 必须在这里读回来，否则"设置里关掉、重启又悄悄检查"。
+      checkForUpdates: bool(true, 'checkForUpdates'),
       // 桌宠窗口位置/尺寸：同样必须读回来，否则"位置记忆"就是假的（存了但重启不生效）。
       // 缺失/非法时留 undefined，由 createWindow 用默认尺寸与位置。
       petX: optNum('petX'),

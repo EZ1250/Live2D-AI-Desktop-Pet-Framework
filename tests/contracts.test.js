@@ -13,9 +13,17 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const contracts = require('../dist/shared/contracts.js');
+const { readSrcSources } = require('./helpers/rendererSandbox');
 
 const ROOT = path.join(__dirname, '..');
-const readSrc = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
+/**
+ * 渲染层已从 renderer.ts 拆出多个全局脚本（settingsPanel/voiceInput/thinkingOverlay）。
+ * 这些断言关心"渲染层代码里有没有这段逻辑"，不关心它此刻在哪个文件里，
+ * 因此虚拟路径 'src/renderer/renderer.ts' 统一读渲染层全部源码（顺序同 index.html）。
+ */
+const rendererSource = () => readSrcSources().join('\n');
+const readSrc = (rel) =>
+  rel === 'src/renderer/renderer.ts' ? rendererSource() : fs.readFileSync(path.join(ROOT, rel), 'utf8');
 
 test('IPC 通道常量非空且不重复', () => {
   const entries = Object.entries(contracts).filter(
@@ -300,4 +308,64 @@ test('Edge TTS 播放接线：speak handler + 渲染层播放 + 说话时 VTS �
     readSrc('src/main/mainImpl.js').includes('require("./earlySwitches")'),
     'mainImpl.js 顶部也 require 一次 earlySwitches（直接 require mainImpl 的入口同样有保障）',
   );
+});
+
+/**
+ * 更新检测（GitHub Release）：契约 / preload / 主进程 / 渲染层 / 设置页五处同步。
+ * 漏一处的表现：设置页一直"尚未检查"、或点击"前往下载"没反应——所以钉住。
+ */
+test('更新检测 IPC：契约、preload、主进程、渲染层、设置页五处都接上了', () => {
+  assert.equal(contracts.IPC_UPDATE_STATUS_GET, 'update:status:get');
+  assert.equal(contracts.IPC_UPDATE_CHECK, 'update:check');
+  assert.equal(contracts.IPC_UPDATE_STATUS, 'update:status');
+  for (const name of ['IPC_UPDATE_STATUS_GET', 'IPC_UPDATE_CHECK', 'IPC_UPDATE_STATUS']) {
+    for (const file of ['src/shared/contracts.ts', 'src/preload/preload.ts', 'src/main/ipc.ts']) {
+      assert.ok(readSrc(file).includes(name), `${file} 应引用 ${name}`);
+    }
+  }
+  // 主进程：启动检查 + 推送（更新提示的唯一入口是设置页，不往托盘/右键菜单塞更新项）
+  const main = readSrc('src/main/mainImpl.js');
+  for (const token of ['registerUpdateHost', 'startAutoUpdateCheck', 'getCurrentUpdateSnapshot', 'IPC_UPDATE_STATUS']) {
+    assert.ok(main.includes(token), `mainImpl.js 应包含 ${token}`);
+  }
+  assert.ok(!main.includes('发现新版本'), '更新提示只放设置页，托盘菜单不应插入"发现新版本"项');
+  assert.ok(!main.includes('cm-update'), '更新提示只放设置页，mainImpl 不应有右键菜单更新项');
+  // 检测逻辑在独立模块里（纯函数可单测 + 网络可注入）
+  const updater = readSrc('src/main/updateCheck.ts');
+  for (const fn of [
+    'export function compareVersion',
+    'export function isTrustedReleaseUrl',
+    'export async function checkForUpdates',
+    'export async function fetchLatestRelease',
+  ]) {
+    assert.ok(updater.includes(fn), `updateCheck.ts 应导出 ${fn}`);
+  }
+  // preload：三个方法都在
+  for (const method of ['getUpdateStatus', 'checkForUpdates', 'onUpdateStatus']) {
+    assert.ok(readSrc('src/preload/preload.ts').includes(method), `preload 应提供 ${method}`);
+  }
+  // 渲染层：拉快照 + 订阅推送 + 状态渲染 + 前往下载
+  for (const token of ['installUpdateUi', 'renderUpdateStatus', 'onUpdateStatus', 'btn-open-release', 'isTrustedGithubReleaseUrl']) {
+    assert.ok(rendererSource().includes(token), `渲染层应包含 ${token}`);
+  }
+  assert.ok(!rendererSource().includes('cm-update'), '渲染层不应再有右键菜单更新项');
+  // 设置页：开关要能回填 / 保存（"存进去、重启读不回来"的坑）
+  assert.ok(readSrc('src/renderer/settingsPanel.ts').includes('setting-check-for-updates'));
+  assert.ok(readSrc('src/renderer/renderer.ts').includes('checkForUpdates: elementById'));
+  assert.match(readSrc('src/main/ai/chatClient.ts'), /checkForUpdates: bool\(true/, 'loadAppSettings 必须读回 checkForUpdates');
+  // index.html：更新区收在"⭐ 您的 Star…"折叠区里，并替代原来的「📦 拿最新版」按钮
+  const html = readSrc('src/renderer/index.html');
+  const detailsStart = html.indexOf('class="settings-links"');
+  const detailsEnd = html.indexOf('</details>', detailsStart);
+  const updateStart = html.indexOf('id="settings-update"');
+  assert.ok(detailsStart > 0, 'index.html 应有设置页折叠区');
+  assert.ok(updateStart > detailsStart && updateStart < detailsEnd, '更新区应放在折叠区（settings-links）里');
+  for (const id of ['setting-check-for-updates', 'update-status-text', 'btn-check-update', 'btn-open-release', 'settings-current-version']) {
+    assert.ok(html.includes(`id="${id}"`), `index.html 应包含 #${id}`);
+  }
+  assert.ok(!html.includes('cm-update'), 'index.html 不应再有右键菜单更新项');
+  assert.ok(!html.includes('拿最新版'), '原来的「📦 拿最新版」按钮应被更新区替代');
+  // 更新设置区必须在设置表单内（不能贴到表单外，否则保存时读不到）
+  const formStart = html.indexOf('id="settings-form"');
+  assert.ok(formStart > 0 && updateStart > formStart, '更新设置区应在设置表单里');
 });

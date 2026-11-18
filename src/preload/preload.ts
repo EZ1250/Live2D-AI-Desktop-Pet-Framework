@@ -73,6 +73,9 @@ import {
   IPC_TTS_SPEAK,
   IPC_TTS_VOICES,
   IPC_UI_BUBBLE,
+  IPC_UPDATE_CHECK,
+  IPC_UPDATE_STATUS,
+  IPC_UPDATE_STATUS_GET,
   IPC_VOICE_CHECK,
   IPC_VOICE_MODELS,
   IPC_VOICE_STATUS,
@@ -97,6 +100,7 @@ import type {
   TodoDto,
   TtsAudioPayload,
   TtsVoiceListResult,
+  UpdateSnapshot,
   VoiceCheckResult,
   VoiceModelIndexResult,
   VoiceStatusResult,
@@ -153,6 +157,18 @@ const api: ElectronAPI = {
   setSettings(settings: AppSettings): Promise<{ ok: boolean; error?: string }> {
     return ipcRenderer.invoke(IPC_SETTINGS_SET, settings);
   },
+  /** 读取更新检测状态快照（不联网；启动检查结果会缓存）。 */
+  getUpdateStatus(): Promise<UpdateSnapshot> {
+    return ipcRenderer.invoke(IPC_UPDATE_STATUS_GET);
+  },
+  /** 立即手动检查一次更新（会联网；忽略"启动时检查更新"开关）。 */
+  checkForUpdates(): Promise<UpdateSnapshot> {
+    return ipcRenderer.invoke(IPC_UPDATE_CHECK);
+  },
+  /** 订阅更新检测状态推送（主进程每次检查后推送）。 */
+  onUpdateStatus(cb: (snapshot: UpdateSnapshot) => void): () => void {
+    return subscribeChannel<UpdateSnapshot>(IPC_UPDATE_STATUS, cb);
+  },
   getMcpStatus(): Promise<import('../shared/contracts').McpPanelStatus> {
     return ipcRenderer.invoke(IPC_MCP_STATUS);
   },
@@ -205,7 +221,7 @@ const api: ElectronAPI = {
   assetImport(kind) {
     return ipcRenderer.invoke(IPC_ASSET_IMPORT, kind);
   },
-  /** 拖放加入：路径来自 webUtils（Electron 31+ 渲染层已拿不到 File.path）。 */
+  /** 拖放加入：路径来自 webUtils（Electron 31+ 起、含当前 45，渲染层已拿不到 File.path）。 */
   assetImportPath(path, kind) {
     return ipcRenderer.invoke(IPC_ASSET_IMPORT_PATH, path, kind ?? 'auto');
   },

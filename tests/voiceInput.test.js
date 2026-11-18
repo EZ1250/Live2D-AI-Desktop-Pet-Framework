@@ -4,16 +4,7 @@ const assert = require('node:assert/strict');
 const path = require('node:path');
 
 const APP = path.join(__dirname, '..');
-const RENDERER = path.join(APP, 'dist', 'renderer', 'renderer.js');
-const VOICELAB = path.join(APP, 'dist', 'renderer', 'voicelab.js');
-const GAZE = path.join(APP, 'dist', 'renderer', 'gazeController.js');
-const EMOTION = path.join(APP, 'dist', 'renderer', 'emotion.js');
-const KERNEL = path.join(APP, 'dist', 'renderer', 'kernel.js');
-const EMOTION_PLUGIN = path.join(APP, 'dist', 'renderer', 'plugins', 'emotion.js');
-const BEHAVIOR_PLUGIN = path.join(APP, 'dist', 'renderer', 'plugins', 'behavior.js');
-const FX = path.join(APP, 'dist', 'renderer', 'fx.js');
-const TODO_PANEL = path.join(APP, 'dist', 'renderer', 'panels', 'todo.js');
-const ASK_BOX = path.join(APP, 'dist', 'renderer', 'panels', 'askBox.js');
+const { loadRendererScripts } = require('./helpers/rendererSandbox');
 
 /* ------------------------------------------------------------------ 假 DOM */
 
@@ -181,50 +172,18 @@ function bootRenderer() {
     constructor(...args) { super(...args); counters.recorders += 1; }
   }
 
-  const globals = {
-    document, window,
+  // 按 index.html 的 <script> 顺序在 vm 里加载渲染层脚本（浏览器语义：共享全局作用域）。
+  // 不能用 require()：那会把每个文件包进模块作用域，renderer.js 就看不到拆出去的模块了。
+  loadRendererScripts(window, {
+    document,
+    location: window.location,
     MediaRecorder: CountingRecorder,
     URLSearchParams,
     getComputedStyle: () => ({ getPropertyValue: () => '' }),
     SVGElement: class {}, HTMLElement: class {}, Element: class {}, Node: class {},
     AudioContext: undefined, // 口型分析不可用 → 代码应静默跳过
-  };
-  const savedGlobals = new Map();
-  for (const [k, v] of Object.entries(globals)) {
-    savedGlobals.set(k, Object.getOwnPropertyDescriptor(globalThis, k));
-    Object.defineProperty(globalThis, k, { configurable: true, writable: true, value: v });
-  }
-  // 注意：这些全局**故意不还原**。渲染层是单例状态机，测试结束后仍有排队中的定时器/
-  // Promise 回调；把 globalThis.document 撤掉会让它们抛 "document is not defined"
-  // （Node 会报成"测试结束后仍有异步活动"）。测试进程用完即退，留着最省事。
-  void savedGlobals;
-  Object.defineProperty(globalThis, 'navigator', {
-    configurable: true,
-    value: { mediaDevices: { getUserMedia } },
+    navigator: { mediaDevices: { getUserMedia } },
   });
-
-  delete require.cache[require.resolve(EMOTION)];
-  delete require.cache[require.resolve(VOICELAB)];
-  delete require.cache[require.resolve(GAZE)];
-  delete require.cache[require.resolve(KERNEL)];
-  delete require.cache[require.resolve(EMOTION_PLUGIN)];
-  delete require.cache[require.resolve(BEHAVIOR_PLUGIN)];
-  delete require.cache[require.resolve(FX)];
-  delete require.cache[require.resolve(TODO_PANEL)];
-  delete require.cache[require.resolve(ASK_BOX)];
-  delete require.cache[require.resolve(RENDERER)];
-  require(EMOTION); // 情绪规则库：emotion 插件启动时读 window.PetEmotion
-  window.PetEmotion = globalThis.PetEmotion;
-  require(VOICELAB);
-  window.PetVoiceLab = globalThis.PetVoiceLab; // voicelab 挂在 globalThis 上
-  require(GAZE); // 视线模块（index.html 里同样先于 renderer.js 加载）
-  require(KERNEL); // 渲染层内核（index.html 里同样先于 renderer.js）
-  require(EMOTION_PLUGIN); // 内置策略插件：在 kernel 之后、renderer.js 之前注册
-  require(BEHAVIOR_PLUGIN);
-  require(FX); // 渲染层 UI 模块：install(deps) 注入依赖
-  require(TODO_PANEL);
-  require(ASK_BOX);
-  require(RENDERER);
 
   return {
     dom, document, window, trace, byId, counters, gateUserMedia,

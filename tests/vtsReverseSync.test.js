@@ -24,12 +24,17 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const APP = path.join(__dirname, '..');
-const RENDERER = path.join(APP, 'dist', 'renderer', 'renderer.js');
+const { RENDERER_SCRIPTS } = require('./helpers/rendererSandbox');
+
+/** 渲染层全部编译产物按 index.html 顺序拼起来（拆文件后函数不再都在 renderer.js 里） */
+const RENDERER_SOURCE = RENDERER_SCRIPTS.map((rel) =>
+  fs.readFileSync(path.join(APP, 'dist', 'renderer', rel), 'utf8').replace(/\\r\\n/g, '\\n'),
+).join('\n');
 
 /** 从编译产物里截出一个顶层函数（tsc 输出：顶格 `function name(` … 顶格 `}`） */
 function extractFunction(source, name) {
   const start = source.indexOf(`function ${name}(`);
-  assert.ok(start >= 0, `dist/renderer/renderer.js 里找不到 ${name}`);
+  assert.ok(start >= 0, `渲染层编译产物里找不到 ${name}`);
   const end = source.indexOf('\n}\n', start);
   assert.ok(end > start, `${name} 的函数体边界异常`);
   return source.slice(start, end + 3);
@@ -37,7 +42,7 @@ function extractFunction(source, name) {
 
 /** 用桩 handle + 桩名字表搭一个能跑 applyVtsEvent 的上下文 */
 function createHarness(options = {}) {
-  const source = fs.readFileSync(RENDERER, 'utf8');
+  const source = RENDERER_SOURCE;
   const code = `${extractFunction(source, 'matchLocalName')}\n${extractFunction(source, 'applyVtsEvent')}`;
   const calls = [];
   const logs = [];

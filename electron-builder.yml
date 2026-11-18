@@ -10,6 +10,10 @@
 appId: com.pet.desktop
 productName: Pet
 
+# 打包完成后给 Pet.exe 翻 Electron fuses（关掉 ELECTRON_RUN_AS_NODE / --inspect / NODE_OPTIONS，
+# 并强制只从 app.asar 加载应用代码）。见 scripts/after-pack.js 的注释与失败策略。
+afterPack: ./scripts/after-pack.js
+
 # 不要在打包时重建原生依赖。
 # 唯一的原生依赖是 active-win，它用的是 **N-API**（napi_versions: [3, 6]）——N-API 是 ABI 稳定的，
 # node_modules 里那份 napi-6-win32-unknown-x64/node-active-win.node 在 Node 与 Electron 下都能直接加载

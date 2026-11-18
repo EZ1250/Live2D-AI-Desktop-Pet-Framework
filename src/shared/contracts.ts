@@ -160,6 +160,12 @@ export const IPC_PICK_FOLDER = 'app:pickFolder';
 export const IPC_OPEN_PATH = 'app:openPath';
 /** invoke renderer→main：用系统默认浏览器打开 http/https 链接（返回空字符串=成功）。 */
 export const IPC_OPEN_EXTERNAL = 'app:openExternal';
+/** invoke renderer→main：读取更新检测状态快照（当前版本 + 上次检查结果；本通道不联网）。 */
+export const IPC_UPDATE_STATUS_GET = 'update:status:get';
+/** invoke renderer→main：立即手动检查一次更新（会联网；忽略"启动时检查更新"开关）。 */
+export const IPC_UPDATE_CHECK = 'update:check';
+/** main→renderer 推送：每次检查完成后推送状态快照（渲染层未就绪时会丢，用 IPC_UPDATE_STATUS_GET 补拉）。 */
+export const IPC_UPDATE_STATUS = 'update:status';
 /**
  * invoke renderer→main：从当前 API 地址拉取服务端**可用模型列表**（GET /models）。
  * 设置页用它把"AI 模型"变成可选列表，避免手打一个不存在的模型名（服务端只会回 "Model not exist."）。
@@ -173,6 +179,61 @@ export interface AiModelListResult {
   models: string[];
   /** ok=false 时的原因（网络/鉴权/地址不对等）。 */
   error?: string;
+}
+
+// ---------------------------------------------------------------------------
+// 更新检测（GitHub Release）
+// 为什么需要：应用没有代码签名、也没有自动更新通道，用户不知道有新版本时只能手动来仓库看。
+// 这里只做"检测 + 提示 + 跳转"，不下载、不安装（完整自动更新需要签名证书）。
+// ---------------------------------------------------------------------------
+
+/** 一个 GitHub Release 的摘要（只保留 UI 需要的字段）。 */
+export interface ReleaseInfo {
+  /** 规范化后的版本号（去 v 前缀，如 1.0.4） */
+  version: string;
+  /** 原始 tag（如 v1.0.4） */
+  tagName: string;
+  /** Release 标题（缺失时用 tagName） */
+  name: string;
+  /** Release 页面地址（只允许 https://github.com/EZ1250/... 前缀） */
+  htmlUrl: string;
+  publishedAt: string;
+  body: string;
+}
+
+/** 本次结果来自哪个接口：api=GitHub API，fallback=releases/latest 重定向页。 */
+export type ReleaseSource = 'api' | 'fallback';
+
+/** 检查失败原因（设置页据此给用户看得懂的提示）。 */
+export type UpdateErrorReason =
+  | 'offline'
+  | 'timeout'
+  | 'rate-limited'
+  | 'http-error'
+  | 'parse-error'
+  | 'unknown';
+
+/**
+ * 更新检测状态（判别联合）：
+ *  - idle：本次运行还没检查过
+ *  - checking：正在检查
+ *  - no-update：已是最新（checkedAt + source 来自这次检查）
+ *  - update-available：发现新版本（release 里有跳转地址）
+ *  - error：检查失败（reason 供设置页显示原因，不弹窗）
+ *  - disabled：设置里关掉了"启动时检查更新"（手动检查仍会执行）
+ */
+export type UpdateState =
+  | { kind: 'idle' }
+  | { kind: 'checking' }
+  | { kind: 'no-update'; checkedAt: number; source: ReleaseSource }
+  | { kind: 'update-available'; release: ReleaseInfo; checkedAt: number; source: ReleaseSource }
+  | { kind: 'error'; reason: UpdateErrorReason; detail?: string; checkedAt?: number }
+  | { kind: 'disabled' };
+
+/** 更新检测快照：状态 + 当前版本（设置页/推送都用它）。 */
+export interface UpdateSnapshot {
+  currentVersion: string;
+  state: UpdateState;
 }
 
 // ---------------------------------------------------------------------------
@@ -673,6 +734,12 @@ export interface ElectronAPI {
   getSettings(): Promise<AppSettings>;
   /** 持久化并立即应用设置。 */
   setSettings(settings: AppSettings): Promise<{ ok: boolean; error?: string }>;
+  /** 读取更新检测状态快照（不联网；启动检查的结果会缓存到这里供设置页展示）。 */
+  getUpdateStatus(): Promise<UpdateSnapshot>;
+  /** 立即手动检查一次更新（会联网；忽略"启动时检查更新"开关）。 */
+  checkForUpdates(): Promise<UpdateSnapshot>;
+  /** 订阅更新检测状态推送（主进程每次检查后推送；旧 preload 没有此方法，渲染层做特性探测）。 */
+  onUpdateStatus?(cb: (snapshot: UpdateSnapshot) => void): () => void;
   /** MCP 面板状态（两个方向 + 自主任务运行情况）。 */
   getMcpStatus(): Promise<McpPanelStatus>;
   /** MCP 操作：reload=重载 mcp.json 与 mcp-server 配置。 */
@@ -724,12 +791,12 @@ export interface ElectronAPI {
   assetImport?(kind: AssetKind): Promise<AssetImportResult>;
   /**
    * 按绝对路径加入资产（拖放用）。kind='auto' 时由主进程按目录内容判断模型还是插件。
-   * 路径来自 preload 的 `pathForFile()`（Electron 31+ 起渲染层拿不到 File.path）。
+   * 路径来自 preload 的 `pathForFile()`（Electron 31+ 起、含当前 45，渲染层拿不到 File.path）。
    */
   assetImportPath?(path: string, kind?: AssetKind | 'auto'): Promise<AssetImportResult>;
   /**
    * 把拖放的 File 转成绝对路径（preload 里调 `webUtils.getPathForFile`）。
-   * Electron 31+ 移除了 `File.path`，渲染层只能经这个桥取路径；取不到时返回空字符串。
+   * Electron 31+ 移除了 `File.path`（45 同样移除），渲染层只能经这个桥取路径；取不到时返回空字符串。
    */
   pathForFile?(file: File): string;
   /** 移除一个用户资产。 */
@@ -930,6 +997,8 @@ export interface AppSettings {
    * 默认关闭——它靠渲染层按像素命中判定，属于"没实机验证过就不该默认打开"的交互变更。
    */
   clickThrough?: boolean;
+  /** 启动时自动检查 GitHub 是否有新版本（默认 true；关闭后仍可在设置页手动检查）。 */
+  checkForUpdates?: boolean;
   /**
    * 桌宠窗口位置与尺寸：主进程在移动/缩放后写入，下次启动读回。
    * 只在窗口仍落在某个显示器工作区内时才沿用，换屏/拔屏后不会跑到看不见的地方。

@@ -21,16 +21,7 @@ const assert = require('node:assert/strict');
 const path = require('node:path');
 
 const APP = path.join(__dirname, '..');
-const RENDERER = path.join(APP, 'dist', 'renderer', 'renderer.js');
-const VOICELAB = path.join(APP, 'dist', 'renderer', 'voicelab.js');
-const GAZE = path.join(APP, 'dist', 'renderer', 'gazeController.js');
-const EMOTION = path.join(APP, 'dist', 'renderer', 'emotion.js');
-const KERNEL = path.join(APP, 'dist', 'renderer', 'kernel.js');
-const EMOTION_PLUGIN = path.join(APP, 'dist', 'renderer', 'plugins', 'emotion.js');
-const BEHAVIOR_PLUGIN = path.join(APP, 'dist', 'renderer', 'plugins', 'behavior.js');
-const FX = path.join(APP, 'dist', 'renderer', 'fx.js');
-const TODO_PANEL = path.join(APP, 'dist', 'renderer', 'panels', 'todo.js');
-const ASK_BOX = path.join(APP, 'dist', 'renderer', 'panels', 'askBox.js');
+const { loadRendererScripts, plain } = require('./helpers/rendererSandbox');
 
 /* ---------------- 假 DOM（够 init()/设置页/气泡跑） ---------------- */
 class FakeEl {
@@ -257,49 +248,23 @@ function bootPetWindow(triggers = USER_TRIGGERS) {
   window.electron = bridge;
   const emit = (ev, payload) => { for (const cb of handlers[ev] ?? []) cb(payload); };
 
-  const globals = {
-    document, window, URLSearchParams,
+  const errors = [];
+  process.on('unhandledRejection', (e) => errors.push(e));
+
+  // 按 index.html 的 <script> 顺序在 vm 里加载渲染层脚本（浏览器语义：共享全局作用域）。
+  // 不能用 require()：那会把每个文件包进模块作用域，renderer.js 就看不到拆出去的模块了。
+  loadRendererScripts(window, {
+    document,
     location: window.location,
+    URLSearchParams,
     requestAnimationFrame: () => 0,
     cancelAnimationFrame: () => {},
     MediaRecorder: class { static isTypeSupported() { return true; } start() {} stop() {} },
     getComputedStyle: () => ({ getPropertyValue: () => '' }),
     SVGElement: class {}, HTMLElement: class {}, Element: class {}, Node: class {},
     AudioContext: undefined,
-  };
-  for (const [k, v] of Object.entries(globals)) {
-    Object.defineProperty(globalThis, k, { configurable: true, writable: true, value: v });
-  }
-  Object.defineProperty(globalThis, 'navigator', {
-    configurable: true,
-    value: { mediaDevices: { getUserMedia: async () => ({ getTracks: () => [{ stop() {} }] }) } },
-  });
-
-  const errors = [];
-  process.on('unhandledRejection', (e) => errors.push(e));
-
-  delete require.cache[require.resolve(EMOTION)];
-  delete require.cache[require.resolve(VOICELAB)];
-  delete require.cache[require.resolve(GAZE)];
-  delete require.cache[require.resolve(KERNEL)];
-  delete require.cache[require.resolve(EMOTION_PLUGIN)];
-  delete require.cache[require.resolve(BEHAVIOR_PLUGIN)];
-  delete require.cache[require.resolve(FX)];
-  delete require.cache[require.resolve(TODO_PANEL)];
-  delete require.cache[require.resolve(ASK_BOX)];
-  delete require.cache[require.resolve(RENDERER)];
-  require(EMOTION); // 情绪规则库：emotion 插件启动时读 window.PetEmotion
-  window.PetEmotion = globalThis.PetEmotion;
-  require(VOICELAB);
-  window.PetVoiceLab = globalThis.PetVoiceLab;
-  require(GAZE); // 视线模块：renderer 初始化时注入 getter（index.html 里同样先于 renderer.js）
-  require(KERNEL); // 渲染层内核：index.html 里在 renderer.js 之前
-  require(EMOTION_PLUGIN); // 内置策略插件：在 kernel 之后、renderer.js 之前注册
-  require(BEHAVIOR_PLUGIN);
-  require(FX); // 渲染层 UI 模块：install(deps) 注入依赖
-  require(TODO_PANEL);
-  require(ASK_BOX);
-  require(RENDERER);
+    navigator: { mediaDevices: { getUserMedia: async () => ({ getTracks: () => [{ stop() {} }] }) } },
+  }, { skip: ['live2d.js'] }); // live2d.js 会覆盖测试注入的 window.PetLive2d（假 handle）
 
   return { dom, document, window, handlers, calls, errors, emit, dispatchWin, dispatchDoc };
 }
@@ -386,17 +351,17 @@ test('行为触发：随启动载入、6 个绑定都能解析、并且真的播
 
   const info = dbg.behaviors();
   // ① 映射随启动就载入（修复前这里是 {}，行为全部退回 auto → 配的表情永远不播）
-  assert.deepEqual(info.triggers, USER_TRIGGERS, '行为触发映射必须在启动时就载入，而不是等打开设置面板');
-  assert.deepEqual(info.motions, MODEL_MOTIONS);
-  assert.deepEqual(info.expressions, MODEL_EXPRESSIONS);
+  assert.deepEqual(plain(info.triggers), USER_TRIGGERS, '行为触发映射必须在启动时就载入，而不是等打开设置面板');
+  assert.deepEqual(plain(info.motions), MODEL_MOTIONS);
+  assert.deepEqual(plain(info.expressions), MODEL_EXPRESSIONS);
 
   // ② 用户截图里那 6 个绑定，在当前模型上都必须能解析出真实目标
-  assert.deepEqual(info.resolved.user_message, { kind: 'expression', name: '猫咪滤镜' });
-  assert.deepEqual(info.resolved.tool_call, { kind: 'expression', name: '眼镜' });
-  assert.deepEqual(info.resolved.command_exec, { kind: 'expression', name: '眼镜' });
-  assert.deepEqual(info.resolved.ai_start, { kind: 'expression', name: '拿笔' });
-  assert.deepEqual(info.resolved.model_idle, { kind: 'expression', name: '围裙' });
-  assert.deepEqual(info.resolved.error, { kind: 'expression', name: '呆猫' });
+  assert.deepEqual(plain(info.resolved.user_message), { kind: 'expression', name: '猫咪滤镜' });
+  assert.deepEqual(plain(info.resolved.tool_call), { kind: 'expression', name: '眼镜' });
+  assert.deepEqual(plain(info.resolved.command_exec), { kind: 'expression', name: '眼镜' });
+  assert.deepEqual(plain(info.resolved.ai_start), { kind: 'expression', name: '拿笔' });
+  assert.deepEqual(plain(info.resolved.model_idle), { kind: 'expression', name: '围裙' });
+  assert.deepEqual(plain(info.resolved.error), { kind: 'expression', name: '呆猫' });
 
   // ③ 走真实推送通道触发，断言真的调到了 setExpression
   const lastExpr = () => env.calls.setExpression[env.calls.setExpression.length - 1];
@@ -421,9 +386,9 @@ test('行为触发：随启动载入、6 个绑定都能解析、并且真的播
   await expectPlays('待机搭话', () => env.emit('onBubble', { text: '摸鱼时间到～' }), '围裙');
 
   // ④ 解析规则本身：三种前缀 / 能力别名 / 不存在的名字
-  assert.deepEqual(dbg.resolveTrigger('expr:猫咪滤镜'), { kind: 'expression', name: '猫咪滤镜' });
-  assert.deepEqual(dbg.resolveTrigger('motion:Idle'), { kind: 'motion', name: 'Idle' });
-  assert.deepEqual(dbg.resolveTrigger('click'), { kind: 'expression', name: '点一下' }, 'click 别名应落到能力归类里的表情');
+  assert.deepEqual(plain(dbg.resolveTrigger('expr:猫咪滤镜')), { kind: 'expression', name: '猫咪滤镜' });
+  assert.deepEqual(plain(dbg.resolveTrigger('motion:Idle')), { kind: 'motion', name: 'Idle' });
+  assert.deepEqual(plain(dbg.resolveTrigger('click')), { kind: 'expression', name: '点一下' }, 'click 别名应落到能力归类里的表情');
   assert.equal(dbg.resolveTrigger('expr:不存在的表情'), null, '模型没有的表情必须解析为 null');
   assert.equal(dbg.resolveTrigger('motion:NoSuchMotion'), null);
   assert.equal(dbg.resolveTrigger(''), null);

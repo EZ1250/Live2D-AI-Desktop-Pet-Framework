@@ -22,7 +22,15 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const ROOT = path.resolve(__dirname, '..');
-const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
+const { readSrcSources } = require('./helpers/rendererSandbox');
+/**
+ * 渲染层已从 renderer.ts 拆出多个全局脚本；这里的断言只关心"渲染层代码里有没有"，
+ * 所以虚拟路径 'src/renderer/renderer.ts' 统一读渲染层全部源码（顺序同 index.html）。
+ */
+const read = (rel) =>
+  rel === 'src/renderer/renderer.ts'
+    ? readSrcSources().join('\n')
+    : fs.readFileSync(path.join(ROOT, rel), 'utf8');
 
 /**
  * 从一段文本里取出**真正的** media-src 指令值。

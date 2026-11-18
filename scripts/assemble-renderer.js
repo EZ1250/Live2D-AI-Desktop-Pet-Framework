@@ -51,8 +51,9 @@ function main() {
     fs.cpSync(path.join(SRC, 'lib'), path.join(DST, 'lib'), { recursive: true });
     ok.push('lib/ (pixi/cubism/core)');
   }
-  // 3) tsc 产物（都是全局脚本：renderer 主逻辑 / Live2D 层 / 情感判定 / 声纹显示 / 视线控制器 / 内核 / 特效）
-  for (const f of ['renderer.js', 'live2d.js', 'emotion.js', 'voicelab.js', 'gazeController.js', 'ttsMouth.js', 'kernel.js', 'fx.js']) {
+  // 3) tsc 产物（都是全局脚本：renderer 主逻辑 / Live2D 层 / 情感判定 / 声纹显示 / 视线控制器 / 内核 / 特效
+  //    / 从 renderer.ts 拆出的三块：资产面板、语音输入、思考浮窗）
+  for (const f of ['renderer.js', 'live2d.js', 'emotion.js', 'voicelab.js', 'gazeController.js', 'ttsMouth.js', 'kernel.js', 'fx.js', 'settingsPanel.js', 'voiceInput.js', 'thinkingOverlay.js']) {
     if (copyFile(path.join(DIST, f), path.join(DST, f))) ok.push(f);
   }
   // 3.1) 渲染层模块目录（插件 plugins/ 与 UI 面板 panels/）：index.html 里都在 renderer.js 之前加载

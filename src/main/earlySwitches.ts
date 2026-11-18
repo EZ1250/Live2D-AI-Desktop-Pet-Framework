@@ -6,8 +6,8 @@
  * mainImpl.js 在其它 import 之前 require，能保证时序最早且幂等。
  *
  * 注意（实测结论，别被"必须加开关"的说法带偏）：
- *   - Electron 31 的 `webPreferences.autoplayPolicy` 默认就是 no-user-gesture-required，
- *     所以这个开关本身**不是**"试听无声"的根因；
+ *   - 升级前在 Electron 31 实测：`webPreferences.autoplayPolicy` 默认就是 no-user-gesture-required，
+ *     所以这个开关本身**不是**"试听无声"的根因（升级到 45 后不再重测该结论，开关继续保留作兜底）；
  *   - 真正的根因是 CSP：TTS 音频是 `data:audio/mpeg` 的 data URL，而页面 CSP 的
  *     media-src 只放了 'self' blob: —— 见 src/main/staticServer.ts 的 HTML_CSP 与
  *     src/renderer/index.html 的 meta CSP（两处都要允许 data:）。

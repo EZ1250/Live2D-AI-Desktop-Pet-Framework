@@ -2173,3 +2173,25 @@ body.is-think-window .think-plan {
   padding: 6px 12px;
 }
 body.is-think-window .think-line { margin-bottom: 6px; }
+
+/* ---------- 更新检测（设置页折叠区「⭐ 您的 Star…」里的最后一块） ---------- */
+/* 与上面的 Star/Issue 按钮用细线隔开，避免"更新"看起来像第三个外链按钮 */
+#settings-update {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.14);
+}
+/* 当前版本号加重一点，和状态行区分开；状态行复用 .settings-status 的常规样式 */
+#settings-update b {
+  color: #fff;
+  font-weight: 600;
+}
+#settings-update .settings-inline {
+  gap: 10px;
+}
+#settings-update .settings-status {
+  flex: 1 1 auto;
+}
+#settings-update #update-status-text.is-error {
+  color: #ff9b9b;
+}

@@ -11,9 +11,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Electron 45 的 engines 要求 node >= 22.12.0（旧的 node 20 装不上）
+          node-version: 24
           cache: npm
       - run: npm ci
       - run: npm run check
       # 隐私闸门：防止本机配置/密钥被打进 dist/public/local-assets（CI 上无本机 Key，仅校验文件清单）
       - run: npm run check:privacy --all
+      # 依赖漏洞可见性：默认 npmmirror 镜像不提供 npm security 端点，这里显式用公共 registry。
+      # 不阻断：active-win 的构建链（node-pre-gyp/node-gyp/tar）漏洞只在安装期使用，
+      # 修复它需要跨大版本升级该依赖，属独立任务（见 docs/PROJECT_LAYOUT.md 的依赖审计说明）。
+      - name: Dependency audit (informational)
+        continue-on-error: true
+        run: npm audit --omit=dev --registry=https://registry.npmjs.org

@@ -130,6 +130,33 @@ asar 内 `renderer/index.html` → asar 内 `public/renderer/index.html` → `di
 - 绑定按模型分桶（`motionTriggersByModel` / `motionTriggerExpressionsByModel`），
   旧版全局字段只作回退；目标在当前模型上不存在时插件只 warn 一次、绝不硬播。
 
+## 更新检测（GitHub Release）
+
+- 启动后**异步检查一次** GitHub 最新 Release（`src/main/updateCheck.ts`）：先请求
+  `api.github.com/repos/EZ1250/Live2D-AI-Desktop-Pet-Framework/releases/latest`（带 `User-Agent`、
+  8s 超时；API 不可用时兜底 `github.com/.../releases/latest` 的 302 地址解析 tag），
+  与 `app.getVersion()` 做 semver 比较（去 `v` 前缀、预发布视为小于正式版、忽略 `+build`）。
+- 三种通道（契约常量在 `contracts.ts`）：
+  - `IPC_UPDATE_STATUS_GET`（`update:status:get`，invoke）→ `UpdateSnapshot`：**不联网**，
+    返回主进程缓存的最近一次检查结果（启动检查可能先于渲染层订阅完成，渲染层启动时靠它补拉）。
+  - `IPC_UPDATE_CHECK`（`update:check`，invoke）→ `UpdateSnapshot`：手动检查，**会联网**，
+    忽略"启动时自动检查"开关。
+  - `IPC_UPDATE_STATUS`（`update:status`，main→renderer 推送）→ `UpdateSnapshot`：每次检查完成后推送。
+- `UpdateState` 是判别联合：`idle` / `checking` / `no-update`（带 `checkedAt`、`source`）/
+  `update-available`（带 `ReleaseInfo`：`version`、`tagName`、`name`、`htmlUrl`、`publishedAt`、`body`）/
+  `error`（`reason`：`offline`/`timeout`/`rate-limited`/`http-error`/`parse-error`/`unknown`）/
+  `disabled`（设置里关掉了启动检查）。
+- 关闭/失败策略：离线、超时、GitHub 限流、HTTP 错误、解析失败、版本号非法 → **静默**，不弹窗、
+  不重试风暴，只在设置页「🔄 更新」区显示原因；用户点「立即检查」才再次联网。
+- 跳转：只信任 `https://github.com/EZ1250/Live2D-AI-Desktop-Pet-Framework/releases/` 前缀的链接
+  （主进程 `isTrustedReleaseUrl` + 渲染层 `isTrustedGithubReleaseUrl` 双重校验），
+  通过 `IPC_OPEN_EXTERNAL` 用系统浏览器打开（该通道只放行 http/https）。**不下载、不安装**。
+- 入口：**只有设置页一个入口**——「设置 → ⭐ 您的 Star 就是我更新的动力（展开）」里的更新区
+  （当前版本、检查状态、上次检查时间、「启动时自动检查更新」开关、立即检查、发现新版本时的「前往下载」）。
+  不弹窗、不占托盘菜单、不加右键菜单项；原「📦 拿最新版」按钮由更新区替代。
+- 设置项：`AppSettings.checkForUpdates`（默认 `true`；`false` 时启动不自动检查，手动检查仍可用）。
+- 调试：`PET_UPDATE_FAKE_LATEST=<版本>` 可伪造远端版本（仅开发态肉眼验证"有更新"UI，不参与打包逻辑）。
+
 ## 第三方资源授权
 
 模型、角色资料、Live2D 运行库等第三方资源的授权**不由 MIT 覆盖**；发布前须逐项核验来源、

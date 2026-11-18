@@ -15,7 +15,8 @@
  *   - **不做自动重连**（用户明确要求）：断了就是断了，由调用方决定要不要再 connect()。
  *   - 不把 token 打进日志。
  *
- * WebSocket 实现：优先用 `ws`（Electron 31 的主进程是 Node 20，没有全局 WebSocket），
+ * WebSocket 实现：优先用 `ws`（升级前 Electron 31 的主进程是 Node 20、没有全局 WebSocket；
+ * 当前 Electron 45 的 Node 24 虽已内置，仍以 `ws` 为主以保证单一实现），
  * 拿不到再退回运行时自带的 global WebSocket（Node 22+ / 浏览器）。
  */
 import { randomUUID } from 'node:crypto';

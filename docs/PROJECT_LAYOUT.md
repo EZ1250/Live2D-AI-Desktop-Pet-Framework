@@ -51,6 +51,9 @@ src/
 │   ├── ttsMouth.ts           TTS 本地口型节拍器（全局脚本 window.PetTtsMouth：90~120ms 打拍/停止归零）
 │   ├── kernel.ts             渲染层微内核（全局脚本 window.PetKernel：事件总线 + 服务表 + 插件宿主）
 │   ├── fx.ts                 点击星星特效（全局脚本 window.PetFx）
+│   ├── settingsPanel.ts    可插拔资产面板（模型/插件导入 + 校验报告；从 renderer.ts 拆出，只声明不执行）
+│   ├── voiceInput.ts         语音输入状态机（按住说话 → ASR → 填入输入框；从 renderer.ts 拆出）
+│   ├── thinkingOverlay.ts    思考过程浮窗（推理内容 + 工具步骤；从 renderer.ts 拆出）
 │   ├── plugins/              内置策略插件（emotion 情绪判定 / behavior 行为触发）
 │   ├── panels/               UI 面板（todo 待办 / askBox 提问确认，install(deps) 注入依赖）
 │   └── lib/                  第三方运行库（pixi / Cubism Core / Live2D 引擎）——不要手改
@@ -346,7 +349,7 @@ API Key 丢了 / 设置改了不生效"——两套配置各改各的，排查�
 
 1. **必须全局阻止 `dragover`/`drop` 的默认行为**。否则把文件拖进窗口时 Chromium 会导航去打开
    那个文件——桌宠窗口直接变成文件预览页，看起来就是"白屏坏了"。
-2. **Electron 31+ 渲染层拿不到 `File.path`**。唯一受支持的方式是 preload 里的
+2. **Electron 31+ 渲染层拿不到 `File.path`**（当前 Electron 45 同样如此）。唯一受支持的方式是 preload 里的
    `webUtils.getPathForFile(file)`（`window.electron.pathForFile`），所以新增了
    `IPC_ASSET_IMPORT_PATH`（`assets:importPath`）这条"直接给路径"的通道；
    它与 `IPC_ASSET_IMPORT` 的区别只是不经系统文件夹选择器。
@@ -852,6 +855,7 @@ node scripts/check-model.js "<模型文件夹>"   # 模型能不能渲染
 npm run build:all                            # 类型 + 装配
 npm test                                     # 类型 + 装配 + 单测（IPC 契约 / 声纹 / 语音状态机 / 取景落位 / 转写模型 / 行为触发）
 npm run check:privacy --all                  # 打包前后密钥/隐私闸门
+npm run audit:prod                           # 生产依赖漏洞（显式走公共 registry，见 §8.1）
 ```
 
 > `npm test` 里带着 `assemble`：`public/renderer/**` 是打包真正吃进去的那份渲染层，
@@ -859,6 +863,26 @@ npm run check:privacy --all                  # 打包前后密钥/隐私闸门
 > 所以测试入口顺手把它刷新，别把它挪出去。
 
 项目内置校验范围见上面的命令；窗口交互、渲染和权限提示仍需在 Windows 目标环境中手动确认。
+
+## 8.1 依赖、版本与审计（升级 Electron 前先读）
+
+- **工具链版本**：Node **>= 22.12**（`package.json` 的 `engines`；Electron 45 npm 包本身也要求它）、
+  Electron **45.3.4**（内置 Node 24.22 / Chromium 156）、electron-builder **26.x**、
+  `@types/node` **24.x**（必须与 Electron 内置 Node 主版本对齐，否则 `electron.d.ts` 与 Node 类型打架）。
+- **升级 Electron 的检查单**：
+  1. `npm install --save-dev --save-exact electron@<版本>`；若 `engines.node` 变化，**同步改
+     `.github/workflows/ci.yml` 的 `node-version`**（CI 用 node 20 时装不上 Electron 45）。
+  2. Electron 45 的 npm 包不再声明 `postinstall`，安装完不会自动下载二进制；
+     `npm start` 的 `prestart` 会跑 `scripts/install-electron.js` 兜底（幂等，已安装则跳过）。
+  3. `src/main/mainImpl.js` / `devDebug.js` 是 JavaScript、不参与 `tsc` 检查——升级后
+     **必须实机启动 + 打包后启动**双端冒烟，别只看 `npm test` 绿。
+  4. 打包后由 `scripts/after-pack.js` 翻 fuses：关 `ELECTRON_RUN_AS_NODE` / `--inspect` /
+     `NODE_OPTIONS`，并强制只从 `app.asar` 加载应用代码。改 fuses 后要重新打包验证能启动。
+- **依赖审计**：本机 registry 是 npmmirror，它的 `/-/npm/v1/security/*` 端点不可用（`[NOT_IMPLEMENTED]`），
+  所以 `npm audit` 必须显式带 `--registry=https://registry.npmjs.org`（`npm run audit:prod` 已封装）。
+  CI 里的这条是 **informational（不阻断）**：目前残留告警来自 `active-win` 的安装期构建链
+  （`node-pre-gyp` / `node-gyp` / `tar`），不是运行时依赖；修复需要跨大版本升级 `active-win`，
+  属独立任务。`.github/dependabot.yml` 每周检查 npm、每月检查 Gradle 与 Actions。
 
 ## 9. 已知未做 / 待实机确认
 

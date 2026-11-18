@@ -169,7 +169,19 @@
         <div class="settings-inline">
           <button type="button" class="settings-external-link" data-url="https://github.com/EZ1250/Live2D-AI-Desktop-Pet-Framework">⭐ 点个 Star</button>
           <button type="button" class="settings-external-link" data-url="https://github.com/EZ1250/Live2D-AI-Desktop-Pet-Framework/issues/new">💬 提个 Issue</button>
-          <button type="button" class="settings-external-link" data-url="https://github.com/EZ1250/Live2D-AI-Desktop-Pet-Framework/releases/latest">📦 拿最新版</button>
+        </div>
+        <div class="settings-update" id="settings-update">
+          <div class="settings-inline">
+            <span>当前版本 <b id="settings-current-version">—</b></span>
+            <label class="settings-checkbox" title="默认开启：启动后异步检查 GitHub 是否有新版本（失败/离线不弹窗、不影响其它功能）">
+              <input id="setting-check-for-updates" name="checkForUpdates" type="checkbox" checked /> 启动时自动检查更新
+            </label>
+          </div>
+          <div class="settings-inline">
+            <button id="btn-check-update" type="button">立即检查</button>
+            <button id="btn-open-release" type="button" hidden>前往下载</button>
+          </div>
+          <p id="update-status-text" class="settings-status" role="status">尚未检查</p>
         </div>
       </details>
       <label>桌宠名字<input id="setting-pet-name" name="petName" type="text" maxlength="24" placeholder="给它起个名字（留空=模型名）" autocomplete="off" spellcheck="false" /></label>
@@ -446,6 +458,11 @@
   <script src="./plugins/behavior.js"></script>
   <!-- ③ 渲染辅助层：moc3/portrait/placeholder 挂载（全局脚本，暴露 window.PetLive2d） -->
   <script src="./live2d.js"></script>
+  <!-- 从 renderer.js 拆出的三块声明区（全局脚本，只声明不执行；先于 renderer.js 加载即可）：
+       可插拔资产面板 / 语音输入状态机 / 思考过程浮窗 -->
+  <script src="./settingsPanel.js"></script>
+  <script src="./voiceInput.js"></script>
+  <script src="./thinkingOverlay.js"></script>
   <!-- ④ 渲染入口 -->
   <script src="./renderer.js"></script>
 </body>

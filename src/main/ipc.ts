@@ -58,6 +58,9 @@ import {
   IPC_TODO_TOGGLE,
   IPC_TTS_SPEAK,
   IPC_TTS_VOICES,
+  IPC_UPDATE_CHECK,
+  IPC_UPDATE_STATUS,
+  IPC_UPDATE_STATUS_GET,
   IPC_VOICE_CHECK,
   IPC_VOICE_MODELS,
   IPC_VOICE_STATUS,
@@ -67,7 +70,7 @@ import {
   IPC_VTS_TRACKING,
 } from '../shared/contracts';
 import type { PetEventType } from '../shared/contracts';
-import type { AiModelListResult, AppSettings, AssetImportResult, AssetKind, AssetPresetResult, AssetScanResult, ChatLogEntry, AutoTaskRound, ChatLogSnapshot, ChatWindowResult, ModelManifest, PluginManifest, TtsVoiceListResult, VoiceCheckResult, VoiceModelIndexResult, VoiceStatusResult, VoiceTranscribeRequest, VoiceTranscribeResult, VtsActionName, VtsActionResult, VtsStatusDto } from '../shared/contracts';
+import type { AiModelListResult, AppSettings, AssetImportResult, AssetKind, AssetPresetResult, AssetScanResult, ChatLogEntry, AutoTaskRound, ChatLogSnapshot, ChatWindowResult, ModelManifest, PluginManifest, TtsVoiceListResult, UpdateSnapshot, VoiceCheckResult, VoiceModelIndexResult, VoiceStatusResult, VoiceTranscribeRequest, VoiceTranscribeResult, VtsActionName, VtsActionResult, VtsStatusDto } from '../shared/contracts';
 import type { PathResolver } from './PathResolver';
 import { fetchAvailableModels, loadAppSettings, saveAppSettings, TOOL_DEFS } from './ai/chatClient';
 import { checkVoiceRoutes, indexVoiceModels, knownRoute, normalizeVoiceConfig, toBytes, transcribeAudio } from './ai/voice';
@@ -152,6 +155,10 @@ export interface IpcDeps {
   onSettingsSaved?: (settings: AppSettings) => void;
   /** 设置面板展开/收起（主进程据此调整窗口层级） */
   onSettingsPanelOpen?: (open: boolean) => void;
+  /** 更新检测：读取当前状态快照（不联网；启动检查结果会缓存，供 renderer 启动/设置页拉取） */
+  getUpdateStatus?: () => UpdateSnapshot;
+  /** 更新检测：手动触发一次检查（会联网；未注入时 handler 返回"主进程未接入"） */
+  checkForUpdates?: () => Promise<UpdateSnapshot>;
   /**
    * VTS 状态快照（可选后端）。未接 VTS 时返回 null —— 设置页据此显示"当前版本不可用"，
    * 所以老版本 main 不实现也安全。
@@ -456,6 +463,25 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
       }
     }
   );
+
+  // ---- IPC_UPDATE_STATUS_GET / IPC_UPDATE_CHECK：更新检测 ---------------------
+  // 只做检测与展示；真正跳转走 IPC_OPEN_EXTERNAL（已限制 http/https）。
+  ipcMain.handle(IPC_UPDATE_STATUS_GET, (): UpdateSnapshot => {
+    const snapshot = deps.getUpdateStatus?.();
+    if (snapshot) return snapshot;
+    return { currentVersion: app.getVersion(), state: { kind: 'idle' } };
+  });
+  ipcMain.handle(IPC_UPDATE_CHECK, async (): Promise<UpdateSnapshot> => {
+    const currentVersion = app.getVersion();
+    if (!deps.checkForUpdates) {
+      return { currentVersion, state: { kind: 'error', reason: 'unknown', detail: '主进程未接入更新检测' } };
+    }
+    try {
+      return await deps.checkForUpdates();
+    } catch (err) {
+      return { currentVersion, state: { kind: 'error', reason: 'unknown', detail: (err as Error).message ?? String(err) } };
+    }
+  });
 
   // ---- IPC_SEND_MESSAGE -----------------------------------------------------
   ipcMain.handle(IPC_SEND_MESSAGE, (event, text: unknown): { ok: boolean; error?: string } => {
@@ -1217,6 +1243,11 @@ function sanitizeSettings(raw: unknown): AppSettings | null {
   if (input.clickThrough !== undefined) {
     if (typeof input.clickThrough !== 'boolean') return null;
     settings.clickThrough = input.clickThrough;
+  }
+  // 启动时检查更新（布尔；默认 true）
+  if (input.checkForUpdates !== undefined) {
+    if (typeof input.checkForUpdates !== 'boolean') return null;
+    settings.checkForUpdates = input.checkForUpdates;
   }
   // 语音识别：模型 / 路由 / 单独网关（都与聊天配置解耦，留空则复用聊天配置）
   if (input.voiceModel !== undefined) {

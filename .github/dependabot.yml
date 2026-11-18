@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # 依赖漏洞可见性：npm 侧每周检查（与 CI 的 informational audit 互补）
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      dev-dependencies:
+        dependency-type: development
+        update-types:
+          - minor
+          - patch
+
+  # Android 子项目（Kotlin/Compose）每月检查
+  - package-ecosystem: gradle
+    directory: /android-mcp-client
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+
+  # GitHub Actions 版本也顺带跟一下
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

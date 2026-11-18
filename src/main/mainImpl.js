@@ -67,6 +67,7 @@ const fs = __importStar(require("fs"));
 const os = __importStar(require("os"));
 const path = __importStar(require("path"));
 const contracts_1 = require("../shared/contracts");
+const updateCheck_1 = require("./updateCheck");
 const PathResolver_1 = require("./PathResolver");
 const staticServer_1 = require("./staticServer");
 const chatClient_1 = require("./ai/chatClient");
@@ -2406,6 +2407,15 @@ async function bootstrap() {
             settingsPanelOpen = open === true;
             restackOwnWindows();
         },
+        // 更新检测：读取快照（不联网）/ 手动检查（联网）。状态由 main 启动检查推送。
+        getUpdateStatus: () => ({
+            currentVersion: electron_1.app.getVersion(),
+            state: updateCheck_1.getCurrentUpdateSnapshot().state,
+        }),
+        checkForUpdates: async () => {
+            const state = await updateCheck_1.triggerManualUpdateCheck();
+            return { currentVersion: electron_1.app.getVersion(), state };
+        },
         mcpReload: async () => {
             await mcpClient?.reload();
             await petMcpServer?.reload();
@@ -2445,6 +2455,10 @@ async function bootstrap() {
             }
             void petMcpServer?.reload();
             applyVtsSettings(next); // VTS 开关/端口改了就重连（关掉就停）
+            // 用户关掉"启动时检查更新"：状态置 disabled 并推给设置页（设置页是更新提示的唯一入口）
+            if (next.checkForUpdates === false) {
+                sendToRenderer(contracts_1.IPC_UPDATE_STATUS, updateCheck_1.markUpdateCheckDisabled());
+            }
         },
     });
     sendToRenderer = bridge.pushToRenderer;
@@ -3064,6 +3078,18 @@ async function bootstrap() {
     createTray(resolver); // 托盘：桌宠不占任务栏，托盘是唯一的"找回/退出"入口
     registerGlobalShortcuts(resolver); // 全局快捷键：托盘也点不到时的兜底召回方式
     console.log(`[main][boot] 窗口已创建 +${Date.now() - bootT0}ms（renderer 开始加载）`);
+    // 更新检测：启动后异步检查一次（不阻塞启动；关闭开关时只标记 disabled，不联网）
+    // 提示入口只在"设置 → 更新"里（不弹窗、不占托盘/右键菜单）。
+    updateCheck_1.registerUpdateHost({
+        getVersion: () => electron_1.app.getVersion(),
+        isEnabled: () => (0, chatClient_1.loadAppSettings)().checkForUpdates !== false,
+        isOnline: () => electron_1.net.isOnline(),
+        allowDebugOverride: !electron_1.app.isPackaged,
+        onStatus: (snapshot) => {
+            sendToRenderer(contracts_1.IPC_UPDATE_STATUS, snapshot);
+        },
+    });
+    updateCheck_1.startAutoUpdateCheck();
     // 9. 启动轮询 + 插件 + 默认模型日志
     await monitor.start();
     await registry?.start?.(); // 启动所有已注册插件（无插件注册时为空转）
@@ -3194,7 +3220,7 @@ function createTray(resolver) {
             const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
             const visible = Boolean(win && win.isVisible());
             const framing = (0, chatClient_1.loadAppSettings)().displayMode === 'half' ? 'half' : 'full';
-            tray.setContextMenu(electron_1.Menu.buildFromTemplate([
+            const template = [
                 {
                     label: visible ? '隐藏桌宠' : '显示桌宠',
                     click: () => {
@@ -3274,7 +3300,8 @@ function createTray(resolver) {
                     label: `${label}（${accel.replace('CommandOrControl', 'Ctrl')}）`,
                     enabled: false,
                 })),
-            ]));
+            ];
+            tray.setContextMenu(electron_1.Menu.buildFromTemplate(template));
         };
         rebuild();
         // 双击托盘 = 显示/隐藏（Windows 习惯）
