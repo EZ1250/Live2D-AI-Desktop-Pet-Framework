@@ -10,6 +10,7 @@ import { tool_web_fetch } from './web';
 import { tool_weather_get } from './web';
 import { tool_media_control } from './media';
 import { tool_screen_capture } from './media';
+import { tool_send_to_user } from './media';
 import { tool_meeting_create } from './schedule';
 import { tool_translate_text } from './web';
 import { tool_mail_compose } from './mail';
@@ -57,6 +58,7 @@ export const TOOL_DEFS: ToolDef[] = [
   tool_weather_get,
   tool_media_control,
   tool_screen_capture,
+  tool_send_to_user,
   tool_meeting_create,
   tool_translate_text,
   tool_mail_compose,

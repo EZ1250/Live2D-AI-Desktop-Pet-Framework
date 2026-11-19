@@ -30,6 +30,15 @@ import * as http from 'http';
 import * as https from 'https';
 import * as path from 'path';
 import { app } from 'electron';
+import { DshBridge, formatDshError } from './dshBridge';
+import {
+  checkMediaCompatibility,
+  DSH_MEDIA_OUT_INSTRUCTION,
+  mediaPayloadForFile,
+  parseMediaMarkers,
+  prepareAttachmentsForApi,
+  prepareAttachmentsForDsh,
+} from './mediaAttachments';
 import { loadMemoryText } from './memory';
 import { MEDIA_ACTIONS } from './mediaTools';
 import {
@@ -40,7 +49,7 @@ import {
   type PromptPhase,
 } from './promptLayers';
 import type { ScenarioContext } from './scenario';
-import type { AppSettings } from '../../shared/contracts';
+import type { AppSettings, AttachmentRef, DshStatus } from '../../shared/contracts';
 
 export interface ChatUsage {
   prompt_tokens?: number;
@@ -55,6 +64,8 @@ export interface ChatHandlers {
   onError(message: string): void;
   /** 思考过程事件（推理内容 / 工具步骤 / 完成）：供"思考浮窗"实时展示 */
   onThink?(evt: { kind: 'start' | 'reasoning' | 'tool' | 'result' | 'done' | 'error'; text: string; tool?: string }): void;
+  /** AI 回发给用户的媒体卡片（图片/音频/文件；main 转发 IPC_CHAT_MEDIA 给渲染层） */
+  onMedia?(payload: import('../../shared/contracts').ChatMediaPayload): void;
 }
 
 /** 消息（支持 function-calling 的 tool_calls / tool 消息字段） */
@@ -325,6 +336,23 @@ export function loadAppSettings(): AppSettings {
         const p = num(8001, 'vtsPort');
         return Number.isInteger(p) && p >= 1 && p <= 65535 ? p : 8001;
       })(),
+      // AI 接入方式（二选一）：默认 api；选 dsh 时聊天走 DSH 桥接（只转对话，不传工具）。
+      // 必须在这里读回来，否则"设置里选了 DSH、重启又走 API"。
+      aiMode: ((): 'api' | 'dsh' => (str('aiMode') === 'dsh' ? 'dsh' : 'api'))(),
+      // 视觉模型（API 模式下图片转述用；留空=自动兜底 qwen3-vl-plus）
+      visionModel: (str('visionModel') ?? '').trim().slice(0, 120),
+      visionRoute: ((): 'auto' | 'chat' | 'custom' => {
+        const route = str('visionRoute');
+        return route === 'chat' || route === 'custom' ? route : 'auto';
+      })(),
+      visionBaseUrl: (str('visionBaseUrl') ?? '').trim().slice(0, 500),
+      visionApiKey: (str('visionApiKey') ?? '').trim().slice(0, 500),
+      // Live2D 纹理精度（最长边像素；0=原始，默认 4096：4096 以下保持原图，只对更大图集降采样）
+      textureMaxSize: ((): number => {
+        const n = num(4096, 'textureMaxSize');
+        if (!Number.isFinite(n) || n <= 0) return 0;
+        return Math.max(256, Math.min(8192, Math.round(n)));
+      })(),
     };
   } catch (err) {
     console.warn('[chatClient] settings.json 解析失败，回退环境变量：', (err as Error).message);
@@ -411,10 +439,12 @@ export function friendlyAiError(rawMessage: string, model: string): string {
  * 拉取服务端可用模型列表（GET {baseUrl}/models）。
  * 设置页用它做下拉候选，避免手打不存在的模型名——服务端只会回 "Model not exist."，用户完全看不出该怎么办。
  */
-export async function fetchAvailableModels(): Promise<{ ok: boolean; models: string[]; error?: string }> {
+export async function fetchAvailableModels(purpose: 'chat' | 'vision' = 'chat'): Promise<{ ok: boolean; models: string[]; error?: string }> {
   const cfg = loadAppSettings();
-  const base = (cfg.aiBaseUrl ?? process.env.AI_BASE_URL ?? '').trim().replace(/\/+$/, '');
-  const key = (cfg.aiApiKey ?? process.env.AI_API_KEY ?? '').trim();
+  const dedicatedBase = purpose === 'vision' ? (cfg.visionBaseUrl ?? '').trim() : '';
+  const dedicatedKey = purpose === 'vision' ? (cfg.visionApiKey ?? '').trim() : '';
+  const base = (dedicatedBase || cfg.aiBaseUrl || process.env.AI_BASE_URL || '').trim().replace(/\/+$/, '');
+  const key = (dedicatedKey || cfg.aiApiKey || process.env.AI_API_KEY || '').trim();
   if (!base) return { ok: false, models: [], error: '尚未配置 API 地址' };
   let url = base;
   if (!/\/models$/.test(url)) url += '/models';
@@ -511,6 +541,8 @@ function textSimilarity(a: string, b: string): number {
 
 export class ChatClient {
   private cfg: ResolvedConfig;
+  /** 最近一次设置的完整快照（附件兼容性检查/ASR/视觉模型要用 voiceBaseUrl、visionModel 等字段） */
+  private appSettings: AppSettings = {};
   /** 持久上下文：[system?, user, assistant, …]（system 按需重建） */
   private messages: ChatMessage[] = [];
   private active: ActiveRequest | null = null;
@@ -537,6 +569,10 @@ export class ChatClient {
   private scenario: ScenarioContext | null = null;
   /** 外部工具定义（MCP 等；main 注入，默认空 → 行为与原来一致） */
   private externalToolDefs: Array<{ type: string; function: Record<string, unknown> }> = [];
+  /** AI 接入方式：api=直连 OpenAI 兼容 API（默认）；dsh=桥接本机 DSH（只转对话文本） */
+  private aiMode: 'api' | 'dsh' = 'api';
+  /** DSH 桥接实例（按需创建；aiMode!=='dsh' 时不会 spawn 任何进程） */
+  private dsh: DshBridge | null = null;
 
   /** 更新开发工作区根目录（设置变化时由 main/ipc 调用） */
   setWorkspaceRoot(root: string): void {
@@ -619,6 +655,53 @@ export class ChatClient {
       maxContextTokens: settings.maxContextTokens ?? 4000,
       showThinking: settings.showThinking !== false,
     };
+    this.aiMode = settings.aiMode === 'dsh' ? 'dsh' : 'api';
+    this.appSettings = settings;
+  }
+
+  /** 当前 AI 接入方式（调试/测试用）。 */
+  getAiMode(): 'api' | 'dsh' {
+    return this.aiMode;
+  }
+
+  /** 懒创建 DSH 桥接：桥接目录固定在 <userData>/dsh-bridge（测试可用 PET_DSH_BRIDGE_DIR 覆盖）。 */
+  private dshBridge(): DshBridge {
+    if (!this.dsh) {
+      // PET_* 调试钩子只在开发态/显式测试开关下生效（打包版默认忽略，避免本机环境变量改命令/目录）
+      const allowDebugHooks = !app.isPackaged || process.env.PET_ALLOW_DEBUG_HOOKS === '1';
+      const env: NodeJS.ProcessEnv = { ...process.env };
+      if (!allowDebugHooks) {
+        for (const key of ['PET_DSH_CMD', 'PET_DSH_TIMEOUT_MS', 'PET_DSH_BRIDGE_DIR']) delete env[key];
+      }
+      const override = allowDebugHooks ? (process.env.PET_DSH_BRIDGE_DIR ?? '').trim() : '';
+      const bridgeDir = override || path.join(app.getPath('userData'), 'dsh-bridge');
+      this.dsh = new DshBridge({
+        bridgeDir,
+        env,
+        sessionFile: path.join(app.getPath('userData'), 'dsh-session.json'),
+      });
+    }
+    return this.dsh;
+  }
+
+  /** DSH 桥接目录（main 的媒体回发白名单需要 outbox 路径）。 */
+  dshBridgeDir(): string {
+    return this.dshBridge().dir;
+  }
+
+  /** 读取 DSH 桥接状态（设置页用；不发起对话）。 */
+  dshStatus(): Promise<DshStatus> {
+    return this.dshBridge().status();
+  }
+
+  /** 重置 DSH 会话（设置页按钮 / 新对话）。 */
+  resetDshSession(): void {
+    this.dsh?.resetSession();
+  }
+
+  /** 发送前附件兼容性检查（会探测 /models 判断视觉模型是否可用；由 IPC_MEDIA_CHECK 调用）。 */
+  checkMedia(attachments: AttachmentRef[]): Promise<import('../../shared/contracts').MediaCheckResult> {
+    return checkMediaCompatibility(this.appSettings, attachments);
   }
 
   /** 临时替换事件回调（手机对话复用同一 chat 实例时用；调用方负责恢复） */
@@ -651,6 +734,8 @@ export class ChatClient {
       maxContextTokens: settings.maxContextTokens ?? 4000,
       showThinking: settings.showThinking !== false,
     };
+    this.aiMode = settings.aiMode === 'dsh' ? 'dsh' : 'api';
+    this.appSettings = settings;
   }
 
   /** 切换当前宠物模型：决定人设语料注入；换宠时取消旧请求并清空旧上下文。 */
@@ -695,6 +780,7 @@ export class ChatClient {
   resetContext(): void {
     this.cancel();
     this.messages = [];
+    this.dsh?.resetSession(); // 同时重置 DSH 会话（下一条消息新开）
   }
 
   /** 用量统计摘要（/usage） */
@@ -729,16 +815,74 @@ export class ChatClient {
   /**
    * 发起一轮对话（SSE 流式）。
    * - 若上一轮仍在流式：先 cancel()。
-   * - 校验长度 > 0；未配置 apiKey 时：本地 OpenAI 兼容服务（127.0.0.1/localhost）放行无 key。
+   * - 附件（图片/音频/文件）先做兼容性转换：图片→视觉模型转述、音频→ASR、文本→内联、其它→路径。
    * - 返回的 Promise 在"请求已发出"时即 resolve；文本走 handlers 回调，出错也走 onError（不 reject）。
    */
-  async startChat(text: string): Promise<void> {
+  async startChat(text: string, attachments?: AttachmentRef[]): Promise<void> {
     this.cancel();
     this.busy = true;
     try {
-      await this.startChatInner(text);
+      if (this.aiMode === 'dsh') {
+        // 桥接 DSH：图片复制进 bridge/inbox 让它用 read_image 看；音频 ASR；文件给路径。
+        const prep = attachments?.length
+          ? await prepareAttachmentsForDsh(this.appSettings, this.dshBridge().dir, attachments)
+          : { promptText: '' };
+        if (prep.blockedError) {
+          this.handlers.onError(prep.blockedError);
+          return;
+        }
+        try {
+          fs.mkdirSync(path.join(this.dshBridge().dir, 'outbox'), { recursive: true });
+        } catch {
+          /* 建不出来时 DSH 自己 mkdir 也会失败，给后续错误 */
+        }
+        const promptText = [text, prep.promptText, DSH_MEDIA_OUT_INSTRUCTION].filter(Boolean).join('\n\n');
+        const reply = await this.dshBridge().chat(promptText);
+        // DSH 回发媒体：解析 [[send:相对路径]]（只允许 bridge 目录内），复制到 chat-media 并推送卡片。
+        const parsed = parseMediaMarkers(reply, path.join(this.dshBridge().dir, 'outbox'));
+        let delivered = 0;
+        for (const file of parsed.files) {
+          const payload = mediaPayloadForFile(file.path, file.caption);
+          if (!payload) continue;
+          const persisted = this.persistMediaCopy(file.path);
+          this.handlers.onMedia?.({ ...payload, path: persisted || payload.path });
+          delivered++;
+        }
+        const clean = parsed.text || (delivered ? '（已把文件发给你）' : '');
+        this.handlers.onDone(clean);
+        return;
+      }
+      // API 模式：图片/音频先转换（不依赖当前聊天模型是否多模态）。
+      const prep = attachments?.length
+        ? await prepareAttachmentsForApi(this.appSettings, attachments)
+        : { promptText: '' };
+      if (prep.blockedError) {
+        this.handlers.onError(prep.blockedError);
+        return;
+      }
+      const userText = [text, prep.promptText].filter(Boolean).join('\n\n');
+      await this.startChatInner(userText || text);
+    } catch (err) {
+      if (this.aiMode === 'dsh') {
+        this.handlers.onError(formatDshError(err));
+        return;
+      }
+      throw err;
     } finally {
       this.busy = false;
+    }
+  }
+
+  /** AI 回发的媒体文件复制到 <userData>/chat-media（历史记录可再次打开；不存 base64）。 */
+  private persistMediaCopy(src: string): string | null {
+    try {
+      const dir = path.join(app.getPath('userData'), 'chat-media');
+      fs.mkdirSync(dir, { recursive: true });
+      const dest = path.join(dir, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${path.basename(src)}`);
+      fs.copyFileSync(src, dest);
+      return dest;
+    } catch {
+      return null;
     }
   }
 
@@ -1451,6 +1595,7 @@ export class ChatClient {
 
   /** 静默取消当前流式请求（不发 onDone/onError；新消息、退出时调用） */
   cancel(): void {
+    this.dsh?.cancel(); // DSH 桥接的当前子进程/排队也要停
     this.cancelled = true;
     this.chatGeneration++;
     const act = this.active;

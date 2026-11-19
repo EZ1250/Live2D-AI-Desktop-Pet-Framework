@@ -824,6 +824,9 @@ let vtsTrackingBridge: RendererBridge | null = null;
  * 这里用独立 setInterval：启用 VTS 就固定 33ms 发一帧（值可以是全 0，静止时也发）。
  */
 let vtsPushTimer: number | null = null;
+/** VTS 是否真的连着（未连接时不发追踪帧，省 CPU/IPC） */
+let vtsConnected = false;
+let vtsProbeTimer: number | null = null;
 /** 自查计数：已发出的帧数 / 最后一帧 / 最后发送时刻 / 发送异常（__petDebug.vts() 用） */
 let vtsSentCount = 0;
 let vtsLastSent: VtsTrackingValues | null = null;
@@ -833,8 +836,37 @@ let vtsLastSendError = '';
 /** 打开/关闭 VTS 追踪推送（设置里勾「启用 VTS」并保存后生效；启动时按设置应用一次） */
 function setVtsTrackingEnabled(on: boolean): void {
   vtsTrackingEnabled = on === true;
-  if (vtsTrackingEnabled) startVtsPushTimer();
-  else stopVtsPushTimer();
+  if (vtsTrackingEnabled) {
+    refreshVtsConnection();
+    if (vtsProbeTimer === null) {
+      vtsProbeTimer = window.setInterval(refreshVtsConnection, 5000) as unknown as number;
+    }
+    startVtsPushTimer();
+  } else {
+    stopVtsPushTimer();
+    if (vtsProbeTimer !== null) {
+      window.clearInterval(vtsProbeTimer);
+      vtsProbeTimer = null;
+    }
+    vtsConnected = false;
+  }
+}
+
+/**
+ * VTS 连接状态探测：**没连接/没授权就不发 30fps 追踪帧**（之前即使 VTS 没开也在发 IPC，
+ * 主进程只会丢弃；省掉 30 次/秒的序列化与进程间通信）。连接后 5s 内自动恢复推送。
+ */
+function refreshVtsConnection(): void {
+  const bridge = vtsTrackingBridge;
+  if (!bridge || typeof bridge.vtsStatus !== 'function') return;
+  void bridge
+    .vtsStatus()
+    .then((status) => {
+      vtsConnected = !!status && status.connected === true && status.authenticated === true;
+    })
+    .catch(() => {
+      vtsConnected = false;
+    });
 }
 
 function startVtsPushTimer(): void {
@@ -867,7 +899,7 @@ function gazeToVtsTracking(nx: number, ny: number): VtsTrackingValues {
  * 视线"静止过期"时发全 0 —— 与桌宠自己回正一致，也保证 VTS 侧不会一直歪着头。
  */
 function pushVtsTracking(): void {
-  if (!vtsTrackingEnabled) return;
+  if (!vtsTrackingEnabled || !vtsConnected) return; // 未连接：不发（5s 探测一次，连上自动恢复）
   const bridge = vtsTrackingBridge;
   if (!bridge || typeof bridge.sendVtsTracking !== 'function') return;
   const gaze = gazeApi()?.state();
@@ -888,6 +920,7 @@ function pushVtsTracking(): void {
 function vtsDebugState(): Any {
   return {
     enabled: vtsTrackingEnabled,
+    connected: vtsConnected,
     sentCount: vtsSentCount,
     lastSent: vtsLastSent,
     lastSentAt: vtsLastSentAt ? new Date(vtsLastSentAt).toISOString() : '',
@@ -1665,7 +1698,14 @@ function chatScrollToEnd(): void {
 function appendChatLog(
   role: 'user' | 'pet' | 'tool' | 'error',
   text: string,
-  opts?: { persist?: boolean; at?: number },
+  opts?: {
+    persist?: boolean;
+    at?: number;
+    /** 历史记录里的媒体元数据（渲染成文件卡片） */
+    media?: Array<import('../shared/contracts').ChatMediaMeta>;
+    /** 实时媒体（图片/音频带 dataUrl，可直接显示/播放） */
+    live?: Array<import('../shared/contracts').ChatMediaPayload>;
+  },
 ): HTMLElement | null {
   if (!chatLogEl) return null;
   const row = document.createElement('div');
@@ -1681,6 +1721,8 @@ function appendChatLog(
   body.className = 'chat-text';
   body.textContent = role === 'tool' ? `🔧 ${text}` : role === 'error' ? `⚠️ ${text}` : text;
   row.appendChild(body);
+  const cards = opts?.live?.length ? buildMediaCards(opts.live) : opts?.media?.length ? buildMediaCards(opts.media) : null;
+  if (cards) row.appendChild(cards);
   chatLogEl.appendChild(row);
   while (chatLogEl.childElementCount > CHAT_LOG_MAX_ROWS) {
     const first = chatLogEl.firstElementChild;
@@ -1689,7 +1731,9 @@ function appendChatLog(
   }
   chatScrollToEnd();
   if (opts?.persist !== false) {
-    void chatBridge?.chatLogAppend?.({ role, text, at: opts?.at ?? Date.now() }).catch(() => undefined);
+    const entry: import('../shared/contracts').ChatLogEntry = { role, text, at: opts?.at ?? Date.now() };
+    if (opts?.media?.length) entry.media = opts.media;
+    void chatBridge?.chatLogAppend?.(entry).catch(() => undefined);
   }
   return row;
 }
@@ -1798,7 +1842,7 @@ async function loadChatLog(bridge: RendererBridge): Promise<void> {
     }
     for (const entry of entries) {
       if (!entry || typeof entry.text !== 'string') continue;
-      appendChatLog(entry.role, entry.text, { persist: false, at: entry.at });
+      appendChatLog(entry.role, entry.text, { persist: false, at: entry.at, media: entry.media });
     }
     chatScrollToEnd();
     void loadAutoTaskRound(bridge);
@@ -2171,6 +2215,12 @@ function subscribeOptionalPushes(bridge: RendererBridge): void {
       return;
     });
   }
+  if (typeof bridge.onChatMedia === 'function') {
+    bridge.onChatMedia((payload) => {
+      if (!payload) return;
+      if (!chatOwnedByChatWindow) appendIncomingMedia(bridge, payload);
+    });
+  }
   if (typeof bridge.onAction === 'function') {
     bridge.onAction((action) => {
       const type = action && action.type;
@@ -2498,6 +2548,8 @@ function clampInt(value: number, min: number, max: number, fallback: number): nu
 
 /** 服务端拉到的全部可用模型（设置页内嵌列表用） */
 let aiModelAll: string[] = [];
+/** 视觉端点拉到的模型列表（视觉专用地址优先，留空复用聊天端点） */
+let visionModelAll: string[] = [];
 
 /* ---------------- 转写模型：按 API 地址索引 + 体检提示 ----------------
    用户要求：转写模型/路由要能"按你给的 API 地址自动索引模型"；如果地址里没有这个模型、
@@ -2716,6 +2768,101 @@ async function refreshAiModelOptions(bridge: RendererBridge, openPanel = false):
     }
   } catch (err) {
     setAiModelStatus(`拉取失败：${(err as Error).message ?? String(err)}`, true);
+  }
+}
+
+function setVisionModelStatus(text: string, isError = false): void {
+  const status = elementById<HTMLElement>('setting-vision-model-status');
+  if (!status) return;
+  status.textContent = text;
+  status.style.color = isError ? '#ffaaa8' : '';
+}
+
+function closeVisionModelPanel(): void {
+  const panel = elementById<HTMLElement>('setting-vision-model-panel');
+  if (panel) panel.hidden = true;
+  elementById<HTMLButtonElement>('setting-vision-model-pick')?.setAttribute('aria-expanded', 'false');
+}
+
+/** 渲染视觉模型候选（点击填入输入框；只填不保存，仍需点保存设置）。 */
+function renderVisionModelList(filter = ''): void {
+  const list = elementById<HTMLElement>('setting-vision-model-list');
+  if (!list) return;
+  const q = filter.trim().toLowerCase();
+  const current = elementById<HTMLInputElement>('setting-vision-model')?.value.trim() ?? '';
+  const hits = q ? visionModelAll.filter((m) => m.toLowerCase().includes(q)) : visionModelAll;
+  list.replaceChildren();
+  if (!hits.length) {
+    const empty = document.createElement('div');
+    empty.className = 'model-empty';
+    empty.textContent = visionModelAll.length ? '没有匹配的模型' : '（还没拉到模型列表，点上面的按钮拉取）';
+    list.appendChild(empty);
+    return;
+  }
+  for (const id of hits.slice(0, 300)) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = `model-item${id === current ? ' is-current' : ''}`;
+    btn.textContent = id;
+    btn.addEventListener('click', () => {
+      const input = elementById<HTMLInputElement>('setting-vision-model');
+      if (input) input.value = id;
+      closeVisionModelPanel();
+      setVisionModelStatus(`已选择「${id}」——记得点最下面「保存设置」才会生效。`);
+    });
+    list.appendChild(btn);
+  }
+}
+
+/** 拉取视觉端点模型列表：视觉专用地址有值就查它，否则回退聊天端点。 */
+async function refreshVisionModelOptions(bridge: RendererBridge, openPanel = false): Promise<void> {
+  const panel = elementById<HTMLElement>('setting-vision-model-panel');
+  const list = elementById<HTMLElement>('setting-vision-model-list');
+  if (openPanel && panel) {
+    panel.hidden = false;
+    elementById<HTMLButtonElement>('setting-vision-model-pick')?.setAttribute('aria-expanded', 'true');
+    window.requestAnimationFrame(() => {
+      try {
+        panel.scrollIntoView({ block: 'center', inline: 'nearest' });
+      } catch {
+        panel.scrollIntoView(false);
+      }
+    });
+    const filter = elementById<HTMLInputElement>('setting-vision-model-filter');
+    if (filter) {
+      filter.value = '';
+      window.setTimeout(() => {
+        try {
+          filter.focus();
+        } catch {
+          /* ignore */
+        }
+      }, 30);
+    }
+  }
+  if (typeof bridge.aiModelList !== 'function') {
+    setVisionModelStatus('（当前版本不支持拉取模型列表）', true);
+    return;
+  }
+  setVisionModelStatus('正在拉取视觉端点模型…');
+  if (list) list.replaceChildren();
+  try {
+    const res = await bridge.aiModelList('vision');
+    if (!res || !res.ok) {
+      setVisionModelStatus(`拉取失败：${res?.error ?? '未知原因'}（也可以手动输入模型名）`, true);
+      renderVisionModelList();
+      return;
+    }
+    visionModelAll = res.models;
+    renderVisionModelList(elementById<HTMLInputElement>('setting-vision-model-filter')?.value ?? '');
+    const current = elementById<HTMLInputElement>('setting-vision-model')?.value.trim() ?? '';
+    if (current && !visionModelAll.includes(current)) {
+      setVisionModelStatus(`共 ${visionModelAll.length} 个模型；⚠️ 当前填的「${current}」不在视觉端点列表里，可点「▾ 选择模型」挑一个。`, true);
+    } else {
+      setVisionModelStatus(`已从视觉端点拉取 ${visionModelAll.length} 个模型（点「▾ 选择模型」展开挑选）。`);
+    }
+  } catch (err) {
+    setVisionModelStatus(`拉取失败：${(err as Error).message ?? String(err)}`, true);
   }
 }
 
@@ -3041,6 +3188,7 @@ function openSettings(bridge: RendererBridge): void {
   const form = elementById<HTMLElement>('settings-form');
   if (form) form.scrollTop = 0;
   closeAiModelPanel(); // 展开的模型列表收起，避免一进来就是 200+ 项的滚动区
+  closeVisionModelPanel();
   setSettingsStatus('读取设置…');
   void populateSettings(bridge)
     .then(() => setSettingsStatus(''))
@@ -3076,6 +3224,16 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
     displayMode: (elementById<HTMLSelectElement>('setting-display-mode')?.value as AppSettings['displayMode']) ?? 'full',
     fullscreenAutoHide: elementById<HTMLInputElement>('setting-hide-fullscreen')?.checked === true,
     clickThrough: elementById<HTMLInputElement>('setting-click-through')?.checked === true,
+    // AI 接入方式二选一：api=直连 API；dsh=桥接本机 DSH（只转对话）
+    aiMode: elementById<HTMLInputElement>('setting-ai-mode-dsh')?.checked === true ? 'dsh' : 'api',
+    visionModel: value('setting-vision-model'),
+    visionRoute: (elementById<HTMLSelectElement>('setting-vision-route')?.value as AppSettings['visionRoute']) ?? 'auto',
+    visionBaseUrl: value('setting-vision-base-url'),
+    visionApiKey: value('setting-vision-api-key'),
+    textureMaxSize: (() => {
+      const n = Number(elementById<HTMLSelectElement>('setting-texture-max')?.value ?? '4096');
+      return Number.isFinite(n) ? n : 4096;
+    })(),
     checkForUpdates: elementById<HTMLInputElement>('setting-check-for-updates')?.checked !== false,
     // 语音识别（留空即复用 AI 配置）
     voiceModel: value('setting-voice-model'),
@@ -3130,6 +3288,12 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
       return next;
     })(),
   };
+  let previousTextureMaxSize: number | undefined;
+  try {
+    previousTextureMaxSize = (await bridge.getSettings()).textureMaxSize;
+  } catch {
+    // 读不到旧值就按默认精度处理；保存本身不受影响
+  }
   setSettingsStatus('保存中…');
   const result = await bridge.setSettings(settings);
   if (!result.ok) {
@@ -3163,6 +3327,14 @@ async function saveSettings(bridge: RendererBridge): Promise<void> {
     } catch {
       /* 读取失败时保持在输入框，下次打开设置会重新 populate */
     }
+  }
+  const prevTextureMax = typeof previousTextureMaxSize === 'number' ? previousTextureMaxSize : 4096;
+  if (settings.textureMaxSize !== prevTextureMax && activeModelName) {
+    // 纹理精度是主进程静态服务/缓存目录级设置：保存后必须重新挂载当前模型，
+    // 否则页面仍用旧精度的纹理，表现为“调了没反应”。
+    setSettingsStatus('纹理精度已变更，正在重新加载模型…');
+    await switchModel(bridge, activeModelName);
+    return;
   }
   setSettingsStatus('已保存，下一条消息立即使用新配置。');
   showBubble('设置已生效', { ttlMs: 2200 });
@@ -3445,6 +3617,14 @@ function installAskBox(bridge: RendererBridge): void {
 
 /** 对话面板专用的推送订阅（只接对话流；气泡/模型动作/窗口监测一概不接） */
 function subscribeChatPanelPushes(bridge: RendererBridge): void {
+  if (typeof bridge.onChatMedia === 'function') {
+    bridge.onChatMedia((payload) => {
+      if (!payload) return;
+      appendIncomingMedia(bridge, payload);
+      setChatTyping(false);
+      chatScrollToEnd();
+    });
+  }
   if (typeof bridge.onChat !== 'function') return;
   bridge.onChat((payload) => {
     if (payload && typeof payload.delta === 'string') {
@@ -3598,6 +3778,7 @@ async function initChatPanel(): Promise<void> {
   installAskBox(bridge); // 提问/写操作确认：有可见气泡窗时主进程会弹到这里
   installChatToolbar(bridge); // ＋ 菜单（新对话 / 历史 / 思考浮窗 / 收起）
   installChatPanelUi(bridge);
+  installChatAttachmentUi(bridge); // 聊天附件：图片/音频/文件（发送前做兼容性检查）
   installVoiceInput(); // 按住说话 → 转写 → 填入输入框（不自动发送）
   installChatRowRetry(); // 失败行走"点一行重填"（不自动重发）
   if (new URLSearchParams(window.location.search).get('debug') === '1') {
@@ -3968,6 +4149,7 @@ async function init(): Promise<void> {
   await loadBehaviorTriggers(bridge);
   installTrackingHub(); // 追踪参数中枢（语音口型 + 文本情感；骨骼/外部追踪预留入口）
   subscribeOptionalPushes(bridge);
+  installChatAttachmentUi(bridge); // 聊天附件：图片/音频/文件（发送前做兼容性检查）
   void loadChatLog(bridge); // 渲染历史对话（重启后还能回看）
   installGazeTracking();
   installWindowInteractions(bridge); // 拖拽移动窗口 + 滚轮缩放
@@ -4029,3 +4211,287 @@ function boot(): void {
   }
 }
 boot();
+
+
+/* ================================================================
+   聊天附件（用户→AI 的图片/音频/文件）与 AI 回发媒体卡片
+   ================================================================ */
+
+type ChatAttachmentRef = import('../shared/contracts').AttachmentRef;
+type ChatMediaLive = import('../shared/contracts').ChatMediaPayload;
+type ChatMediaPinned = import('../shared/contracts').ChatMediaMeta;
+
+const CHAT_MAX_ATTACHMENTS = 6;
+
+/** 当前待发送附件（点发送后清空；失败保留） */
+let pendingAttachments: ChatAttachmentRef[] = [];
+let attachmentCheckSeq = 0;
+
+/** 附件类型判定（与主进程同一套扩展名白名单；渲染层只用于暂存/展示） */
+function attachmentKindOf(name: string, mime: string): ChatAttachmentRef['kind'] {
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  const m = (mime || '').toLowerCase();
+  if (m.startsWith('image/') || ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'avif', 'heic'].includes(ext)) return 'image';
+  if (m.startsWith('audio/') || ['mp3', 'wav', 'm4a', 'aac', 'ogg', 'opus', 'flac', 'weba', 'webm'].includes(ext)) return 'audio';
+  if (
+    m.startsWith('text/') ||
+    m === 'application/json' ||
+    ['txt', 'md', 'json', 'csv', 'log', 'yml', 'yaml', 'xml', 'html', 'css', 'js', 'ts', 'py', 'java', 'c', 'cpp', 'h', 'go', 'rs', 'sh', 'ps1', 'bat', 'cmd', 'ini', 'toml', 'sql'].includes(ext)
+  ) {
+    return 'text';
+  }
+  return 'file';
+}
+
+function attachmentMeta(att: ChatAttachmentRef): ChatMediaPinned {
+  return { kind: att.kind === 'image' ? 'image' : att.kind === 'audio' ? 'audio' : 'file', name: att.name, mime: att.mime, size: att.size, path: att.path };
+}
+
+/** 实时 payload → 可持久化元数据（不存 base64） */
+function mediaPayloadToMeta(payload: ChatMediaLive): ChatMediaPinned {
+  return { kind: payload.kind, name: payload.name, mime: payload.mime, size: payload.size, path: payload.path, caption: payload.caption };
+}
+
+function humanSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/** 组装媒体卡片：实时 payload 优先（图片/音频带 dataUrl 可直接显示/播放），历史只有路径时显示文件卡 */
+function buildMediaCards(items: Array<ChatMediaLive | ChatMediaPinned>): HTMLElement | null {
+  if (!items.length) return null;
+  const wrap = document.createElement('div');
+  wrap.className = 'chat-media-list';
+  for (const item of items) {
+    const live = item as ChatMediaLive;
+    const card = document.createElement('div');
+    card.className = `chat-media-card is-${item.kind}`;
+    if (item.kind === 'image' && live.dataUrl) {
+      const img = document.createElement('img');
+      img.className = 'chat-media-image';
+      img.src = live.dataUrl;
+      img.alt = item.name;
+      card.appendChild(img);
+    } else if (item.kind === 'audio' && live.dataUrl) {
+      const audio = document.createElement('audio');
+      audio.className = 'chat-media-audio';
+      audio.controls = true;
+      audio.src = live.dataUrl;
+      card.appendChild(audio);
+    } else {
+      const icon = document.createElement('span');
+      icon.className = 'chat-media-icon';
+      icon.textContent = item.kind === 'image' ? '🖼️' : item.kind === 'audio' ? '🎵' : '📄';
+      card.appendChild(icon);
+    }
+    const meta = document.createElement('div');
+    meta.className = 'chat-media-meta';
+    const name = document.createElement('span');
+    name.className = 'chat-media-name';
+    name.textContent = item.name;
+    const size = document.createElement('span');
+    size.className = 'chat-media-size';
+    size.textContent = humanSize(item.size);
+    meta.append(name, size);
+    if (item.caption) {
+      const cap = document.createElement('span');
+      cap.className = 'chat-media-caption';
+      cap.textContent = item.caption;
+      meta.appendChild(cap);
+    }
+    card.appendChild(meta);
+    if (item.path) {
+      const open = document.createElement('button');
+      open.type = 'button';
+      open.className = 'chat-media-open';
+      open.textContent = '打开';
+      open.title = '用系统程序打开（历史文件若已被清理会打不开）';
+      open.addEventListener('click', () => {
+        void chatBridge?.openPath?.(item.path as string).catch(() => undefined);
+      });
+      card.appendChild(open);
+    }
+    wrap.appendChild(card);
+  }
+  return wrap;
+}
+
+/** AI 回发媒体：聊天里显示卡片 + 落盘记录（历史里保留媒体元数据） */
+function appendIncomingMedia(bridge: RendererBridge, payload: ChatMediaLive): void {
+  const meta = mediaPayloadToMeta(payload);
+  appendChatLog('pet', payload.caption ?? '', { persist: false, live: [payload] });
+  void bridge.chatLogAppend?.({ role: 'pet', text: payload.caption ?? '', at: Date.now(), media: [meta] }).catch(() => undefined);
+  if (!payload.caption) {
+    const label = payload.kind === 'image' ? '图片' : payload.kind === 'audio' ? '音频' : '文件';
+    showBubble(`📎 发来一个${label}：${payload.name}`, { ttlMs: 3600 });
+  }
+  chatScrollToEnd();
+}
+
+function setAttachmentHint(text: string, isError: boolean): void {
+  const el = elementById<HTMLElement>('chat-attachments-hint');
+  if (!el) return;
+  el.textContent = text;
+  el.hidden = !text;
+  el.className = isError ? 'chat-attachments-hint is-error' : 'chat-attachments-hint';
+}
+
+/** 渲染待发送附件 chips（带移除按钮） */
+function renderPendingAttachments(): void {
+  const box = elementById<HTMLElement>('chat-attachments');
+  if (!box) return;
+  box.replaceChildren();
+  box.hidden = pendingAttachments.length === 0;
+  pendingAttachments.forEach((att, index) => {
+    const chip = document.createElement('div');
+    chip.className = `chat-attachment-chip is-${att.kind}`;
+    const icon = document.createElement('span');
+    icon.className = 'chat-attachment-icon';
+    icon.textContent = att.kind === 'image' ? '🖼️' : att.kind === 'audio' ? '🎵' : att.kind === 'text' ? '📝' : '📄';
+    const name = document.createElement('span');
+    name.className = 'chat-attachment-name';
+    name.textContent = att.name;
+    name.title = att.path;
+    const size = document.createElement('span');
+    size.className = 'chat-attachment-size';
+    size.textContent = humanSize(att.size);
+    const rm = document.createElement('button');
+    rm.type = 'button';
+    rm.className = 'chat-attachment-remove';
+    rm.textContent = '×';
+    rm.title = '移除这个附件';
+    rm.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      pendingAttachments.splice(index, 1);
+      renderPendingAttachments();
+      void refreshAttachmentCompatibility(getBridgeForChat() ?? undefined);
+    });
+    chip.append(icon, name, size, rm);
+    box.appendChild(chip);
+  });
+}
+
+/** 发送前兼容性检查（IPC_MEDIA_CHECK）：ok/converted/unsupported → 提示行 + chip 状态 */
+async function refreshAttachmentCompatibility(bridge?: RendererBridge): Promise<void> {
+  const b = bridge ?? chatBridge;
+  if (!b || !pendingAttachments.length) {
+    setAttachmentHint('', false);
+    return;
+  }
+  const seq = ++attachmentCheckSeq;
+  if (typeof b.checkMedia !== 'function') return;
+  try {
+    const result = await b.checkMedia(pendingAttachments);
+    if (seq !== attachmentCheckSeq) return;
+    const box = elementById<HTMLElement>('chat-attachments');
+    const unsupported = new Set(result.items.filter((i) => i.status === 'unsupported').map((i) => i.attachment.path));
+    box?.querySelectorAll<HTMLElement>('.chat-attachment-chip').forEach((chip, i) => {
+      const att = pendingAttachments[i];
+      if (!att) return;
+      chip.classList.toggle('is-unsupported', unsupported.has(att.path));
+      const item = result.items.find((it) => it.attachment.path === att.path);
+      if (item?.hint) chip.title = item.hint;
+    });
+    if (!result.ok) setAttachmentHint(result.summary || '当前 AI 不支持这些附件', true);
+    else if (result.summary) setAttachmentHint(result.summary, false);
+    else setAttachmentHint('', false);
+  } catch (err) {
+    setAttachmentHint(`附件检查失败：${(err as Error).message ?? String(err)}`, true);
+  }
+}
+
+/** 追加文件（选择/拖拽/粘贴共用）：拿路径 → 没路径就暂存字节 */
+async function addFilesToChat(bridge: RendererBridge, files: File[]): Promise<void> {
+  const list = Array.from(files || []).filter(Boolean);
+  if (!list.length) return;
+  for (const file of list) {
+    if (pendingAttachments.length >= CHAT_MAX_ATTACHMENTS) {
+      setAttachmentHint(`一条消息最多 ${CHAT_MAX_ATTACHMENTS} 个附件`, true);
+      break;
+    }
+    const kind = attachmentKindOf(file.name || 'file', file.type || '');
+    let localPath = '';
+    try {
+      const maybe = bridge as RendererBridge & { pathForFile?: (f: File) => string };
+      if (typeof maybe.pathForFile === 'function') localPath = maybe.pathForFile(file) || '';
+    } catch {
+      localPath = '';
+    }
+    if (!localPath) {
+      try {
+        const buf = await file.arrayBuffer();
+        const staged = await bridge.stageAttachment?.(buf, file.name || `attachment-${Date.now()}`, file.type || '');
+        if (staged && staged.ok && staged.path) localPath = staged.path;
+        else {
+          setAttachmentHint(staged?.error ? `附件暂存失败：${staged.error}` : '附件暂存失败', true);
+          continue;
+        }
+      } catch (err) {
+        setAttachmentHint(`附件读取失败：${(err as Error).message ?? String(err)}`, true);
+        continue;
+      }
+    }
+    pendingAttachments.push({ path: localPath, name: file.name || localPath.split(/[\\/]/).pop() || 'file', mime: file.type || '', size: file.size || 0, kind });
+  }
+  renderPendingAttachments();
+  await refreshAttachmentCompatibility(bridge);
+}
+
+function clearPendingAttachments(): void {
+  pendingAttachments = [];
+  attachmentCheckSeq++;
+  renderPendingAttachments();
+  setAttachmentHint('', false);
+}
+
+function getPendingAttachments(): ChatAttachmentRef[] {
+  return pendingAttachments.slice();
+}
+
+function getBridgeForChat(): RendererBridge | null {
+  return chatBridge;
+}
+
+/** 附件 UI 绑定：📎 按钮、文件选择、拖拽、粘贴、移除 */
+function installChatAttachmentUi(bridge: RendererBridge): void {
+  const attachBtn = elementById<HTMLButtonElement>('chat-attach');
+  const fileInput = elementById<HTMLInputElement>('chat-file-input');
+  attachBtn?.addEventListener('click', () => {
+    try {
+      fileInput?.click();
+    } catch {
+      /* ignore */
+    }
+  });
+  fileInput?.addEventListener('change', () => {
+    const files = Array.from(fileInput.files ?? []);
+    fileInput.value = '';
+    void addFilesToChat(bridge, files);
+  });
+  const bar = elementById<HTMLElement>('chatbar');
+  if (bar) {
+    bar.addEventListener('dragover', (event) => {
+      if (!(event as DragEvent).dataTransfer) return;
+      event.preventDefault();
+      bar.classList.add('is-dragover');
+    });
+    bar.addEventListener('dragleave', () => bar.classList.remove('is-dragover'));
+    bar.addEventListener('drop', (event) => {
+      const dt = (event as DragEvent).dataTransfer;
+      if (!dt || !dt.files || !dt.files.length) return;
+      event.preventDefault();
+      bar.classList.remove('is-dragover');
+      void addFilesToChat(bridge, Array.from(dt.files));
+    });
+    bar.addEventListener('paste', (event) => {
+      const files = Array.from((event as ClipboardEvent).clipboardData?.files ?? []);
+      if (!files.length) return;
+      event.preventDefault();
+      void addFilesToChat(bridge, files);
+    });
+  }
+}
+

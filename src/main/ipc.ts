@@ -61,6 +61,10 @@ import {
   IPC_UPDATE_CHECK,
   IPC_UPDATE_STATUS,
   IPC_UPDATE_STATUS_GET,
+  IPC_DSH_RESET_SESSION,
+  IPC_DSH_STATUS,
+  IPC_MEDIA_CHECK,
+  IPC_ATTACHMENT_STAGE,
   IPC_VOICE_CHECK,
   IPC_VOICE_MODELS,
   IPC_VOICE_STATUS,
@@ -76,6 +80,7 @@ import { fetchAvailableModels, loadAppSettings, saveAppSettings, TOOL_DEFS } fro
 import { checkVoiceRoutes, indexVoiceModels, knownRoute, normalizeVoiceConfig, toBytes, transcribeAudio } from './ai/voice';
 import type { VoiceRoute } from './ai/voice';
 import { speak as speakTts } from './voice/ttsService';
+import { scheduleUserModelTextureCache } from './modelTextureCache';
 import { listVoices as listTtsVoices } from './voice/edgeTts';
 import {
   listUserModels,
@@ -115,6 +120,16 @@ export interface IpcDeps {
   isPhoneChatActive?: () => boolean;
   pathResolver: PathResolver;
   chat: ChatClient;
+  /** 附件兼容性检查（渲染层发送前调用；不发起对话） */
+  mediaCheck?: (
+    attachments: import('../shared/contracts').AttachmentRef[],
+  ) => Promise<import('../shared/contracts').MediaCheckResult>;
+  /** 附件暂存：渲染层字节（剪贴板图片等）→ 本地路径 */
+  stageAttachment?: (
+    data: ArrayBuffer,
+    name: string,
+    mime: string,
+  ) => { ok: boolean; path?: string; error?: string };
   registry: PluginRegistryLike;
   /** 本地静态服务 baseUrl 提供者（loadModel 拼模型 URL 用） */
   staticBaseUrl: () => string;
@@ -159,6 +174,10 @@ export interface IpcDeps {
   getUpdateStatus?: () => UpdateSnapshot;
   /** 更新检测：手动触发一次检查（会联网；未注入时 handler 返回"主进程未接入"） */
   checkForUpdates?: () => Promise<UpdateSnapshot>;
+  /** DSH 桥接：读取状态（检测 dsh 命令/版本；AI 接入方式=DSH 时设置页用） */
+  dshStatus?: () => Promise<import('../shared/contracts').DshStatus>;
+  /** DSH 桥接：重置会话（设置页按钮；清本地 session.json） */
+  dshResetSession?: () => void;
   /**
    * VTS 状态快照（可选后端）。未接 VTS 时返回 null —— 设置页据此显示"当前版本不可用"，
    * 所以老版本 main 不实现也安全。
@@ -179,6 +198,46 @@ export interface IpcBridge {
   readChatHistory: (sessionId: string, limit: number) => string;
 }
 
+/** 渲染层传来的附件数组：白名单字段 + 路径非空 + 类型合法（不做磁盘访问，后面按路径读）。 */
+function sanitizeAttachments(raw: unknown): import('../shared/contracts').AttachmentRef[] {
+  if (!Array.isArray(raw)) return [];
+  const out: import('../shared/contracts').AttachmentRef[] = [];
+  for (const item of raw.slice(0, 12)) {
+    if (!item || typeof item !== 'object') continue;
+    const r = item as Record<string, unknown>;
+    const p = typeof r.path === 'string' ? r.path.trim() : '';
+    if (!p) continue;
+    const name = typeof r.name === 'string' && r.name.trim() ? path.basename(r.name.trim()) : path.basename(p);
+    const size = typeof r.size === 'number' && Number.isFinite(r.size) ? Math.max(0, r.size) : 0;
+    const mime = typeof r.mime === 'string' ? r.mime.slice(0, 120) : '';
+    const kind = r.kind === 'image' || r.kind === 'audio' || r.kind === 'text' ? r.kind : 'file';
+    out.push({ path: p, name, mime, size, kind });
+  }
+  return out;
+}
+
+/** 聊天记录里的媒体元数据：只允许白名单字段（防脏数据/超大 base64 落盘）。 */
+function sanitizeChatMedia(list: unknown): import('../shared/contracts').ChatMediaMeta[] | undefined {
+  if (!Array.isArray(list)) return undefined;
+  const out: import('../shared/contracts').ChatMediaMeta[] = [];
+  for (const item of list.slice(0, 8)) {
+    if (!item || typeof item !== 'object') continue;
+    const r = item as Record<string, unknown>;
+    const kind = r.kind === 'image' || r.kind === 'audio' || r.kind === 'file' ? r.kind : null;
+    const name = typeof r.name === 'string' ? r.name.slice(0, 200) : '';
+    if (!kind || !name) continue;
+    out.push({
+      kind,
+      name,
+      mime: typeof r.mime === 'string' ? r.mime.slice(0, 120) : '',
+      size: typeof r.size === 'number' && Number.isFinite(r.size) ? Math.max(0, r.size) : 0,
+      path: typeof r.path === 'string' ? r.path.slice(0, 500) : undefined,
+      caption: typeof r.caption === 'string' ? r.caption.slice(0, 300) : undefined,
+    });
+  }
+  return out.length ? out : undefined;
+}
+
 export function registerIpc(deps: IpcDeps): IpcBridge {
   const pushToRenderer = (channel: string, payload: unknown): void => {
     const win = deps.getWindow();
@@ -190,6 +249,8 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
   ipcMain.handle(IPC_LOAD_MODEL, (_event, name?: unknown): ModelManifest => {
     const manifest = buildModelManifest(deps, typeof name === 'string' ? name : undefined);
     if (manifest.name) rememberModelName(manifest.name); // 下次启动接着用它
+    // 后台构建/更新纹理降采样缓存（首次用原图，随后启动/切换模型走缓存：显存与加载时间都降）
+    scheduleUserModelTextureCache(manifest.name);
     // 同步当前宠物到 chat：切换模型 → 注入对应人设语料（knowledge/<模型名>.md）并清空旧上下文
     deps.chat.setActiveModel(manifest.name || null);
     deps.onModelChanged?.(manifest.name || 'character');
@@ -240,7 +301,17 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
     entries: [],
   });
   const sanitizeEntries = (list: unknown): ChatLogEntry[] =>
-    Array.isArray(list) ? list.filter(isChatEntry).map((e) => ({ ...e, text: e.text.slice(0, 4000) })).slice(-MAX_ENTRIES_PER_SESSION) : [];
+    Array.isArray(list)
+      ? list
+          .filter(isChatEntry)
+          .map((e) => {
+            const media = sanitizeChatMedia((e as { media?: unknown }).media);
+            const out: ChatLogEntry = { role: e.role, text: e.text.slice(0, 4000), at: e.at };
+            if (media) out.media = media;
+            return out;
+          })
+          .slice(-MAX_ENTRIES_PER_SESSION)
+      : [];
 
   /** 读会话文件；旧格式（顶层数组）自动迁移成一个会话 */
   const readChatLogFile = (): ChatLogFile => {
@@ -327,7 +398,7 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
   ipcMain.handle(IPC_CHAT_LOG_GET, (): ChatLogSnapshot => chatSnapshot(readChatLogFile()));
   ipcMain.handle(IPC_CHAT_LOG_APPEND, (_event, raw: unknown): { ok: boolean } => {
     try {
-      const row = (raw ?? {}) as { role?: unknown; text?: unknown; at?: unknown };
+      const row = (raw ?? {}) as { role?: unknown; text?: unknown; at?: unknown; media?: unknown };
       if (!isChatEntry({ ...row, at: typeof row.at === 'number' ? row.at : Date.now() })) return { ok: false };
       const text = (row.text as string).slice(0, 4000);
       const entry: ChatLogEntry = {
@@ -335,6 +406,8 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
         text,
         at: typeof row.at === 'number' && Number.isFinite(row.at) ? row.at : Date.now(),
       };
+      const media = sanitizeChatMedia(row.media);
+      if (media) entry.media = media;
       const data = readChatLogFile();
       let current = data.sessions.find((s) => s.id === data.currentId);
       if (!current) {
@@ -483,10 +556,78 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
     }
   });
 
+  // ---- IPC_DSH_STATUS / IPC_DSH_RESET_SESSION：DSH 桥接 ------------------------
+  // 只做状态探测与本地会话重置；真正的对话在 chatClient 里按 aiMode 分流（只转文本）。
+  ipcMain.handle(IPC_DSH_STATUS, async (): Promise<import('../shared/contracts').DshStatus> => {
+    if (!deps.dshStatus) {
+      return {
+        available: false,
+        commandPath: '',
+        version: null,
+        bridgeDir: '',
+        busy: false,
+        lastError: '主进程未接入 DSH 桥接',
+      };
+    }
+    try {
+      return await deps.dshStatus();
+    } catch (err) {
+      return {
+        available: false,
+        commandPath: '',
+        version: null,
+        bridgeDir: '',
+        busy: false,
+        lastError: (err as Error).message ?? String(err),
+      };
+    }
+  });
+  ipcMain.handle(IPC_DSH_RESET_SESSION, (): void => {
+    deps.dshResetSession?.();
+  });
+
+  // ---- IPC_MEDIA_CHECK / IPC_ATTACHMENT_STAGE：附件兼容性检查 / 暂存 ----------
+  // 发送前先判断当前接入方式（API/DSH）与模型能不能处理，不能处理时给可读提示（不静默丢弃）。
+  ipcMain.handle(
+    IPC_MEDIA_CHECK,
+    async (_event, raw: unknown): Promise<import('../shared/contracts').MediaCheckResult> => {
+      const attachments = sanitizeAttachments(raw);
+      if (!deps.mediaCheck) {
+        return { ok: false, mode: 'api', model: '', items: [], summary: '主进程未接入附件检查' };
+      }
+      try {
+        return await deps.mediaCheck(attachments);
+      } catch (err) {
+        return { ok: false, mode: 'api', model: '', items: [], summary: (err as Error).message ?? String(err) };
+      }
+    },
+  );
+  ipcMain.handle(
+    IPC_ATTACHMENT_STAGE,
+    (_event, raw: unknown): { ok: boolean; path?: string; error?: string } => {
+      const payload = (raw ?? {}) as { data?: unknown; name?: unknown; mime?: unknown };
+      const data = payload.data;
+      const name = typeof payload.name === 'string' ? payload.name : 'attachment';
+      const mime = typeof payload.mime === 'string' ? payload.mime : '';
+      if (!(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data as ArrayBufferView)) {
+        return { ok: false, error: '附件数据格式不对' };
+      }
+      if (!deps.stageAttachment) return { ok: false, error: '主进程未接入附件暂存' };
+      try {
+        const buf = data instanceof ArrayBuffer ? data : (data as ArrayBufferView).buffer;
+        return deps.stageAttachment(buf as ArrayBuffer, name, mime);
+      } catch (err) {
+        return { ok: false, error: (err as Error).message ?? String(err) };
+      }
+    },
+  );
+
   // ---- IPC_SEND_MESSAGE -----------------------------------------------------
-  ipcMain.handle(IPC_SEND_MESSAGE, (event, text: unknown): { ok: boolean; error?: string } => {
-    const message = typeof text === 'string' ? text.trim() : '';
-    if (!message) return { ok: false, error: '消息为空' };
+  ipcMain.handle(IPC_SEND_MESSAGE, (event, raw: unknown): { ok: boolean; error?: string } => {
+    const payload = raw && typeof raw === 'object' ? (raw as { text?: unknown; attachments?: unknown }) : { text: raw };
+    const message = typeof payload.text === 'string' ? payload.text.trim() : '';
+    const attachments = sanitizeAttachments(payload.attachments);
+    if (!message && attachments.length === 0) return { ok: false, error: '消息为空' };
 
     // 用户发言 → 转发行为到桌宠窗口
     try {
@@ -507,8 +648,8 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
       return { ok: true };
     };
 
-    // ---- 斜杠命令（本地处理，不调 LLM）----
-    if (message.startsWith('/')) {
+    // ---- 斜杠命令（本地处理，不调 LLM；带附件时不走斜杠命令）----
+    if (attachments.length === 0 && message.startsWith('/')) {
       const rawCmd = message.slice(1).trim();
       const [cmd, cmdArg] = rawCmd.toLowerCase().split(/\s+/, 2);
       switch (cmd) {
@@ -585,7 +726,7 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
       /* 浮窗开关失败不影响对话本身 */
     }
     void deps.chat
-      .startChat(message)
+      .startChat(message, attachments)
       .catch((err: unknown) => {
         // startChat 自身错误走 onError；此处兜底防御（正常不应触发）
         console.error('[ipc] startChat 意外异常', err);
@@ -809,9 +950,9 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
   );
 
   // ---- 服务端可用模型列表（设置页的模型选择用）--------------------------------
-  ipcMain.handle(IPC_AI_MODEL_LIST, async (): Promise<AiModelListResult> => {
+  ipcMain.handle(IPC_AI_MODEL_LIST, async (_event, purpose?: unknown): Promise<AiModelListResult> => {
     try {
-      return await fetchAvailableModels();
+      return await fetchAvailableModels(purpose === 'vision' ? 'vision' : 'chat');
     } catch (err) {
       return { ok: false, models: [], error: (err as Error).message ?? String(err) };
     }
@@ -1248,6 +1389,37 @@ function sanitizeSettings(raw: unknown): AppSettings | null {
   if (input.checkForUpdates !== undefined) {
     if (typeof input.checkForUpdates !== 'boolean') return null;
     settings.checkForUpdates = input.checkForUpdates;
+  }
+  // AI 接入方式（二选一）：api / dsh，其它值一律拒绝
+  if (input.aiMode !== undefined) {
+    if (input.aiMode !== 'api' && input.aiMode !== 'dsh') return null;
+    settings.aiMode = input.aiMode;
+  }
+  // Live2D 纹理精度（最长边像素；0=原始；只允许几档，防手滑写坏）
+  if (input.textureMaxSize !== undefined) {
+    const n = input.textureMaxSize;
+    if (typeof n !== 'number' || !Number.isFinite(n)) return null;
+    if (![0, 512, 1024, 2048, 3072, 4096, 8192].includes(n)) return null;
+    settings.textureMaxSize = n;
+  }
+  // API 模式的「视觉模型」：图片转述用（留空自动）
+  if (input.visionModel !== undefined) {
+    if (typeof input.visionModel !== 'string') return null;
+    if (input.visionModel.length > 120) return null;
+    settings.visionModel = input.visionModel.trim();
+  }
+  // 视觉识别专用配置：地址/Key 留空复用聊天配置；route 只允许 auto/chat/custom
+  if (input.visionRoute !== undefined) {
+    if (input.visionRoute !== 'auto' && input.visionRoute !== 'chat' && input.visionRoute !== 'custom') return null;
+    settings.visionRoute = input.visionRoute;
+  }
+  if (input.visionBaseUrl !== undefined) {
+    if (typeof input.visionBaseUrl !== 'string' || input.visionBaseUrl.length > 500) return null;
+    settings.visionBaseUrl = input.visionBaseUrl.trim();
+  }
+  if (input.visionApiKey !== undefined) {
+    if (typeof input.visionApiKey !== 'string' || input.visionApiKey.length > 500) return null;
+    settings.visionApiKey = input.visionApiKey.trim();
   }
   // 语音识别：模型 / 路由 / 单独网关（都与聊天配置解耦，留空则复用聊天配置）
   if (input.voiceModel !== undefined) {

@@ -759,7 +759,7 @@ body.is-dragover #stage::after {
   font-size: 12px;
 }
 .asset-item.is-bad { border-color: rgba(255, 150, 150, 0.45); }
-.asset-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.asset-name { flex: 1 1 auto; min-width: 0; overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; word-break: break-word; line-height: 1.4; }
 .asset-badge { flex: none; padding: 1px 7px; border-radius: 999px; font-size: 10.5px; }
 .asset-badge.is-ok { background: rgba(120, 220, 160, 0.18); color: #9fe6bb; border: 1px solid rgba(120, 220, 160, 0.4); }
 .asset-badge.is-warn { background: rgba(255, 209, 102, 0.16); color: #ffd166; border: 1px solid rgba(255, 209, 102, 0.4); }
@@ -859,7 +859,49 @@ body.is-dragover #stage::after {
   background: rgba(159, 230, 187, 0.12);
 }
 /* 设置项旁边的浅色提示文字 */
-.settings-hint { color: rgba(255, 255, 255, 0.55); font-size: 12px; }
+.settings-hint { color: rgba(255, 255, 255, 0.55); font-size: 12px; line-height: 1.6; }
+.settings-fieldset .settings-hint {
+  margin: 6px 0 2px;
+  padding: 0 2px;
+}
+
+/* 转写模型行：标签独立成项，输入框吃掉剩余宽度，索引按钮不被压扁 */
+.settings-row-label {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+#setting-voice-model-pick {
+  flex: 0 0 auto;
+  max-width: 100%;
+}
+#setting-voice-model {
+  min-width: 160px;
+}
+
+/* 转写模型「按地址索引」的提示行：独立成块，避免和输入行挤在一起；
+   长候选列表允许换行，保持 11~12px 的辅助文字层级。 */
+#setting-voice-model-hint.voice-model-hint {
+  flex: 1 1 100%;
+  margin: 6px 0 7px;
+  padding: 7px 10px;
+  border-left: 3px solid rgba(255, 209, 102, 0.72);
+  border-radius: 0 7px 7px 0;
+  background: rgba(255, 209, 102, 0.08);
+  line-height: 1.6;
+  font-size: 12px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+#setting-voice-model-hint.voice-model-hint.is-ok {
+  border-left-color: rgba(159, 230, 187, 0.8);
+  background: rgba(159, 230, 187, 0.08);
+}
+#setting-voice-model-hint.voice-model-hint.is-bad {
+  border-left-color: rgba(255, 180, 180, 0.85);
+  background: rgba(255, 180, 180, 0.08);
+}
+#setting-voice-model-hint.voice-model-hint:empty { display: none; }
 
 /* 转写模型「按地址索引」的提示行：三档颜色复用资产徽章那套语义色 */
 .voice-model-hint.is-ok { color: #9fe6bb; }
@@ -2195,3 +2237,142 @@ body.is-think-window .think-line { margin-bottom: 6px; }
 #settings-update #update-status-text.is-error {
   color: #ff9b9b;
 }
+
+
+/* ---------- AI 接入方式（二选一） ---------- */
+.ai-mode-radios {
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.settings-hint {
+  margin: 0 0 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.55);
+}
+#ai-api-details > summary,
+#ai-dsh-details > summary {
+  cursor: pointer;
+  color: rgba(255, 255, 255, 0.86);
+}
+#ai-api-details[open] > summary,
+#ai-dsh-details[open] > summary {
+  margin-bottom: 6px;
+}
+#dsh-status-text {
+  flex: 1 1 100%;
+}
+
+
+/* ---------- 聊天附件（用户→AI：图片/音频/文件） ---------- */
+.chat-attach {
+  flex: none;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.08);
+  color: inherit;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+.chat-attach:hover { background: rgba(255, 255, 255, 0.16); }
+.chat-file-input { display: none; }
+.chat-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 6px 0;
+}
+.chat-attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 3px 6px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.07);
+  font-size: 11.5px;
+}
+.chat-attachment-chip.is-unsupported {
+  border-color: rgba(255, 140, 140, 0.6);
+  background: rgba(255, 120, 120, 0.12);
+}
+.chat-attachment-name {
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-attachment-size { color: rgba(255, 255, 255, 0.5); flex: none; }
+.chat-attachment-remove {
+  flex: none;
+  border: 0;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.65);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+}
+.chat-attachment-remove:hover { color: #ff9b9b; }
+.chat-attachments-hint {
+  margin: 2px 8px 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.6);
+}
+.chat-attachments-hint.is-error { color: #ff9b9b; }
+.chatbar.is-dragover { outline: 1px dashed rgba(130, 200, 255, 0.7); outline-offset: -3px; }
+
+/* ---------- 媒体卡片（用户附件 / AI 回发媒体） ---------- */
+.chat-media-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 5px;
+}
+.chat-media-card {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-width: 210px;
+  padding: 5px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(0, 0, 0, 0.22);
+}
+.chat-media-image {
+  max-width: 200px;
+  max-height: 150px;
+  border-radius: 7px;
+  object-fit: contain;
+  background: rgba(0, 0, 0, 0.25);
+}
+.chat-media-audio { width: 200px; height: 32px; }
+.chat-media-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  align-items: baseline;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.75);
+}
+.chat-media-name { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-media-size { color: rgba(255, 255, 255, 0.45); }
+.chat-media-caption { flex: 1 1 100%; color: rgba(255, 255, 255, 0.6); }
+.chat-media-icon { font-size: 20px; }
+.chat-media-open {
+  align-self: flex-start;
+  padding: 2px 9px;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.08);
+  color: inherit;
+  cursor: pointer;
+  font-size: 11px;
+}
+.chat-media-open:hover { background: rgba(255, 255, 255, 0.16); }

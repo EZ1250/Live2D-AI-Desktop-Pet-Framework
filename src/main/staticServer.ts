@@ -79,7 +79,12 @@ export class StaticServer {
    */
   constructor(
     private readonly root: string,
-    private readonly extraMounts: Array<{ prefix: string; resolve: (key: string) => string | null }> = []
+    private readonly extraMounts: Array<{
+      prefix: string;
+      resolve: (key: string) => string | null;
+      /** 可选：缓存目录（如纹理降采样缓存）。存在同名文件时优先返回缓存版本。 */
+      cacheRoot?: (key: string) => string | null;
+    }> = []
   ) {}
 
   get port(): number {
@@ -167,6 +172,23 @@ export class StaticServer {
       if (!base || !rest) {
         this.respond(res, 404, 'text/plain; charset=utf-8', '404 Not Found');
         return;
+      }
+      const rel = rest.replace(/\//g, path.sep);
+      // 优先命中缓存（纹理降采样）：缓存里没有才回原目录
+      const cache = mount.cacheRoot?.(key);
+      if (cache) {
+        const cachedAbs = path.resolve(cache, rel);
+        const relCheck = path.relative(cache, cachedAbs);
+        if (relCheck && !relCheck.startsWith('..') && !path.isAbsolute(relCheck)) {
+          try {
+            if (fs.existsSync(cachedAbs) && fs.statSync(cachedAbs).isFile()) {
+              this.serveFrom(cache, rel, res);
+              return;
+            }
+          } catch {
+            /* 缓存访问失败：回退原文件 */
+          }
+        }
       }
       this.serveFrom(base, rest.replace(/\//g, path.sep), res);
       return;

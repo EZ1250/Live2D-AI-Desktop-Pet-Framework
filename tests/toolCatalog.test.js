@@ -19,6 +19,7 @@ const EXPECTED_NAMES = [
   'weather_get',
   'media_control',
   'screen_capture',
+  'send_to_user',
   'meeting_create',
   'translate_text',
   'mail_compose',

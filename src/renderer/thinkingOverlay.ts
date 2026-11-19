@@ -427,6 +427,15 @@ function installSettingsUi(bridge: RendererBridge): void {
     event.preventDefault();
     void saveSettings(bridge).catch((err: unknown) => setSettingsStatus(`保存失败：${(err as Error).message ?? String(err)}`, true));
   });
+  // AI 接入方式（二选一）：切单选时展开对应配置区、收起另一边；DSH 按钮刷新状态/重置会话
+  elementById<HTMLInputElement>('setting-ai-mode-api')?.addEventListener('change', syncAiModeDetails);
+  elementById<HTMLInputElement>('setting-ai-mode-dsh')?.addEventListener('change', syncAiModeDetails);
+  elementById<HTMLButtonElement>('dsh-refresh-status')?.addEventListener('click', () => {
+    void refreshDshStatus(bridge);
+  });
+  elementById<HTMLButtonElement>('dsh-reset-session')?.addEventListener('click', () => {
+    void resetDshSessionFromUi(bridge);
+  });
   // —— VTube Studio（可选后端）：连接 / 授权 / 断开 / 刷新 / 触发热键 / 试听语音 ——
   elementById<HTMLButtonElement>('setting-vts-connect')?.addEventListener('click', () => {
     void runVtsActionFromUi(bridge, 'connect');
@@ -585,6 +594,27 @@ function installSettingsUi(bridge: RendererBridge): void {
     if (event.key === 'Escape') {
       event.preventDefault();
       closeAiModelPanel();
+    }
+  });
+
+  // 视觉模型：从视觉专用端点（留空则聊天端点）索引候选，和 AI 模型选择一致
+  elementById<HTMLButtonElement>('setting-vision-model-pick')?.addEventListener('click', () => {
+    const panel = elementById<HTMLElement>('setting-vision-model-panel');
+    if (panel && !panel.hidden) {
+      closeVisionModelPanel();
+      return;
+    }
+    closeAiModelPanel();
+    closeVoiceModelPanel();
+    void refreshVisionModelOptions(bridge, true);
+  });
+  elementById<HTMLInputElement>('setting-vision-model-filter')?.addEventListener('input', (event) => {
+    renderVisionModelList((event.target as HTMLInputElement).value);
+  });
+  elementById<HTMLInputElement>('setting-vision-model-filter')?.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeVisionModelPanel();
     }
   });
 

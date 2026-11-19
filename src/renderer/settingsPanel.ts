@@ -379,6 +379,11 @@ async function populateSettings(bridge: RendererBridge): Promise<void> {
   renderMotionTriggerRows();
   refreshMotionTriggerOptions();
   populateMotionTriggerSelects();
+  const textureSelect = elementById<HTMLSelectElement>('setting-texture-max');
+  if (textureSelect) {
+    const v = typeof settings.textureMaxSize === 'number' ? settings.textureMaxSize : 4096;
+    textureSelect.value = String(v);
+  }
   const modelSelect = elementById<HTMLSelectElement>('setting-model');
   if (modelSelect) {
     modelSelect.replaceChildren();
@@ -488,8 +493,23 @@ async function populateSettings(bridge: RendererBridge): Promise<void> {
       void maybe.getUpdateStatus().then(renderUpdateStatus).catch(() => undefined);
     }
   }
-  applySfxSettings(settings); // 音效开关/音量 + 滑杆显示
-  // 打开设置就顺手拉一次可用模型列表（失败也不影响其它设置项）+ 扫描可插拔资产
+  const visionModelInput = elementById<HTMLInputElement>('setting-vision-model');
+  if (visionModelInput) visionModelInput.value = settings.visionModel ?? '';
+  const visionRouteSelect = elementById<HTMLSelectElement>('setting-vision-route');
+  if (visionRouteSelect) visionRouteSelect.value = settings.visionRoute === 'chat' || settings.visionRoute === 'custom' ? settings.visionRoute : 'auto';
+  const visionBaseInput = elementById<HTMLInputElement>('setting-vision-base-url');
+  if (visionBaseInput) visionBaseInput.value = settings.visionBaseUrl ?? '';
+  const visionKeyInput = elementById<HTMLInputElement>('setting-vision-api-key');
+  if (visionKeyInput) visionKeyInput.value = settings.visionApiKey ?? '';
+  // AI 接入方式二选一：单选回填 + 对应配置区展开/收起 + DSH 状态刷新
+  const apiModeRadio = elementById<HTMLInputElement>('setting-ai-mode-api');
+  const dshModeRadio = elementById<HTMLInputElement>('setting-ai-mode-dsh');
+  const aiMode = settings.aiMode === 'dsh' ? 'dsh' : 'api';
+  if (apiModeRadio) apiModeRadio.checked = aiMode === 'api';
+  if (dshModeRadio) dshModeRadio.checked = aiMode === 'dsh';
+  syncAiModeDetails();
+  if (aiMode === 'dsh') void refreshDshStatus(bridge);
+  applySfxSettings(settings); // 音效开关/音量 + 滑杆显示  // 打开设置就顺手拉一次可用模型列表（失败也不影响其它设置项）+ 扫描可插拔资产
   void refreshAiModelOptions(bridge);
   void refreshAssetPanel(bridge);
   void refreshVoiceStatus(bridge); // 语音识别这行的状态（是否配好、走哪条路由、发往哪个主机）
@@ -983,5 +1003,60 @@ async function runVtsTestInjectFromUi(bridge: RendererBridge): Promise<void> {
     setSettingsStatus(`测试注入失败：${(err as Error).message ?? String(err)}`, true);
   } finally {
     if (btn) btn.disabled = false;
+  }
+}
+
+/* ---------- AI 接入方式（API / 桥接 DSH）---------- */
+/** 二选一：选中哪边就展开哪边配置区，另一边收起（details 折叠）。 */
+function syncAiModeDetails(): void {
+  const dshSelected = elementById<HTMLInputElement>('setting-ai-mode-dsh')?.checked === true;
+  const apiDetails = elementById<HTMLDetailsElement>('ai-api-details');
+  const dshDetails = elementById<HTMLDetailsElement>('ai-dsh-details');
+  if (apiDetails) apiDetails.open = !dshSelected;
+  if (dshDetails) dshDetails.open = dshSelected;
+}
+
+/** 读取 DSH 桥接状态并显示在设置页（只探测 dsh 命令/版本，不发起对话）。 */
+async function refreshDshStatus(bridge: RendererBridge): Promise<void> {
+  const el = elementById<HTMLElement>('dsh-status-text');
+  if (!el) return;
+  const maybe = bridge as RendererBridge & { getDshStatus?: () => Promise<import('../shared/contracts').DshStatus> };
+  if (typeof maybe.getDshStatus !== 'function') {
+    el.textContent = '当前版本不支持 DSH 状态查询';
+    return;
+  }
+  el.textContent = '检测 DSH…';
+  el.className = 'settings-status';
+  try {
+    const s = await maybe.getDshStatus();
+    el.textContent = s.available
+      ? `DSH 可用：${s.version ?? '版本未知'}（${s.commandPath}）`
+      : `DSH 不可用：${s.lastError ?? '未检测到 dsh 命令'}`;
+    el.className = s.available ? 'settings-status' : 'settings-status is-error';
+  } catch (err) {
+    el.textContent = `DSH 状态检测失败：${(err as Error).message ?? String(err)}`;
+    el.className = 'settings-status is-error';
+  }
+}
+
+/** 重置 DSH 会话（设置页按钮；下一条消息新开会话）。 */
+async function resetDshSessionFromUi(bridge: RendererBridge): Promise<void> {
+  const el = elementById<HTMLElement>('dsh-status-text');
+  const maybe = bridge as RendererBridge & { resetDshSession?: () => Promise<void> };
+  if (typeof maybe.resetDshSession !== 'function') {
+    if (el) el.textContent = '当前版本不支持重置 DSH 会话';
+    return;
+  }
+  try {
+    await maybe.resetDshSession();
+    if (el) {
+      el.textContent = 'DSH 会话已重置（下一条消息新开会话）';
+      el.className = 'settings-status';
+    }
+  } catch (err) {
+    if (el) {
+      el.textContent = `重置失败：${(err as Error).message ?? String(err)}`;
+      el.className = 'settings-status is-error';
+    }
   }
 }

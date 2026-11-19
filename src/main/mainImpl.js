@@ -78,6 +78,8 @@ const devTools_1 = require("./ai/devTools");
 const webTools_1 = require("./ai/webTools");
 const weatherTools_1 = require("./ai/weatherTools");
 const mediaTools_1 = require("./ai/mediaTools");
+const mediaAttachments_1 = require("./ai/mediaAttachments");
+const modelTextureCache_1 = require("./modelTextureCache");
 const screenTools_1 = require("./ai/screenTools");
 const meetingTools_1 = require("./ai/meetingTools");
 const translateTools_1 = require("./ai/translateTools");
@@ -104,7 +106,12 @@ const vtsService_1 = require("./vts/vtsService");
 try {
     const os_1 = require("os");
     const path_1 = require("path");
-    const unified = path_1.join(electron_1.app.getPath('appData'), 'pet-desktop-app');
+    // PET_USER_DATA_DIR：调试/自动化测试用，把 userData 指到独立目录（不碰用户真实设置；
+    // 同时能让开发态与已安装版并存——Electron 的单实例锁落在 userData 里）。
+    // 打包版默认忽略；自动化测试需显式 PET_ALLOW_DEBUG_HOOKS=1。
+    const allowDebugHooks = !electron_1.app.isPackaged || process.env.PET_ALLOW_DEBUG_HOOKS === '1';
+    const overrideUserData = allowDebugHooks ? (process.env.PET_USER_DATA_DIR || '').trim() : '';
+    const unified = overrideUserData || path_1.join(electron_1.app.getPath('appData'), 'pet-desktop-app');
     if (electron_1.app.getPath('userData') !== unified) {
         electron_1.app.setPath('userData', unified);
     }
@@ -1650,7 +1657,7 @@ function closeThinkWindowWindow() {
 }
 // ---------------------------------------------------------------- 推送路由
 /** 对话频道：桌宠窗口（出气泡）+ 气泡窗（出对话记录）都要收 */
-const CHAT_MIRROR_CHANNELS = new Set([contracts_1.IPC_AI_CHUNK, contracts_1.IPC_AI_DONE, contracts_1.IPC_AI_ERROR, contracts_1.IPC_AUTOTASK_ROUND_PUSH]);
+const CHAT_MIRROR_CHANNELS = new Set([contracts_1.IPC_AI_CHUNK, contracts_1.IPC_AI_DONE, contracts_1.IPC_AI_ERROR, contracts_1.IPC_AUTOTASK_ROUND_PUSH, contracts_1.IPC_CHAT_MEDIA]);
 /** 思考频道：只发给思考浮窗（气泡窗很小，不显示思考流） */
 const THINK_CHANNELS = new Set([contracts_1.IPC_THINK_PUSH, contracts_1.IPC_PLAN_PUSH]);
 /** 推给桌宠窗口；对话频道镜像给气泡窗，思考频道发给思考浮窗 */
@@ -2299,7 +2306,12 @@ async function bootstrap() {
         }
     });
     const srv = new staticServer_1.StaticServer(resolver.staticRoot(), [
-        { prefix: 'user-models', resolve: (name) => (0, userAssets_1.findUserModel)(name)?.dir ?? null },
+        {
+            prefix: 'user-models',
+            resolve: (name) => (0, userAssets_1.findUserModel)(name)?.dir ?? null,
+            // 纹理降采样缓存优先（大图集模型显存占用可降一个数量级；原文件不动）
+            cacheRoot: (name) => (0, modelTextureCache_1.userModelCacheDir)(name),
+        },
     ]);
     await srv.start();
     server = srv;
@@ -2315,18 +2327,41 @@ async function bootstrap() {
     scenario.load();
     console.log('[main] 系统提示词库：' + (promptLibrary.source === 'bundled' ? '随包四层提示词' : '内置兜底') +
         '；情景提示词：' + scenario.filePath());
+    // —— 流式增量合并器：onChunk 只入缓冲，每 16ms 推一次（≈一帧一次）——
+    let chatDeltaBuf = '';
+    let chatDeltaTimer = null;
+    const flushChatDeltas = () => {
+        if (!chatDeltaBuf) return;
+        const text = chatDeltaBuf;
+        chatDeltaBuf = '';
+        pushToWindows(contracts_1.IPC_AI_CHUNK, { delta: text });
+    };
+    const queueChatDelta = (delta) => {
+        if (!delta) return;
+        chatDeltaBuf += delta;
+        if (chatDeltaTimer) return;
+        chatDeltaTimer = setTimeout(() => {
+            chatDeltaTimer = null;
+            flushChatDeltas();
+        }, 16);
+    };
     // 4. AI 对话（回调暂存 sendToRenderer，IPC 注册后生效）
     chat = new chatClient_1.ChatClient(settings, {
-        onChunk: (delta) => pushToWindows(contracts_1.IPC_AI_CHUNK, { delta }),
+        // 流式增量合并：16ms 内多个 token 合成一次 IPC/一次 DOM 更新（逐字效果不变，IPC 与布局次数大减）
+        onChunk: (delta) => queueChatDelta(delta),
         onDone: (full, usage) => {
+            flushChatDeltas();
             pushToWindows(contracts_1.IPC_AI_DONE, usage ? { full, usage } : { full });
             onChatRoundFinished(); // 答完 → 2.5s 后自动收起思考浮窗
         },
         onError: (message) => {
+            flushChatDeltas();
             pushToWindows(contracts_1.IPC_AI_ERROR, { message });
             onChatRoundFinished(); // 出错同样收尾，别让浮窗一直挂着
         },
         onThink: (evt) => pushToWindows(contracts_1.IPC_THINK_PUSH, evt), // 思考浮窗
+        // AI 回发媒体（DSH 的 [[send:...]] 标记解析后 / 工具 send_to_user）：推给聊天窗显示卡片
+        onMedia: (payload) => pushToWindows(contracts_1.IPC_CHAT_MEDIA, payload),
     }, resolver.knowledgeDir());
     chat.setWorkspaceRoot(settings.devWorkspaceRoot ?? ''); // 让 system prompt 知道产物该放哪
     chat.setUserDataDir(electron_1.app.getPath('userData')); // 读 <userData>/memory.md 用户记忆
@@ -2416,6 +2451,12 @@ async function bootstrap() {
             const state = await updateCheck_1.triggerManualUpdateCheck();
             return { currentVersion: electron_1.app.getVersion(), state };
         },
+        // DSH 桥接（AI 接入方式=DSH 时）：设置页状态探测 + 重置会话
+        dshStatus: () => chat.dshStatus(),
+        dshResetSession: () => chat.resetDshSession(),
+        // 附件：发送前兼容性检查（不联网）+ 剪贴板等字节暂存到 userData/uploads
+        mediaCheck: (attachments) => chat.checkMedia(attachments),
+        stageAttachment: (data, name, mime) => (0, mediaAttachments_1.stageAttachmentBuffer)(path.join(electron_1.app.getPath('userData'), 'uploads'), data, name, mime),
         mcpReload: async () => {
             await mcpClient?.reload();
             await petMcpServer?.reload();
@@ -2488,6 +2529,27 @@ async function bootstrap() {
         const args = (rawArgs ?? {});
         const s = (v, dflt = '') => (typeof v === 'string' ? v : dflt);
         const n = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : Number(s(v)));
+        // 把图片/音频/文件发给用户（AI→用户）：路径必须落在白名单目录内，防越权读取。
+        if (name === 'send_to_user') {
+            const rawPath = s(args.path).trim();
+            if (!rawPath)
+                return '缺少 path（要发送给用户的文件路径）。';
+            const userDataDir = electron_1.app.getPath('userData');
+            const dshBridgeDir = chat && chat.dshBridgeDir ? chat.dshBridgeDir() : path.join(userDataDir, 'dsh-bridge');
+            const baseDir = settings.devWorkspaceRoot || path.join(userDataDir, 'chat-media');
+            const abs = path.isAbsolute(rawPath) ? rawPath : path.resolve(baseDir, rawPath);
+            const roots = (0, mediaAttachments_1.allowedSendRoots)(userDataDir, settings.devWorkspaceRoot || '', dshBridgeDir);
+            const safe = (0, mediaAttachments_1.resolveSafeSendFile)(abs, roots);
+            if (!safe.ok || !safe.real)
+                return `拒绝：只能发送聊天媒体区/附件暂存区/DSH 输出区/开发工作区里的普通文件（${safe.reason ?? '不允许'}）。`;
+            if ((0, mediaAttachments_1.isForbiddenSendFile)(safe.real))
+                return '拒绝：该文件看起来是配置/密钥或可执行文件，不能发给用户。';
+            const payload = (0, mediaAttachments_1.mediaPayloadForFile)(safe.real, s(args.caption).trim() || undefined);
+            if (!payload)
+                return '发送失败：文件不存在、不是文件或超过 15MB 限制。';
+            pushToWindows(contracts_1.IPC_CHAT_MEDIA, payload);
+            return `已把「${payload.name}」发送给用户（聊天里会显示卡片）。`;
+        }
         // 计划审批：多步任务先出方案，用户点头才动手（只读动作，无副作用）
         if (name === 'plan_propose') {
             const planText = s(args.plan).trim();

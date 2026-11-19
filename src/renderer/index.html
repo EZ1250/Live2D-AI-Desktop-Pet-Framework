@@ -65,8 +65,12 @@
     </div>
     <div id="chat-history-list" class="chat-history-list" hidden></div>
     <div id="chat-log" class="chat-log" aria-live="polite"></div>
+    <div id="chat-attachments" class="chat-attachments" hidden></div>
+    <p id="chat-attachments-hint" class="chat-attachments-hint" role="status" hidden></p>
+    <input id="chat-file-input" class="chat-file-input" type="file" multiple hidden />
     <div class="chat-input-row">
       <button id="chat-plus" class="chat-plus" type="button" title="更多" aria-haspopup="true" aria-expanded="false">＋</button>
+      <button id="chat-attach" class="chat-attach" type="button" title="添加图片/音频/文件（也可以直接拖进来或粘贴）" aria-label="添加附件">📎</button>
       <input id="chat-input" class="chat-input" type="text" placeholder="输入消息" maxlength="500" autocomplete="off" spellcheck="false" />
       <button id="chat-mic" class="chat-mic" type="button" aria-pressed="false" title="按住说话（松开后转写，不会自动发送）" aria-label="按住说话">
         <!-- 声纹图标（参考用户给的图：7 条圆头竖条，中间最高、左右对称，描边不填充）；
@@ -186,6 +190,12 @@
       </details>
       <label>桌宠名字<input id="setting-pet-name" name="petName" type="text" maxlength="24" placeholder="给它起个名字（留空=模型名）" autocomplete="off" spellcheck="false" /></label>
       <label>模型<select id="setting-model" name="model"></select></label>
+      <label>模型纹理精度<select id="setting-texture-max" name="textureMaxSize">
+        <option value="1024">极速（1024，显存最省）</option>
+        <option value="2048">均衡（2048）</option>
+        <option value="4096" selected>高清（4096，推荐）</option>
+        <option value="0">原始（不压缩，最吃显存）</option>
+      </select></label>
       <label>角色取景
         <select id="setting-display-mode" name="displayMode">
           <option value="full">全身</option>
@@ -257,33 +267,6 @@
           <span class="settings-hint">内置列表不满意时点这里</span>
         </div>
       </fieldset>
-      <!-- 语音识别（转写）：与聊天模型分开配；自检按钮用内置合成音频打两条路由 -->
-      <fieldset class="settings-fieldset">
-        <legend>语音识别（语音输入转文字）</legend>
-        <!-- 转写模型：可从 API 地址的 /models 自动索引候选；留空则按地址自动挑一个。 -->
-        <label class="settings-row">转写模型
-          <input id="setting-voice-model" name="voiceModel" placeholder="留空=按地址自动识别（默认 qwen3-asr-flash）" autocomplete="off" />
-          <button id="setting-voice-model-pick" type="button" title="从 API 地址的 /models 挑转写模型">▾ 按地址索引</button>
-        </label>
-        <div id="setting-voice-model-panel" class="model-panel" hidden>
-          <input id="setting-voice-model-filter" class="model-filter" type="text" placeholder="过滤：asr / whisper / audio / speech…" autocomplete="off" spellcheck="false" />
-          <div id="setting-voice-model-list" class="model-list"></div>
-        </div>
-        <p id="setting-voice-model-hint" class="settings-status voice-model-hint" role="status"></p>
-        <label>转写路由
-          <select id="setting-voice-route" name="voiceRoute">
-            <option value="auto">自动（推荐：先试可用的那条）</option>
-            <option value="chat-audio">chat/completions + 音频（百炼网关用这条）</option>
-            <option value="transcriptions">/audio/transcriptions（OpenAI 经典）</option>
-          </select>
-        </label>
-        <label>语音专用地址<input id="setting-voice-base-url" name="voiceBaseUrl" placeholder="留空=复用上面的 API 地址" /></label>
-        <label>语音专用 Key<input id="setting-voice-api-key" name="voiceApiKey" type="password" placeholder="留空=复用上面的 API Key" /></label>
-        <div class="settings-row">
-          <button id="setting-voice-check" type="button" title="用一段内置合成音频分别测试两条转写路由">🎙 自检语音识别</button>
-          <span id="setting-voice-status" class="settings-status" role="status"></span>
-        </div>
-      </fieldset>
       <!-- VTube Studio 可选后端：把桌宠的视线/口型同步到本机 VTS 里的模型。
            不启用时完全不连 VTS，桌宠自己的渲染行为不变（VTS 只是"第二后端"）。 -->
       <fieldset class="settings-fieldset">
@@ -312,27 +295,112 @@
           <button id="setting-vts-hotkey-run" type="button" title="在当前 VTS 模型里按名字找到热键并触发">触发热键</button>
         </label>
       </fieldset>
-      <label>Provider<input id="setting-provider" name="provider" placeholder="deepseek / openai / azure" /></label>
-      <label>API 地址<input id="setting-base-url" name="baseUrl" placeholder="https://api.deepseek.com" /></label>
-      <label>API Key<input id="setting-api-key" name="apiKey" type="password" placeholder="仅保存到本机" /></label>
-      <label class="settings-row">AI 模型
-        <input id="setting-ai-model" name="aiModel" placeholder="点右边「选择模型」从服务端列表里挑" autocomplete="off" />
-        <button id="setting-ai-model-refresh" type="button" title="从 API 地址拉取可用模型（GET /models）">▾ 选择模型</button>
-      </label>
-      <!-- 内嵌展开的模型列表：不用原生 datalist（它的弹窗只有一个候选、点外面收不回、滚动还挡在原处） -->
-      <div id="setting-ai-model-panel" class="model-panel" hidden>
-        <input id="setting-ai-model-filter" class="model-filter" type="text" placeholder="过滤：coder / max / flash / vl …" autocomplete="off" spellcheck="false" />
-        <div id="setting-ai-model-list" class="model-list"></div>
-      </div>
-      <p id="setting-ai-model-status" class="settings-status" role="status"></p>
-      <label>Azure API 版本<input id="setting-azure-version" name="azureApiVersion" placeholder="2024-10-21" /></label>
-      <div class="settings-grid">
-        <label>温度<input id="setting-temperature" name="temperature" type="number" min="0" max="2" step="0.1" /></label>
-        <label>上下文轮数<input id="setting-rounds" name="contextRounds" type="number" min="0" max="100" step="1" /></label>
-      </div>
-      <label>上下文 Token 上限<input id="setting-tokens" name="maxContextTokens" type="number" min="256" max="200000" step="256" placeholder="多步任务建议 ≥16000" /></label>
-      <label class="settings-checkbox"><input id="setting-confirm-tools" name="confirmTools" type="checkbox" /> 工具调用需确认（写操作前先问我）</label>
-      <label class="settings-checkbox"><input id="setting-show-thinking" name="showThinking" type="checkbox" checked /> 显示思考过程（请求模型返回推理内容）</label>
+      <fieldset class="settings-fieldset" id="ai-mode-fieldset">
+        <legend>AI 接入方式（二选一）</legend>
+        <div class="settings-inline ai-mode-radios">
+          <label class="settings-checkbox"><input type="radio" name="aiMode" id="setting-ai-mode-api" value="api" checked /> 使用 API（OpenAI 兼容）</label>
+          <label class="settings-checkbox"><input type="radio" name="aiMode" id="setting-ai-mode-dsh" value="dsh" /> 桥接本机 DSH（只转对话）</label>
+        </div>
+      </fieldset>
+      <details id="ai-api-details" class="settings-links" open>
+        <summary>API 配置（OpenAI 兼容；直连 API 时使用）</summary>
+        <label>Provider<input id="setting-provider" name="provider" placeholder="deepseek / openai / azure" /></label>
+        <label>API 地址<input id="setting-base-url" name="baseUrl" placeholder="https://api.deepseek.com" /></label>
+        <label>API Key<input id="setting-api-key" name="apiKey" type="password" placeholder="仅保存到本机" /></label>
+        <label class="settings-row">AI 模型
+          <input id="setting-ai-model" name="aiModel" placeholder="点右边「选择模型」从服务端列表里挑" autocomplete="off" />
+          <button id="setting-ai-model-refresh" type="button" title="从 API 地址拉取可用模型（GET /models）">▾ 选择模型</button>
+        </label>
+        <!-- 内嵌展开的模型列表：不用原生 datalist（它的弹窗只有一个候选、点外面收不回、滚动还挡在原处） -->
+        <div id="setting-ai-model-panel" class="model-panel" hidden>
+          <input id="setting-ai-model-filter" class="model-filter" type="text" placeholder="过滤：coder / max / flash / vl …" autocomplete="off" spellcheck="false" />
+          <div id="setting-ai-model-list" class="model-list"></div>
+        </div>
+        <p id="setting-ai-model-status" class="settings-status" role="status"></p>
+        <label>Azure API 版本<input id="setting-azure-version" name="azureApiVersion" placeholder="2024-10-21" /></label>
+        <div class="settings-grid">
+          <label>温度<input id="setting-temperature" name="temperature" type="number" min="0" max="2" step="0.1" /></label>
+          <label>上下文轮数<input id="setting-rounds" name="contextRounds" type="number" min="0" max="100" step="1" /></label>
+        </div>
+        <label>上下文 Token 上限<input id="setting-tokens" name="maxContextTokens" type="number" min="256" max="200000" step="256" placeholder="多步任务建议 ≥16000" /></label>
+        <div class="settings-divider">开发辅助（建文件夹 / 写文件 / 执行命令）</div>
+        <label class="settings-row">开发工作区
+          <input id="setting-dev-root" name="devWorkspaceRoot" type="text" readonly placeholder="未选择（选择后 Pet 才能建文件夹 / 写文件）" />
+          <button id="setting-dev-root-pick" type="button">选择文件夹…</button>
+          <button id="setting-dev-root-open" type="button">打开</button>
+        </label>
+        <label>权限模式
+          <select id="setting-permission-mode" name="permissionMode">
+            <option value="ask">每次询问（最安全）</option>
+            <option value="auto-edit">自动接受编辑（写入不问，命令仍问）</option>
+            <option value="plan-only">只读 / 计划（不许改动）</option>
+          </select>
+        </label>
+        <label class="settings-checkbox"><input id="setting-confirm-tools" name="confirmTools" type="checkbox" /> 工具调用需确认（写操作前先问我）</label>
+        <label class="settings-checkbox"><input id="setting-show-thinking" name="showThinking" type="checkbox" checked /> 显示思考过程（请求模型返回推理内容）</label>
+        <label class="settings-checkbox"><input id="setting-allow-shell" name="allowShell" type="checkbox" checked /> 允许执行命令（危险命令会被拦截，每次执行都需确认）</label>
+        <!-- 视觉识别 / 语音识别用同一套 fieldset + settings-row 版式，避免两块配置视觉上不成体系 -->
+        <fieldset class="settings-fieldset">
+          <legend>视觉识别（图片识别用；可留空自动）</legend>
+          <label class="settings-row">
+            <span class="settings-row-label">视觉模型</span>
+            <input id="setting-vision-model" name="visionModel" placeholder="如 qwen3-vl-plus / gpt-4o（留空自动）" />
+            <button id="setting-vision-model-pick" type="button" title="从视觉/聊天端点的 /models 挑视觉模型">▾ 选择模型</button>
+          </label>
+          <div id="setting-vision-model-panel" class="model-panel" hidden>
+            <input id="setting-vision-model-filter" class="model-filter" type="text" placeholder="过滤：vl / vision / omni / gpt-4o…" autocomplete="off" spellcheck="false" />
+            <div id="setting-vision-model-list" class="model-list"></div>
+          </div>
+          <p id="setting-vision-model-status" class="settings-status" role="status"></p>
+          <label>视觉路由
+            <select id="setting-vision-route" name="visionRoute">
+              <option value="auto">自动（推荐：能直读就直读，否则挑视觉模型）</option>
+              <option value="chat">聊天模型直读</option>
+              <option value="custom">只用指定视觉模型</option>
+            </select>
+          </label>
+          <label>视觉专用地址<input id="setting-vision-base-url" name="visionBaseUrl" placeholder="留空=复用上面的聊天 API 地址" /></label>
+          <label>视觉专用 Key<input id="setting-vision-api-key" name="visionApiKey" type="password" placeholder="留空=复用上面的聊天 API Key" /></label>
+          <p class="settings-hint">当前聊天模型不支持图片时，会先用这个视觉模型识别图片内容；音频会先转写成文字再发送。</p>
+        </fieldset>
+        <!-- 语音识别（转写）：与聊天模型分开配；自检按钮用内置合成音频打两条路由 -->
+        <fieldset class="settings-fieldset">
+          <legend>语音识别（语音输入转文字；默认复用上面的 API 配置）</legend>
+          <!-- 转写模型：可从 API 地址的 /models 自动索引候选；留空则按地址自动挑一个。 -->
+          <label class="settings-row">
+            <span class="settings-row-label">转写模型</span>
+            <input id="setting-voice-model" name="voiceModel" placeholder="留空=按地址自动识别（默认 qwen3-asr-flash）" autocomplete="off" />
+            <button id="setting-voice-model-pick" type="button" title="从 API 地址的 /models 挑转写模型">▾ 按地址索引</button>
+          </label>
+          <div id="setting-voice-model-panel" class="model-panel" hidden>
+            <input id="setting-voice-model-filter" class="model-filter" type="text" placeholder="过滤：asr / whisper / audio / speech…" autocomplete="off" spellcheck="false" />
+            <div id="setting-voice-model-list" class="model-list"></div>
+          </div>
+          <p id="setting-voice-model-hint" class="settings-status voice-model-hint" role="status"></p>
+          <label>转写路由
+            <select id="setting-voice-route" name="voiceRoute">
+              <option value="auto">自动（推荐：先试可用的那条）</option>
+              <option value="chat-audio">chat/completions + 音频（百炼网关用这条）</option>
+              <option value="transcriptions">/audio/transcriptions（OpenAI 经典）</option>
+            </select>
+          </label>
+          <label>语音专用地址<input id="setting-voice-base-url" name="voiceBaseUrl" placeholder="留空=复用上面的 API 地址" /></label>
+          <label>语音专用 Key<input id="setting-voice-api-key" name="voiceApiKey" type="password" placeholder="留空=复用上面的 API Key" /></label>
+          <div class="settings-row">
+            <button id="setting-voice-check" type="button" title="用一段内置合成音频分别测试两条转写路由">🎙 自检语音识别</button>
+            <span id="setting-voice-status" class="settings-status" role="status"></span>
+          </div>
+        </fieldset>
+      </details>
+      <details id="ai-dsh-details" class="settings-links">
+        <summary>DSH 桥接（本机会话；只转对话）</summary>
+        <p class="settings-hint">把对话交给本机 DeepSeek Harness 处理：只转发文字消息、不传工具/截图；同一个 DSH 会话会延续上下文。DSH 用哪个模型由 DSH 自己的配置决定。</p>
+        <div class="settings-inline">
+          <button id="dsh-refresh-status" type="button">刷新 DSH 状态</button>
+          <button id="dsh-reset-session" type="button">重置 DSH 会话</button>
+        </div>
+        <p id="dsh-status-text" class="settings-status" role="status">读取 DSH 状态…</p>
+      </details>
       <label class="settings-checkbox"><input id="setting-sfx" name="sfxEnabled" type="checkbox" checked /> 点击音效（点桌宠时播放轻响）</label>
       <label class="settings-range">音效音量
         <input id="setting-sfx-volume" name="sfxVolume" type="range" min="0" max="1" step="0.05" value="0.6" />
@@ -344,20 +412,6 @@
         <legend>行为触发（每个行为绑一个动作或表情）</legend>
         <div id="motion-trigger-body"></div>
       </fieldset>
-      <div class="settings-divider">开发辅助（建文件夹 / 写文件 / 执行命令）</div>
-      <label class="settings-row">开发工作区
-        <input id="setting-dev-root" name="devWorkspaceRoot" type="text" readonly placeholder="未选择（选择后 Pet 才能建文件夹 / 写文件）" />
-        <button id="setting-dev-root-pick" type="button">选择文件夹…</button>
-        <button id="setting-dev-root-open" type="button">打开</button>
-      </label>
-      <label class="settings-checkbox"><input id="setting-allow-shell" name="allowShell" type="checkbox" checked /> 允许执行命令（危险命令会被拦截，每次执行都需确认）</label>
-      <label>权限模式
-        <select id="setting-permission-mode" name="permissionMode">
-          <option value="ask">每次询问（最安全）</option>
-          <option value="auto-edit">自动接受编辑（写入不问，命令仍问）</option>
-          <option value="plan-only">只读 / 计划（不许改动）</option>
-        </select>
-      </label>
       <div class="settings-divider">可插拔资产（模型 / 插件：放进文件夹即可用）</div>
 
       <div class="asset-block">

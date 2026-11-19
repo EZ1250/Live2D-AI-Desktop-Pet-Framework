@@ -369,3 +369,174 @@ test('更新检测 IPC：契约、preload、主进程、渲染层、设置页五
   const formStart = html.indexOf('id="settings-form"');
   assert.ok(formStart > 0 && updateStart > formStart, '更新设置区应在设置表单里');
 });
+
+/**
+ * AI 接入方式（API / 桥接 DSH）：契约 / preload / 主进程 / 渲染层 / 设置页五处同步。
+ * 漏一处的表现：设置页选 DSH 后状态行一直"读取中"、或聊天仍走 API——所以钉住。
+ */
+test('DSH 桥接 IPC：契约、preload、主进程、渲染层、设置页五处都接上了', () => {
+  assert.equal(contracts.IPC_DSH_STATUS, 'dsh:status');
+  assert.equal(contracts.IPC_DSH_RESET_SESSION, 'dsh:reset-session');
+  for (const name of ['IPC_DSH_STATUS', 'IPC_DSH_RESET_SESSION']) {
+    for (const file of ['src/shared/contracts.ts', 'src/preload/preload.ts', 'src/main/ipc.ts']) {
+      assert.ok(readSrc(file).includes(name), `${file} 应引用 ${name}`);
+    }
+  }
+  // preload + 契约方法名
+  for (const method of ['getDshStatus', 'resetDshSession']) {
+    for (const file of ['src/shared/contracts.ts', 'src/preload/preload.ts']) {
+      assert.ok(readSrc(file).includes(method), `${file} 应提供 ${method}`);
+    }
+  }
+  // 主进程：独立桥接模块 + 设置页状态/重置 + 聊天分流 + 设置读回
+  const dshSrc = readSrc('src/main/ai/dshBridge.ts');
+  for (const token of ['class DshBridge', 'export function parseDshLine', 'looksLikeInvalidSession', 'DSH_PERMISSION_MODE']) {
+    assert.ok(dshSrc.includes(token), `dshBridge.ts 应包含 ${token}`);
+  }
+  const chat = readSrc('src/main/ai/chatClient.ts');
+  for (const token of ['DshBridge', 'private aiMode', 'dshStatus()', 'resetDshSession()', "this.aiMode === 'dsh'"]) {
+    assert.ok(chat.includes(token), `chatClient.ts 应包含 ${token}`);
+  }
+  assert.match(chat, /aiMode: \(\(\): 'api' \| 'dsh'/, 'loadAppSettings 必须读回 aiMode');
+  const main = readSrc('src/main/mainImpl.js');
+  for (const token of ['dshStatus: () => chat.dshStatus()', 'dshResetSession: () => chat.resetDshSession()']) {
+    assert.ok(main.includes(token), `mainImpl.js 应包含 ${token}`);
+  }
+  // 渲染层：保存 aiMode + 二选一 UI + DSH 状态/重置
+  for (const token of ['setting-ai-mode-dsh', 'syncAiModeDetails', 'refreshDshStatus', 'resetDshSessionFromUi']) {
+    assert.ok(rendererSource().includes(token), `渲染层应包含 ${token}`);
+  }
+  assert.ok(readSrc('src/renderer/renderer.ts').includes('aiMode: elementById'), 'saveSettings 必须提交 aiMode');
+  const html = readSrc('src/renderer/index.html');
+  for (const id of [
+    'setting-ai-mode-api',
+    'setting-ai-mode-dsh',
+    'ai-api-details',
+    'ai-dsh-details',
+    'dsh-status-text',
+    'dsh-refresh-status',
+    'dsh-reset-session',
+  ]) {
+    assert.ok(html.includes(`id="${id}"`), `index.html 应包含 #${id}`);
+  }
+  // 模型名不再被省略号截断
+  const styles = readSrc('src/renderer/styles.css');
+  assert.ok(/\.asset-name\s*\{[^}]*white-space:\s*normal/.test(styles), '.asset-name 应允许换行显示完整模型名');
+  assert.ok(!/\.asset-name\s*\{[^}]*text-overflow:\s*ellipsis/.test(styles), '.asset-name 不应再用省略号截断');
+});
+
+
+/**
+ * 聊天媒体附件（用户↔AI：图片/音频/文件）+ 发送前兼容性检查：五处同步。
+ * 漏一处的表现：能选附件但发不出去、提示不出现、AI 回发的文件不显示——所以钉住。
+ */
+test('聊天媒体附件：契约、preload、主进程、工具、渲染层五处都接上了', () => {
+  assert.equal(contracts.IPC_MEDIA_CHECK, 'chat:media-check');
+  assert.equal(contracts.IPC_ATTACHMENT_STAGE, 'chat:attachment-stage');
+  assert.equal(contracts.IPC_CHAT_MEDIA, 'chat:media');
+  for (const name of ['IPC_MEDIA_CHECK', 'IPC_ATTACHMENT_STAGE', 'IPC_CHAT_MEDIA']) {
+    for (const file of ['src/shared/contracts.ts', 'src/preload/preload.ts']) {
+      assert.ok(readSrc(file).includes(name), `${file} 应引用 ${name}`);
+    }
+  }
+  for (const name of ['IPC_MEDIA_CHECK', 'IPC_ATTACHMENT_STAGE']) {
+    assert.ok(readSrc('src/main/ipc.ts').includes(name), `ipc.ts 应引用 ${name}`);
+  }
+  // 契约类型 + 方法
+  const c = readSrc('src/shared/contracts.ts');
+  for (const token of ['AttachmentKind', 'AttachmentRef', 'MediaCheckResult', 'ChatMediaPayload', 'ChatMediaMeta']) {
+    assert.ok(c.includes(token), `contracts.ts 应定义 ${token}`);
+  }
+  for (const token of ['checkMedia', 'stageAttachment', 'onChatMedia']) {
+    for (const file of ['src/shared/contracts.ts', 'src/preload/preload.ts']) {
+      assert.ok(readSrc(file).includes(token), `${file} 应提供 ${token}`);
+    }
+  }
+  assert.match(c, /sendMessage\(text: string, attachments\?: AttachmentRef\[\]\)/, 'sendMessage 应接受附件参数');
+  assert.match(c, /interface ChatLogEntry[\s\S]{0,200}media\?: ChatMediaMeta\[\]/, 'ChatLogEntry 应带 media');
+  assert.match(c, /interface AppSettings[\s\S]*?visionModel\?: string/, 'AppSettings 应有 visionModel');
+  assert.ok(c.includes("visionRoute?: 'auto' | 'chat' | 'custom'"), 'AppSettings 应有 visionRoute');
+  assert.ok(c.includes('visionBaseUrl?: string') && c.includes('visionApiKey?: string'), 'AppSettings 应有视觉专用地址/Key');
+  // 主进程：附件模块 + chatClient 分流 + dsh 允许写文件 + 设置读写
+  const media = readSrc('src/main/ai/mediaAttachments.ts');
+  for (const token of [
+    'checkMediaCompatibility',
+    'prepareAttachmentsForApi',
+    'prepareAttachmentsForDsh',
+    'parseMediaMarkers',
+    'mediaPayloadForFile',
+    'stageAttachmentBuffer',
+    'describeImages',
+  ]) {
+    assert.ok(media.includes(token), `mediaAttachments.ts 应包含 ${token}`);
+  }
+  const chat = readSrc('src/main/ai/chatClient.ts');
+  for (const token of ['prepareAttachmentsForApi', 'prepareAttachmentsForDsh', 'parseMediaMarkers', 'checkMediaCompatibility', 'startChat(text: string, attachments?: AttachmentRef[])']) {
+    assert.ok(chat.includes(token), `chatClient.ts 应包含 ${token}`);
+  }
+  assert.ok(readSrc('src/main/ai/dshBridge.ts').includes("DSH_PERMISSION_MODE: 'workspace-write'"), 'DSH 需允许在工作目录内写文件（AI 回发文件）');
+  const ipcSrc = readSrc('src/main/ipc.ts');
+  for (const token of ['mediaCheck', 'stageAttachment', 'sanitizeChatMedia', 'sanitizeAttachments']) {
+    assert.ok(ipcSrc.includes(token), `ipc.ts 应包含 ${token}`);
+  }
+  assert.ok(readSrc('src/main/mainImpl.js').includes("name === 'send_to_user'"), 'mainImpl 应实现 send_to_user 工具');
+  // 工具目录
+  const tools = readSrc('src/main/ai/tools/catalog/media.ts');
+  assert.ok(tools.includes("name: 'send_to_user'"), '工具目录应包含 send_to_user');
+  assert.ok(readSrc('src/main/ai/tools/catalog/all.ts').includes('tool_send_to_user'));
+  // 渲染层
+  const html = readSrc('src/renderer/index.html');
+  for (const id of ['chat-attach', 'chat-file-input', 'chat-attachments', 'chat-attachments-hint', 'setting-vision-model', 'setting-vision-route', 'setting-vision-base-url', 'setting-vision-api-key']) {
+    assert.ok(html.includes(`id="${id}"`), `index.html 应包含 #${id}`);
+  }
+  const renderer = readSrc('src/renderer/renderer.ts');
+  for (const token of ['buildMediaCards', 'installChatAttachmentUi', 'appendIncomingMedia', 'refreshAttachmentCompatibility', 'visionModel: value(', "setting-vision-route"]) {
+    assert.ok(renderer.includes(token), `renderer.ts 应包含 ${token}`);
+  }
+  assert.ok(readSrc('src/renderer/voiceInput.ts').includes('sendMessage(text, attachments)'), 'sendChat 应带附件发送');
+  assert.ok(readSrc('src/renderer/settingsPanel.ts').includes('setting-vision-model'), '设置页应回填视觉模型');
+  const styles = readSrc('src/renderer/styles.css');
+  for (const token of ['.chat-attachment-chip', '.chat-media-card', '.chat-media-image', '.chat-attachments-hint']) {
+    assert.ok(styles.includes(token), `styles.css 应包含 ${token}`);
+  }
+});
+
+
+/**
+ * 性能优化（纹理降采样缓存 / VTS 空闲抑制 / 流式增量合并）：接线与开关别被改回去。
+ */
+test('性能优化：纹理降采样缓存、流式增量合并、VTS 空闲抑制都接上了', () => {
+  // 设置项 + 读写
+  const c = readSrc('src/shared/contracts.ts');
+  assert.ok(c.includes('textureMaxSize?: number'), 'AppSettings 应有 textureMaxSize');
+  assert.ok(readSrc('src/main/ipc.ts').includes('textureMaxSize'), '设置白名单应允许 textureMaxSize');
+  assert.ok(readSrc('src/main/ai/chatClient.ts').includes("num(4096, 'textureMaxSize')"), 'loadAppSettings 应读回 textureMaxSize');
+  // 纹理缓存模块 + 静态服务 overlay + 模型加载后调度
+  const cache = readSrc('src/main/modelTextureCache.ts');
+  for (const token of ['ensureUserModelTextureCache', 'scheduleUserModelTextureCache', 'userModelCacheDir', 'nativeImage']) {
+    assert.ok(cache.includes(token), `modelTextureCache.ts 应包含 ${token}`);
+  }
+  assert.ok(cache.includes('20000'), '缓存构建应防抖（停留 20s 再构建，避免拖慢切模型）');
+  const info = readSrc('src/main/modelTextureInfo.ts');
+  for (const token of ['readImageInfo', 'normalizeTextureMax', 'sanitizeCacheKey']) {
+    assert.ok(info.includes(token), `modelTextureInfo.ts 应包含 ${token}`);
+  }
+  assert.ok(readSrc('src/main/staticServer.ts').includes('cacheRoot?:'), '静态服务应支持缓存 overlay');
+  assert.ok(readSrc('src/main/mainImpl.js').includes('cacheRoot: (name) => (0, modelTextureCache_1.userModelCacheDir)(name)'));
+  assert.ok(readSrc('src/main/ipc.ts').includes('scheduleUserModelTextureCache(manifest.name)'), '加载模型后应调度缓存构建');
+  // 设置页
+  const html = readSrc('src/renderer/index.html');
+  assert.ok(html.includes('id="setting-texture-max"'), '设置页应有纹理精度选择');
+  assert.ok(readSrc('src/renderer/settingsPanel.ts').includes('setting-texture-max'));
+  assert.ok(readSrc('src/renderer/renderer.ts').includes("value('setting-texture-max')") || readSrc('src/renderer/renderer.ts').includes("'setting-texture-max'"));
+  // 流式增量合并（16ms）
+  const main = readSrc('src/main/mainImpl.js');
+  assert.ok(main.includes('queueChatDelta(delta)'), 'onChunk 应走合并缓冲');
+  assert.ok(main.includes('flushChatDeltas();'), 'onDone/onError 前应 flush 合并缓冲');
+  assert.ok(/setTimeout\(\(\) => \{\s*chatDeltaTimer = null;/.test(main), '合并器应 16ms 定时 flush');
+  // VTS 空闲抑制
+  const renderer = readSrc('src/renderer/renderer.ts');
+  assert.ok(renderer.includes('vtsConnected'), 'VTS 推送应记录连接状态');
+  assert.ok(renderer.includes('!vtsTrackingEnabled || !vtsConnected'), 'VTS 未连接时不应发追踪帧');
+  assert.ok(renderer.includes('refreshVtsConnection'), '应有 VTS 连接状态探测');
+});

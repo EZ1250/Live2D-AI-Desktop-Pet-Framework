@@ -134,10 +134,73 @@ export interface AutoTaskRound {
   durationMs?: number;
 }
 
+/** 附件类型（按扩展名/MIME 分四类：图片、音频、可内联文本、其它文件）。 */
+export type AttachmentKind = 'image' | 'audio' | 'text' | 'file';
+
+/** 一条待发送附件（渲染层选择/拖入/暂存后交给主进程）。 */
+export interface AttachmentRef {
+  /** 本地绝对路径（主进程读取；渲染层拿不到内容时不传字节） */
+  path: string;
+  /** 展示用文件名 */
+  name: string;
+  /** MIME（不确定时为空字符串，主进程按扩展名兜底） */
+  mime: string;
+  /** 字节数 */
+  size: number;
+  kind: AttachmentKind;
+}
+
+/** 单个附件的兼容性结论：ok=直接支持；converted=会自动转换后支持；unsupported=当前接入 AI 不支持。 */
+export type MediaCheckStatus = 'ok' | 'converted' | 'unsupported';
+
+export interface MediaCheckItem {
+  attachment: AttachmentRef;
+  status: MediaCheckStatus;
+  /** 处理方式（给人看的短标签，如「直接发送」「视觉模型转述」「ASR 转写」「路径引用」） */
+  route: string;
+  /** 给用户的说明/提示（unsupported 时必填） */
+  hint?: string;
+}
+
+/** 发送前兼容性检查结果（整条消息级别）。 */
+export interface MediaCheckResult {
+  ok: boolean;
+  mode: 'api' | 'dsh';
+  model: string;
+  items: MediaCheckItem[];
+  /** 汇总提示（不兼容或使用转换时的说明；ok 且全直接支持时为空） */
+  summary: string;
+}
+
+/** AI 回发给用户的媒体卡片（main→renderer 推 payload；图片/音频可带 dataUrl 直接显示）。 */
+export interface ChatMediaPayload {
+  kind: 'image' | 'audio' | 'file';
+  name: string;
+  mime: string;
+  size: number;
+  /** 本地文件路径（点「打开」时交给系统；历史记录也用它） */
+  path?: string;
+  /** 实时显示用（图片/音频 base64 data URL；仅当次推送，不持久化） */
+  dataUrl?: string;
+  caption?: string;
+}
+
+/** 聊天记录里的媒体元数据（持久化；不含 dataUrl，重启后按路径打开）。 */
+export interface ChatMediaMeta {
+  kind: 'image' | 'audio' | 'file';
+  name: string;
+  mime: string;
+  size: number;
+  path?: string;
+  caption?: string;
+}
+
 export interface ChatLogEntry {
   role: 'user' | 'pet' | 'tool' | 'error';
   text: string;
   at: number;
+  /** 该条记录附带的媒体（用户发出的附件 / AI 回发的媒体） */
+  media?: ChatMediaMeta[];
 }
 
 /** 历史会话摘要（会话列表用）。 */
@@ -166,6 +229,17 @@ export const IPC_UPDATE_STATUS_GET = 'update:status:get';
 export const IPC_UPDATE_CHECK = 'update:check';
 /** main→renderer 推送：每次检查完成后推送状态快照（渲染层未就绪时会丢，用 IPC_UPDATE_STATUS_GET 补拉）。 */
 export const IPC_UPDATE_STATUS = 'update:status';
+/** invoke renderer→main：读取本机 DSH 桥接状态（是否可用/版本/桥接目录；AI 接入方式=DSH 时设置页用）。 */
+export const IPC_DSH_STATUS = 'dsh:status';
+/** invoke renderer→main：重置 DSH 会话（清本地 session.json；"新对话"之外的设置页手动入口）。 */
+export const IPC_DSH_RESET_SESSION = 'dsh:reset-session';
+
+/** 附件兼容性检查（invoke）：发送前判断当前接入方式/模型能否处理这些附件。 */
+export const IPC_MEDIA_CHECK = 'chat:media-check';
+/** 附件暂存（invoke）：渲染层把剪贴板/拖入的字节交给主进程落盘，返回本地路径。 */
+export const IPC_ATTACHMENT_STAGE = 'chat:attachment-stage';
+/** AI 回发媒体（main→renderer 推送）：图片/音频/文件卡片。 */
+export const IPC_CHAT_MEDIA = 'chat:media';
 /**
  * invoke renderer→main：从当前 API 地址拉取服务端**可用模型列表**（GET /models）。
  * 设置页用它把"AI 模型"变成可选列表，避免手打一个不存在的模型名（服务端只会回 "Model not exist."）。
@@ -234,6 +308,22 @@ export type UpdateState =
 export interface UpdateSnapshot {
   currentVersion: string;
   state: UpdateState;
+}
+
+/** DSH 桥接状态（AI 接入方式=桥接 DSH 时，设置页展示；不发起对话）。 */
+export interface DshStatus {
+  /** 本机是否检测到可用的 dsh 命令 */
+  available: boolean;
+  /** 解析到的 dsh 命令路径（或命令名） */
+  commandPath: string;
+  /** dsh -V 输出的版本号（不可用时为 null） */
+  version: string | null;
+  /** 桥接工作目录（<userData>/dsh-bridge，会话文件也在里面） */
+  bridgeDir: string;
+  /** 当前是否有一轮 DSH 对话在跑 */
+  busy: boolean;
+  /** 最近一次失败原因（可读） */
+  lastError: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -722,8 +812,8 @@ export interface ModelCompatInfo {
 export interface ElectronAPI {
   /** 加载指定模型，resolve 为 ModelManifest（url 指向主进程静态服务）。 */
   loadModel(modelName: string): Promise<ModelManifest>;
-  /** 发送消息触发 AI 对话；流式结果经 onChat 订阅推送。 */
-  sendMessage(text: string): Promise<{ ok: boolean }>;
+  /** 发送消息触发 AI 对话；流式结果经 onChat 订阅推送。attachments 为图片/音频/文件（发送前会做兼容性检查）。 */
+  sendMessage(text: string, attachments?: AttachmentRef[]): Promise<{ ok: boolean }>;
   /** 订阅活动窗口变化；返回取消订阅函数。 */
   onWindowChange(cb: (info: WindowInfo | null) => void): () => void;
   /** 注册插件清单，供主进程加载进 plugin registry；失败时 error 携带原因。 */
@@ -740,6 +830,16 @@ export interface ElectronAPI {
   checkForUpdates(): Promise<UpdateSnapshot>;
   /** 订阅更新检测状态推送（主进程每次检查后推送；旧 preload 没有此方法，渲染层做特性探测）。 */
   onUpdateStatus?(cb: (snapshot: UpdateSnapshot) => void): () => void;
+  /** 读取本机 DSH 桥接状态（检测 dsh 命令/版本；不发起对话）。 */
+  getDshStatus(): Promise<DshStatus>;
+  /** 重置 DSH 会话（清掉本地 session id；下一条消息新开会话）。 */
+  resetDshSession(): Promise<void>;
+  /** 发送前检查附件兼容性（不发起对话；不兼容时给出可读提示）。 */
+  checkMedia(attachments: AttachmentRef[]): Promise<MediaCheckResult>;
+  /** 附件暂存：把渲染层拿到的字节（剪贴板图片等）落盘到 userData/uploads，返回路径。 */
+  stageAttachment(data: ArrayBuffer, name: string, mime: string): Promise<{ ok: boolean; path?: string; error?: string }>;
+  /** 订阅 AI 回发媒体（图片/音频/文件卡片；主进程推送）。 */
+  onChatMedia?(cb: (payload: ChatMediaPayload) => void): () => void;
   /** MCP 面板状态（两个方向 + 自主任务运行情况）。 */
   getMcpStatus(): Promise<McpPanelStatus>;
   /** MCP 操作：reload=重载 mcp.json 与 mcp-server 配置。 */
@@ -781,8 +881,8 @@ export interface ElectronAPI {
   openPath?(target: string): Promise<string>;
   /** 用系统默认浏览器打开 http/https 链接；成功返回空字符串，失败返回错误信息。 */
   openExternal?(url: string): Promise<string>;
-  /** 拉取服务端可用 AI 模型列表（设置页的模型选择用）。 */
-  aiModelList?(): Promise<AiModelListResult>;
+  /** 拉取服务端可用 AI 模型列表（chat=聊天端点，vision=视觉专用端点；设置页模型选择用）。 */
+  aiModelList?(purpose?: 'chat' | 'vision'): Promise<AiModelListResult>;
   /** 扫描用户资产（模型 + 插件），带问题清单。 */
   assetScan?(): Promise<AssetScanResult>;
   /** 打开资产文件夹（模型 / 插件）；返回空字符串=成功。 */
@@ -999,6 +1099,34 @@ export interface AppSettings {
   clickThrough?: boolean;
   /** 启动时自动检查 GitHub 是否有新版本（默认 true；关闭后仍可在设置页手动检查）。 */
   checkForUpdates?: boolean;
+  /**
+   * AI 接入方式（二选一，默认 api）：
+   *  - api：直连 OpenAI 兼容 API（用 aiBaseUrl/aiApiKey/aiModel；支持工具/截图等完整能力）
+   *  - dsh：桥接本机 DeepSeek Harness（dsh headless 会话；只转对话文本，不传工具/截图）
+   * 选 dsh 时 API Key 等字段仍保留保存，但聊天不再使用。
+   */
+  aiMode?: 'api' | 'dsh';
+  /**
+   * API 模式的「视觉模型」：当前聊天模型不支持图片时，用它先描述/OCR 图片再把文字注入对话。
+   * 留空 = 自动（优先从 /models 里挑名字像视觉模型的，兜底 qwen3-vl-plus）。
+   */
+  visionModel?: string;
+  /**
+   * 视觉识别路由：
+   *  - auto（默认）：聊天模型支持视觉就用它，否则用显式视觉模型 / 从 /models 自动挑
+   *  - chat：强制用聊天模型读图（聊天模型不是视觉模型时通常会在请求时报错）
+   *  - custom：只用「视觉模型」里显式填写的模型
+   */
+  visionRoute?: 'auto' | 'chat' | 'custom';
+  /** 视觉识别专用地址；留空复用上方聊天 API 地址。 */
+  visionBaseUrl?: string;
+  /** 视觉识别专用 Key；留空复用上方聊天 API Key。 */
+  visionApiKey?: string;
+  /**
+   * Live2D 模型纹理精度（最长边上限，像素；0=原始不压缩，默认 4096）。
+   * 4096 以下模型保持原图；8192 图集降采样能大幅降低显存/内存占用。
+   */
+  textureMaxSize?: number;
   /**
    * 桌宠窗口位置与尺寸：主进程在移动/缩放后写入，下次启动读回。
    * 只在窗口仍落在某个显示器工作区内时才沿用，换屏/拔屏后不会跑到看不见的地方。

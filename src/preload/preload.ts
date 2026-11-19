@@ -28,10 +28,13 @@ import {
   IPC_ASSET_PRESET,
   IPC_ASSET_REMOVE,
   IPC_ASSET_SCAN,
+  IPC_ATTACHMENT_STAGE,
+  IPC_MEDIA_CHECK,
   IPC_CHAT_CONTEXT_RESET,
   IPC_CHAT_HISTORY_CLEAR,
   IPC_CHAT_LOG_APPEND,
   IPC_CHAT_LOG_GET,
+  IPC_CHAT_MEDIA,
   IPC_CHAT_SESSION_NEW,
   IPC_CHAT_SESSION_SELECT,
   IPC_CHAT_WINDOW_CLOSE,
@@ -40,6 +43,8 @@ import {
   IPC_CHAT_WINDOW_STATE,
   IPC_CHAT_WINDOW_VOICE_STRIP,
   IPC_CONTEXT_MENU,
+  IPC_DSH_RESET_SESSION,
+  IPC_DSH_STATUS,
   IPC_GLOBAL_CURSOR,
   IPC_HIT_PROBE,
   IPC_HIT_RESULT,
@@ -96,7 +101,11 @@ import type {
   PetEventType,
   ChatLogEntry, AutoTaskRound,
   ChatLogSnapshot,
+  ChatMediaPayload,
   ChatWindowResult,
+  AttachmentRef,
+  MediaCheckResult,
+  DshStatus,
   TodoDto,
   TtsAudioPayload,
   TtsVoiceListResult,
@@ -134,8 +143,8 @@ const api: ElectronAPI = {
     return ipcRenderer.invoke(IPC_LOAD_MODEL, modelName);
   },
 
-  sendMessage(text: string): Promise<{ ok: boolean }> {
-    return ipcRenderer.invoke(IPC_SEND_MESSAGE, text);
+  sendMessage(text: string, attachments?: AttachmentRef[]): Promise<{ ok: boolean }> {
+    return ipcRenderer.invoke(IPC_SEND_MESSAGE, { text, attachments });
   },
 
   onWindowChange(cb: (info: WindowInfo | null) => void): () => void {
@@ -164,6 +173,26 @@ const api: ElectronAPI = {
   /** 立即手动检查一次更新（会联网；忽略"启动时检查更新"开关）。 */
   checkForUpdates(): Promise<UpdateSnapshot> {
     return ipcRenderer.invoke(IPC_UPDATE_CHECK);
+  },
+  /** 读取本机 DSH 桥接状态（检测 dsh 命令/版本；不发起对话）。 */
+  getDshStatus(): Promise<DshStatus> {
+    return ipcRenderer.invoke(IPC_DSH_STATUS);
+  },
+  /** 重置 DSH 会话（清掉本地 session id；下一条消息新开会话）。 */
+  resetDshSession(): Promise<void> {
+    return ipcRenderer.invoke(IPC_DSH_RESET_SESSION);
+  },
+  /** 发送前检查附件兼容性（不发起对话）。 */
+  checkMedia(attachments: AttachmentRef[]): Promise<MediaCheckResult> {
+    return ipcRenderer.invoke(IPC_MEDIA_CHECK, attachments);
+  },
+  /** 附件暂存：渲染层字节（剪贴板图片等）→ userData/uploads，返回本地路径。 */
+  stageAttachment(data: ArrayBuffer, name: string, mime: string): Promise<{ ok: boolean; path?: string; error?: string }> {
+    return ipcRenderer.invoke(IPC_ATTACHMENT_STAGE, { data, name, mime });
+  },
+  /** 订阅 AI 回发媒体（图片/音频/文件卡片）。 */
+  onChatMedia(cb: (payload: ChatMediaPayload) => void): () => void {
+    return subscribeChannel<ChatMediaPayload>(IPC_CHAT_MEDIA, cb);
   },
   /** 订阅更新检测状态推送（主进程每次检查后推送）。 */
   onUpdateStatus(cb: (snapshot: UpdateSnapshot) => void): () => void {
@@ -206,9 +235,9 @@ const api: ElectronAPI = {
     return ipcRenderer.invoke(IPC_OPEN_EXTERNAL, url);
   },
 
-  /** 拉取服务端可用 AI 模型列表（设置页的模型选择用）。 */
-  aiModelList() {
-    return ipcRenderer.invoke(IPC_AI_MODEL_LIST);
+  /** 拉取服务端可用 AI 模型列表（设置页的模型选择用；vision=视觉专用端点）。 */
+  aiModelList(purpose: 'chat' | 'vision' = 'chat') {
+    return ipcRenderer.invoke(IPC_AI_MODEL_LIST, purpose);
   },
 
   /** 可插拔资产（模型 / 插件）：扫描 / 打开文件夹 / 加入 / 移除。 */

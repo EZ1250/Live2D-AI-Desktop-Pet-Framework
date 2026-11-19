@@ -19,6 +19,24 @@ export const tool_media_control: ToolDef = {
       },
     },
   };
+export const tool_send_to_user: ToolDef = {
+    type: 'function',
+    function: {
+      name: 'send_to_user',
+      description:
+        '把本地文件（图片/音频/其它文件）发给用户，聊天里会显示成卡片（图片可看、音频可播放、文件可点开）。' +
+        '只能发 userData、开发工作区或 DSH 桥接目录里的文件；单个文件 ≤15MB。' +
+        '例如："把刚才截图发给我""把这个音频发我听听"。不要用它发送你还没生成/保存的文件。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '要发送的本地文件路径（绝对路径，或相对开发工作区的路径）' },
+          caption: { type: 'string', description: '可选：随文件一起显示的说明' },
+        },
+        required: ['path'],
+      },
+    },
+  };
 export const tool_screen_capture: ToolDef = {
     type: 'function',
     function: {

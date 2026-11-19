@@ -597,7 +597,9 @@ async function sendChat(bridge: RendererBridge): Promise<void> {
   }
   if (chatSending || !input) return;
   const text = input.value.trim();
-  if (!text) return;
+  // 附件（图片/音频/文件）：即使没打字也可以只发附件；发送前已做过兼容性检查
+  const attachments = typeof getPendingAttachments === 'function' ? getPendingAttachments() : [];
+  if (!text && attachments.length === 0) return;
   chatSending = true;
   if (sendBtn) {
     sendBtn.disabled = true;
@@ -608,13 +610,18 @@ async function sendChat(bridge: RendererBridge): Promise<void> {
   input.classList.remove('is-prefilled');
   try {
     // 用户消息立即回显；AI 回复随后经 onChat → feedChatDelta 覆盖/续打同一气泡
-    showBubble(`你：${text}`, { immediate: true, ttlMs: 2000 });
-    pendingUserRow = appendChatLog('user', text);
+    const shownText = text || (attachments.length ? '📎 已发送附件' : '');
+    showBubble(`你：${text || '📎 附件'}`, { immediate: true, ttlMs: 2000 });
+    pendingUserRow = appendChatLog(
+      'user',
+      shownText,
+      attachments.length ? { media: attachments.map((att) => (typeof attachmentMeta === 'function' ? attachmentMeta(att) : undefined)).filter(Boolean) as import('../shared/contracts').ChatMediaMeta[] } : undefined,
+    );
     markUserRowSending(pendingUserRow);
     streamRowEl = null; // 新的一轮：流式行从头开始
     aiStartEmitted = false;
     emitBehavior('user_message'); // 桌宠窗口内发消息：本地触发（气泡窗发的那条由主进程转发）
-    const res = await bridge.sendMessage(text);
+    const res = await bridge.sendMessage(text, attachments);
     if (!res.ok) {
       // 契约未携带 error 字段：给出通用失败提示（空消息/主进程拒绝等）
       const why = '发送失败：消息未送达，请检查 AI 设置后重试';
@@ -622,6 +629,7 @@ async function sendChat(bridge: RendererBridge): Promise<void> {
       markUserRowFailed(pendingUserRow, '消息未送达');
       appendChatLog('error', why);
     } else {
+      if (attachments.length && typeof clearPendingAttachments === 'function') clearPendingAttachments();
       setChatTyping(true); // 已送达：显示"Pet 正在回复…"，收到第一个分片或结束时复位
     }
   } catch (err) {

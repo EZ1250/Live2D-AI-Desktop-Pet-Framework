@@ -157,6 +157,101 @@ asar 内 `renderer/index.html` → asar 内 `public/renderer/index.html` → `di
 - 设置项：`AppSettings.checkForUpdates`（默认 `true`；`false` 时启动不自动检查，手动检查仍可用）。
 - 调试：`PET_UPDATE_FAKE_LATEST=<版本>` 可伪造远端版本（仅开发态肉眼验证"有更新"UI，不参与打包逻辑）。
 
+## AI 接入方式（API / 桥接 DSH）
+
+- `AppSettings.aiMode`（`'api' | 'dsh'`，默认 `api`）二选一，设置页单选切换；选中一种时另一种配置区自动收起。
+  - `api`：直连 OpenAI 兼容 API（原有行为；支持工具/截图/思考等完整能力）。
+  - `dsh`：**桥接本机 DSH**（`dsh --profile headless --json [--session-id <id>] -`）。
+    按用户要求**只转对话**：只把用户文字经 stdin 发给 DSH、只取 `final`/`text` 事件的文本作为回复；
+    不向 DSH 传宠物工具、不传截图、不解析其工具事件。实现见 `src/main/ai/dshBridge.ts`。
+- DSH 桥接细节：
+  - 工作目录固定为 `<userData>/dsh-bridge`（**不放 AGENTS.md**；避免 headless 把桌宠项目当工作区去读规则/动文件），
+    并设 `DSH_PERMISSION_MODE=workspace-write`（只允许写 bridge 目录内，AI 才能生成文件回发给用户；
+    其它副作用仍受 DSH 自身审批策略限制）；每次对话一个子进程，串行排队，超时 120s，
+    取消/退出/新对话会杀进程树（Windows `taskkill /T /F`）。
+  - 会话续接：首次从 `session` 事件拿 `sessionId` 存到 `<userData>/dsh-bridge/session.json`，后续消息带
+    `--session-id`；「新对话/重置上下文」或设置页「重置 DSH 会话」会清空它。
+  - 失败可读：未安装（找不到 dsh）→「未检测到 dsh 命令」；超时 →「DSH 超时（Ns）」；非零退出 → 带 stderr 尾部；
+    cmd.exe 的 GBK 系统错误会按 GBK 解码显示；会话失效（unknown session 等）自动清会话并重试一次。
+  - 状态探测：`dsh -V` 缓存版本；设置页「刷新 DSH 状态」重新探测。
+  - 安全边界（评审后加固）：
+    - 会话 id 白名单 `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`：`session.json` 里的非法 id 直接忽略，
+      DSH 返回的非法 id 不落盘；避免把任意字符串拼进 Windows shell 命令行。
+    - dsh 命令路径含引号 / `%` / 控制字符 / cmd·PowerShell 元字符（& | < > ^ ' $ `）时拒绝执行
+      （状态报「路径包含不安全字符」）；
+      Windows 下 `.cmd/.bat` 用一条带引号的命令行交给 `shell:true`，`.ps1` 用 `powershell -File`，其它直接 spawn。
+    - 子进程环境会去掉密钥类变量：宠物/其它厂商前缀（`AI_*` / `OPENAI_*` / `DEEPSEEK_*` / `AZURE_*` /
+      `VOICE_*` / `MAIL_*` / `ANTHROPIC_*` / `GEMINI_*` / `GOOGLE_*` / `GROQ_*` / `COHERE_*` /
+      `HUGGINGFACE_*` / `HF_*`）以及含 `API_KEY`/`SECRET`/`TOKEN`/`PASSWORD`/`CREDENTIAL`/`AUTH` 的变量；
+      `DSH_*` 与系统变量保留。并设 `DSH_PERMISSION_MODE=workspace-write`——写入范围仅 bridge 目录
+      （实测 read-only 下写文件会被 DSH 沙箱拒绝；改成 workspace-write 后 DSH 只能写 bridge 目录，AI 回发文件靠它）。
+    - 取消/重置会递增"代际号"：旧子进程的回调（text/close/error）按代际丢弃，不会把旧回复覆盖到新状态；
+      队列串行、`final`/`text` 都为空时报「DSH 未返回内容」。
+    - NDJSON 解析容错：BOM、CRLF、跨 chunk 半行、非法行都跳过不炸流。
+- IPC 通道（契约常量见 `contracts.ts`）：
+  - `IPC_DSH_STATUS`（`dsh:status`，invoke）→ `DshStatus { available, commandPath, version, bridgeDir, busy, lastError }`
+  - `IPC_DSH_RESET_SESSION`（`dsh:reset-session`，invoke）→ `void`（清本地会话）
+- 调试钩子：`PET_DSH_CMD` 覆盖 dsh 路径、`PET_DSH_TIMEOUT_MS` 覆盖超时、`PET_DSH_BRIDGE_DIR` 覆盖桥接目录、
+  `PET_USER_DATA_DIR` 指到独立 userData（自动化测试用；单实例锁也会隔离）。
+  **打包版默认忽略这些钩子**（避免本机环境变量改命令/目录），自动化需显式 `PET_ALLOW_DEBUG_HOOKS=1`。
+- 设置页「模型 / 插件」资产列表：模型名**完整显示**（允许换行，不再省略号截断），徽章/按钮自动换行。
+
+
+## 聊天附件（图片 / 音频 / 文件）与 AI 回发媒体
+
+- 用户→AI（两种接入方式都支持）：聊天输入支持 **📎 选择文件 / 拖拽 / 粘贴图片**；发送前显示附件 chips，
+  并先做**兼容性检查**（`IPC_MEDIA_CHECK`）：兼容 → 放行；需要转换 → 自动转换并提示；不支持 → 红框 + 可读提示。
+  - API 模式：图片 → 若聊天模型本身是视觉模型则直接发；否则先用「视觉模型」（`AppSettings.visionModel`）
+    描述/OCR，把结果作为文字注入对话。视觉模型怎么定：有 /models 列表时**自动从端点模型列表里挑**视觉模型
+    （优先名字带 vl/vision，排除 realtime/audio/tts/asr/embedding 等；缓存 10 分钟）；列表里没有视觉模型时直接判
+    「不支持」并提示替代方案（换支持图片的模型 / 手填视觉模型 / 改用桥接 DSH）；/models 拉不到时才乐观兜底
+    `qwen3-vl-plus`（发送失败给可读错误）。音频 → ASR 转写（`voiceModel`，voice* 留空复用聊天 API）。
+    - 视觉识别也支持独立配置：`visionModel` / `visionRoute`（`auto` / `chat` / `custom`）/
+      `visionBaseUrl` / `visionApiKey`；地址/Key 留空复用聊天 API。`auto` 优先聊天模型直读、否则用显式视觉模型或
+      从 `/models` 自动挑；`chat` 强制聊天模型；`custom` 只用显式视觉模型。
+    文本文件 → 内联（≤2 万字符）。其它文件 → 本地路径 + 提示模型用工具读取。
+  - DSH 模式：图片复制到 `<userData>/dsh-bridge/inbox/`，任务里给路径并让 DSH 用 `read_image` 查看
+    （实测 DSH headless 支持）；音频 → ASR；文本 → 内联+路径；其它文件 → 路径。
+  - 限制：单条消息最多 6 个附件；图片 ≤12MB、音频 ≤20MB、其它 ≤25MB。
+- AI→用户（两种接入方式都支持）：
+  - API 模式：新增工具 `send_to_user`（`path`/`caption`）→ 主进程校验收窄白名单（chat-media / uploads /
+    dsh-bridge/outbox / 开发工作区，realpath 校验、拒绝配置密钥与可执行文件）与 ≤15MB → 推 `IPC_CHAT_MEDIA`，
+    聊天里显示图片缩略图 / 音频播放器 / 文件卡（可点「打开」）。
+  - DSH 模式：任务文本约定「需要发给用户的文件写到当前目录并用 `[[send:相对路径]]` 标注」；
+    final 文本解析标记、校验在 bridge 目录内、复制到 `<userData>/chat-media/` 后推送卡片；回复文本去掉标记。
+  - 聊天记录持久化 `ChatLogEntry.media`（只存元数据，不存 base64）；历史对话里媒体显示为文件卡（点开用系统程序）。
+- 安全：附件路径只来自用户显式选择；AI 回发路径必须落在白名单目录；大小/数量受限；不执行任何命令；
+  渲染层拿不到文件内容（图片/音频 base64 只在主进程→渲染层单向推送、仅当次显示）。
+  - 回发白名单（`allowedSendRoots`）：`<userData>/chat-media`、`<userData>/uploads`、
+    `<userData>/dsh-bridge/outbox`、用户设置的开发工作区；**不含 userData 根**（避免 AI 读 settings.json 等密钥文件），
+    且拒绝 `settings*/chat-log/mcp/session/token/credentials` 等配置/密钥文件名与 `.exe/.bat/.cmd/.ps1/.msi/.dll/...` 可执行扩展名。
+  - 路径校验用 `fs.realpathSync` 之后再比较目录（防符号链接/junction 指向白名单外）；
+    只接受普通文件；单文件 ≤15MB；附件合计 ≤40MB。
+  - DSH 输出目录收敛为 `<userData>/dsh-bridge/outbox/`，`[[send:…]]` 只解析 outbox 内文件
+    （兼容 `[[send:x]]` 与 `[[send:outbox/x]]` 两种写法）；DSH 会话 id 文件移到 `<userData>/dsh-session.json`
+    （bridge 目录可写也不会被 DSH 篡改会话）。
+  - API 模式附件转述/转写拼进 prompt 的总长度上限 12000 字符（超出截断并标注），避免上下文/费用失控。
+- 调试：`PET_USER_DATA_DIR` 隔离 userData 便于自动化（打包版需 `PET_ALLOW_DEBUG_HOOKS=1`）。
+
+
+## 性能与内存（纹理降采样缓存 / idle 抑制 / 流式合并）
+
+- **Live2D 纹理降采样缓存**（`src/main/modelTextureCache.ts`）：
+  - 用户模型贴图常为 4096/8192 图集（实测 DeepSeek 6 张共 148.7M 像素 → 解压约 595MB，GPU 进程工作集 1.5GB）；
+    桌宠窗口仅 ~600px 宽，4096 贴图仍远高于显示分辨率，后台把超大图集等比缩到 `textureMaxSize`（默认 4096）并缓存到
+    `<userData>/live2d-cache/<maxSize>/<模型>/…`；静态服务对 `/user-models/<模型>/…` 优先返回缓存文件（原文件不动）。
+  - 设置项 `AppSettings.textureMaxSize`：`0`=原始、`1024`/`2048`/`4096`(默认)；改设置自动换缓存目录重建。
+  - 防抖：模型加载后**停留 20s 才构建**且只构建最后一个模型，避免快速切模型/刚启动时后台解码拖慢切换；
+    `meta.json` 记录源文件 mtime/size，源文件或设置变化才重建；WebP/GIF 不降采样（避免扩展名/MIME 不符）。
+  - 实测（DeepSeek 模型，笔记本）：GPU 进程工作集 **1529MB → 365MB**、renderer **575MB → 223MB**、
+    总工作集合 **2289MB → 792MB（约 -65%）**；切模型 DeepSeek **2436ms → 751ms**、神宫白子 **2436ms → 346ms**。
+- **流式增量合并**：`chatClient.onChunk` 在 main 侧缓冲，每 **16ms（≈一帧）** 合并成一次 `IPC_AI_CHUNK` 再推给渲染层；
+  `onDone/onError` 前强制 flush 保证顺序。逐字显示效果不变，IPC/DOM 更新次数显著减少。
+- **VTS 空闲抑制**：VTS 启用但未连接/未授权时不再每 33ms 发追踪帧（原来主进程只会丢弃）；每 5s 探测一次连接状态，
+  连上后自动恢复 30fps 推送。
+- 已有优化继续保留：RAF 主循环 60fps 上限 + 空闲 24fps + 页面隐藏暂停；窗口不可见暂停；媒体 base64 限制；
+  聊天记录 DOM 行数上限；模型切换时销毁旧 PIXI 上下文（实测切换不泄漏）。
+
 ## 第三方资源授权
 
 模型、角色资料、Live2D 运行库等第三方资源的授权**不由 MIT 覆盖**；发布前须逐项核验来源、
