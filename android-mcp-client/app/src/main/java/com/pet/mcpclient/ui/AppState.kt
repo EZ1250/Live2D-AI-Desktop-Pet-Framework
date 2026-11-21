@@ -12,6 +12,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Base64
 import kotlinx.coroutines.CancellationException
@@ -19,8 +20,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.min
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.pet.mcpclient.data.AvatarOptions
+import com.pet.mcpclient.data.CastStreamClient
 import com.pet.mcpclient.data.McpClient
 import com.pet.mcpclient.data.McpException
 import com.pet.mcpclient.data.ServerConfig
@@ -52,13 +59,44 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var chatElapsedSec by mutableStateOf(0)
         private set
-    var avatar by mutableStateOf<ImageBitmap?>(null)
+    /**
+     * 头像当前帧：普通引用 + 帧号。Compose 在 **draw 阶段**读这两者，只重绘头像区域，
+     * 不再每帧重组整个对话页（旧实现每帧 `avatar = ImageBitmap` 会触发整页重组，是卡顿主因之一）。
+     */
+    @Volatile
+    var currentAvatarBitmap: Bitmap? = null
         private set
+    var avatarSeq by mutableStateOf(0)
+        private set
+    var avatarHasFrame by mutableStateOf(false)
+        private set
+    /** 头像清晰度预设：sharp(清晰) / balanced(均衡) / smooth(流畅) / data(省流) */
+    var avatarQuality by mutableStateOf(prefs.getString("avatarQualityV4", "transparent") ?: "transparent")
+        private set
+    /** 打开对话页时自动显示桌宠（默认开启） */
+    var autoAvatarOnChat by mutableStateOf(prefs.getBoolean("autoAvatarOnChat", true))
+        private set
+    /** 对话页头像球大小（dp）：源窗口约 711px，大球 260dp≈715px 可接近 1:1 显示 */
+    var avatarBallSizeDp by mutableStateOf(prefs.getInt("avatarBallSizeDpV2", 210))
+        private set
+
+    /** 投屏点击后若电脑焦点是输入框，自动弹手机输入法 */
+    var castKeyboardWanted by mutableStateOf(false)
+        private set
+    /** 当前头像是否透明 PNG（决定磨砂球背景；JPEG 黑底时用深色球） */
+    val avatarTransparent: Boolean get() = avatarQuality == "transparent"
+
     var pendingConfirm by mutableStateOf<PhoneConfirm?>(null)
         private set
     var avatarOn by mutableStateOf(false)
         private set
-    var castImage by mutableStateOf<ImageBitmap?>(null)
+    /** 投屏当前帧：draw 阶段读取 + 帧号，避免每帧重组整个页面 */
+    @Volatile
+    var currentCastBitmap: Bitmap? = null
+        private set
+    var castSeq by mutableStateOf(0)
+        private set
+    var castHasFrame by mutableStateOf(false)
         private set
     var castOn by mutableStateOf(false)
         private set
@@ -68,11 +106,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var comboBusy by mutableStateOf(false)
         private set
-    private var castJob: Job? = null
     private var castLastErrorAt = 0L
-    /** 头像解码标志/时间戳在 OkHttp 回调线程与默认调度器之间共享，必须保证可见性 */
-    @Volatile
-    private var avatarDecoding = false
+    private var castMouseErrorAt = 0L
+    private val castDecoder = AvatarFrameDecoder()
+    private val castDecoding = AtomicBoolean(false)
+    private val castPendingBytes = AtomicReference<ByteArray?>(null)
+    private var castClient: CastStreamClient? = null
+    private var castStreamJob: Job? = null
+    private var castFrameIdleAt = 0L
+    /** 解码只允许一个协程：CAS 原子标志 + “只保留最新一帧”的待解码队列（避免解码期间帧全丢） */
+    private val avatarDecoding = AtomicBoolean(false)
+    private val avatarPendingBytes = AtomicReference<ByteArray?>(null)
     @Volatile
     private var lastAvatarAt = 0L
     private var avatarDecodeFailures = 0
@@ -80,6 +124,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var avatarRetryCount = 0
     private var avatarRetryAt = 0L
     private var avatarWatchJob: Job? = null
+    private var avatarAutoStarted = false
+    private var appForeground = true
+    private val avatarDecoder = AvatarFrameDecoder()
+    /** 旧版电脑端没有 binary/trim 能力：自动退回 320px/PNG/20fps 兼容模式 */
+    private var legacyAvatarServer = false
+    private var decodeEmaMs = 0.0
+    private var decodeSlowStreak = 0
+    private var lastQualityDownAt = 0L
     private var wsRecoveryJob: Job? = null
     private var phonePollJob: Job? = null
     var host by mutableStateOf(prefs.getString("host", "") ?: "")
@@ -133,6 +185,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 registerPhoneTools()
                 startPhonePolling()
                 startWsRecovery()
+                // 若在对话页里点「重连/连接」，连上后立即补显示桌宠
+                if (page == AppPage.CHAT && autoAvatarOnChat && appForeground && !avatarOn) startAvatar(auto = true)
+                if (page == AppPage.CAST && appForeground && !castOn) startCast()
             } catch (e: Exception) {
                 error = (e as? McpException)?.message ?: "连接失败：${e.message ?: "未知错误"}"
                 log("连接失败：${e.message}")
@@ -159,7 +214,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 if (!upgraded) continue
                 channel = client.channel
                 installPhoneNotifications()
-                if (avatarOn) runCatching { client.avatarStart(220) }
+                if (avatarOn) runCatching { requestAvatarStart() }
+                else if (page == AppPage.CHAT && autoAvatarOnChat && appForeground) startAvatar(auto = true)
                 log("WS 通知通道已恢复（${client.channel}）")
             }
         }
@@ -177,35 +233,226 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         return@setNotificationListener
                     }
                     if (method == "pet/avatarFrame") {
-                        // 解码跟不上时直接丢帧；解码结束必须在 finally 里复位，否则一次异常后永久卡死
-                        if (avatarDecoding) return@setNotificationListener
-                        val data = params["data"]?.jsonPrimitive?.content ?: return@setNotificationListener
-                        avatarDecoding = true
-                        viewModelScope.launch(Dispatchers.Default) {
-                            try {
-                                val bytes = Base64.decode(data, Base64.DEFAULT)
-                                val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return@launch
-                                lastAvatarAt = System.currentTimeMillis()
-                                avatarRetryCount = 0
-                                avatarRetryAt = 0L
-                                avatarDecodeFailures = 0
-                                val now = System.currentTimeMillis()
-                                // 限制 UI 更新节奏（~20fps），避免解码/重组过快造成手机端卡顿
-                                if (now - lastAvatarAcceptedAt >= 50) {
-                                    lastAvatarAcceptedAt = now
-                                    avatar = bmp.asImageBitmap()
-                                }
-                                lastAvatarAt = System.currentTimeMillis()
-                            } catch (e: Exception) {
-                                if (e is CancellationException) throw e
-                                avatarDecodeFailures += 1
-                                if (avatarDecodeFailures == 10) log("头像帧连续解码失败 10 次")
-                            } finally {
-                                avatarDecoding = false
-                            }
-                        }
+                        // 旧服务端兼容：JSON + base64（新服务端 binary=true 时不会走这里）
+                        val bytes = params["data"]?.jsonPrimitive?.content
+                            ?.let { runCatching { Base64.decode(it, Base64.DEFAULT) }.getOrNull() }
+                            ?: return@setNotificationListener
+                        decodeAvatarBytes(bytes)
                     }
                 }
+        // WS 二进制帧（新协议）：图片原始字节，直接解码
+        client.setBinaryFrameListener { bytes -> decodeAvatarBytes(bytes) }
+    }
+
+    /**
+     * 接收一帧头像：只保留最新一帧待解码（解码慢时丢旧帧，不积压延迟）。
+     * 解码在 Default 单协程串行执行；bitmap 只在 Main 线程发布。
+     */
+    private fun decodeAvatarBytes(bytes: ByteArray) {
+        if (!avatarOn || bytes.isEmpty()) return
+        avatarPendingBytes.set(bytes)
+        if (!avatarDecoding.compareAndSet(false, true)) return
+        viewModelScope.launch(Dispatchers.Default) {
+            try {
+                while (avatarOn) {
+                    val data = avatarPendingBytes.getAndSet(null) ?: break
+                    decodeAndPublish(data)
+                }
+            } finally {
+                avatarDecoding.set(false)
+            }
+        }
+    }
+
+    private suspend fun decodeAndPublish(bytes: ByteArray) {
+        val t0 = System.nanoTime()
+        try {
+            val bmp = avatarDecoder.decode(bytes)
+            if (bmp == null) {
+                avatarDecodeFailures += 1
+                if (avatarDecodeFailures == 10) log("头像帧连续解码失败 10 次")
+                return
+            }
+            val decodeMs = (System.nanoTime() - t0) / 1_000_000.0
+            lastAvatarAt = System.currentTimeMillis()
+            avatarRetryCount = 0
+            avatarRetryAt = 0L
+            avatarDecodeFailures = 0
+            withContext(Dispatchers.Main) {
+                if (!avatarOn) return@withContext
+                currentAvatarBitmap = bmp
+                avatarHasFrame = true
+                avatarSeq += 1
+                lastAvatarAcceptedAt = System.currentTimeMillis()
+                decodeEmaMs = if (decodeEmaMs <= 0.0) decodeMs else decodeEmaMs * 0.8 + decodeMs * 0.2
+                if (decodeEmaMs > 35.0) decodeSlowStreak += 1 else decodeSlowStreak = 0
+                if (decodeSlowStreak >= 12) {
+                    decodeSlowStreak = 0
+                    stepDownAvatarQuality()
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: OutOfMemoryError) {
+            withContext(Dispatchers.Main) {
+                log("头像解码内存不足，自动降低清晰度")
+                stepDownAvatarQuality(force = true)
+            }
+        } catch (e: Exception) {
+            avatarDecodeFailures += 1
+            if (avatarDecodeFailures == 10) log("头像帧连续解码失败：${e.message ?: "未知错误"}")
+        }
+    }
+
+    private fun avatarLabel(q: String): String = when (q) {
+        "sharp" -> "清晰"
+        "smooth" -> "流畅"
+        "data" -> "省流"
+        else -> "均衡"
+    }
+
+    /** 按清晰度预设生成请求：目标分辨率 ≥ 头像球在屏幕上的物理像素，避免“小图放大发虚”。 */
+    private fun avatarOptions(): AvatarOptions {
+        if (legacyAvatarServer) {
+            return AvatarOptions(maxWidth = 320, fps = 20, format = "png", quality = 88, binary = false, trim = false)
+        }
+        val density = getApplication<Application>().resources.displayMetrics.density
+        val ballPx = (avatarBallSizeDp.toFloat() * density).toInt().coerceAtLeast(320)
+        return when (avatarQuality) {
+            // 默认：PNG 透明（磨砂球背景可见），约 15fps；源窗口约 720px，请求不超过 540 避免放大
+            // 默认：720 JPEG 30fps，帧率稳 24+；球内用 Screen 混合去掉黑底
+            "balanced" -> AvatarOptions(maxWidth = 640, fps = 30, format = "jpeg", quality = 90, binary = true, trim = true)
+            // 可选透明 PNG（约 15fps）
+            "transparent" -> AvatarOptions(maxWidth = 540, fps = 15, format = "png", quality = 92, binary = true, trim = true)
+            "smooth" -> AvatarOptions(maxWidth = 540, fps = 30, format = "jpeg", quality = 86, binary = true, trim = true)
+            "data" -> AvatarOptions(maxWidth = 360, fps = 24, format = "jpeg", quality = 82, binary = true, trim = true)
+            else -> AvatarOptions(maxWidth = 540, fps = 15, format = "png", quality = 92, binary = true, trim = true)
+        }
+    }
+
+    /** 投屏双击：移动鼠标；返回 false 表示当前不可用 */
+    fun castMouseMove(nx: Float, ny: Float): Boolean {
+        if (!castOn) return false
+        val c = castClient ?: return false
+        viewModelScope.launch {
+            runCatching { c.moveMouse(nx.toDouble(), ny.toDouble(), 1) }
+                .onFailure { e ->
+                    if (System.currentTimeMillis() - castMouseErrorAt > 3000) {
+                        castMouseErrorAt = System.currentTimeMillis()
+                        log("鼠标移动失败：${e.message ?: "未知错误"}")
+                    }
+                }
+        }
+        return true
+    }
+
+    /** 投屏三击：左键单击；成功则查询电脑焦点，输入框自动弹手机键盘 */
+    fun castMouseClick(nx: Float, ny: Float): Boolean {
+        if (!castOn) return false
+        val c = castClient ?: return false
+        viewModelScope.launch {
+            runCatching { c.clickMouse(nx.toDouble(), ny.toDouble(), 1) }
+                .onSuccess {
+                    kotlinx.coroutines.delay(150) // 等目标应用完成焦点切换
+                    runCatching { c.isEditableFocused() }
+                        .onSuccess { editable -> if (editable) castKeyboardWanted = true }
+                }
+                .onFailure { e ->
+                    if (System.currentTimeMillis() - castMouseErrorAt > 3000) {
+                        castMouseErrorAt = System.currentTimeMillis()
+                        log("鼠标左键失败：${e.message ?: "未知错误"}")
+                    }
+                }
+        }
+        return true
+    }
+
+    /** 长按 3s：鼠标右键 */
+    fun castMouseRightClick(nx: Float, ny: Float): Boolean {
+        if (!castOn) return false
+        val c = castClient ?: return false
+        viewModelScope.launch {
+            runCatching { c.rightClickMouse(nx.toDouble(), ny.toDouble(), 1) }
+                .onFailure { e ->
+                    if (System.currentTimeMillis() - castMouseErrorAt > 3000) {
+                        castMouseErrorAt = System.currentTimeMillis()
+                        log("鼠标右键失败：${e.message ?: "未知错误"}")
+                    }
+                }
+        }
+        return true
+    }
+
+    fun consumeCastKeyboardWanted() { castKeyboardWanted = false }
+    fun requestCastKeyboard() { castKeyboardWanted = true }
+
+    fun castTypeText(text: String): Boolean {
+        if (!castOn) return false
+        val value = text
+        if (value.isBlank()) return false
+        val c = castClient ?: return false
+        viewModelScope.launch {
+            runCatching { c.typeText(value) }
+                .onFailure { e ->
+                    if (System.currentTimeMillis() - castMouseErrorAt > 3000) {
+                        castMouseErrorAt = System.currentTimeMillis()
+                        log("电脑输入失败：${e.message ?: "未知错误"}")
+                    }
+                }
+        }
+        return true
+    }
+
+    fun setAvatarBallSize(dp: Int) {
+        val value = dp.coerceIn(160, 260)
+        avatarBallSizeDp = value
+        prefs.edit().putInt("avatarBallSizeDpV2", value).apply()
+        log("头像球大小：${value}dp")
+    }
+
+    fun selectAvatarQuality(quality: String) {
+        val allowed = setOf("transparent", "balanced", "smooth", "data")
+        val next = if (quality in allowed) quality else "balanced"
+        if (next == avatarQuality) return
+        avatarQuality = next
+        prefs.edit().putString("avatarQualityV4", next).apply()
+        log("头像清晰度：${avatarLabel(next)}")
+        if (avatarOn) {
+            avatarPendingBytes.set(null)
+            if (!avatarDecoding.get()) avatarDecoder.reset()
+            viewModelScope.launch { runCatching { requestAvatarStart() } }
+        }
+    }
+
+    fun setAutoAvatarOnChatEnabled(enabled: Boolean) {
+        autoAvatarOnChat = enabled
+        prefs.edit().putBoolean("autoAvatarOnChat", enabled).apply()
+        if (enabled && page == AppPage.CHAT && connected && appForeground && !avatarOn) startAvatar(auto = true)
+        if (!enabled && avatarAutoStarted) stopAvatar()
+    }
+
+    /** 启动头像流并按回执判断电脑端新旧协议；旧端自动切兼容参数 */
+    private suspend fun requestAvatarStart() {
+        val ack = client.avatarStart(avatarOptions())
+        val supportsBinary = (ack as? JsonObject)?.get("binary")?.jsonPrimitive?.content?.toBoolean() == true
+        if (!supportsBinary && !legacyAvatarServer) {
+            legacyAvatarServer = true
+            log("电脑端版本较旧：头像流使用兼容模式（320px/20fps）；升级电脑端可解锁 720p/30fps 与透明边裁剪")
+            client.avatarStart(avatarOptions())
+        }
+    }
+
+    private fun stepDownAvatarQuality(force: Boolean = false) {
+        val order = listOf("transparent", "balanced", "smooth", "data")
+        val idx = order.indexOf(avatarQuality).coerceAtLeast(0)
+        if (idx >= order.lastIndex) return
+        val now = System.currentTimeMillis()
+        if (!force && now - lastQualityDownAt < 15_000) return
+        lastQualityDownAt = now
+        avatarQuality = order[idx + 1]
+        prefs.edit().putString("avatarQualityV4", avatarQuality).apply()
+        log("头像清晰度自动降为「${avatarLabel(avatarQuality)}」（解码/网络跟不上）")
+        viewModelScope.launch { runCatching { requestAvatarStart() } }
     }
 
     fun disconnect() {
@@ -364,7 +611,160 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }.getOrDefault(out.toString())
     }
 
-    fun openPage(page: AppPage) { this.page = page }
+    private var lastTouchMoveAt = 0L
+
+    fun touchMove(nx: Float, ny: Float) {
+        if (!connected) return
+        val now = System.currentTimeMillis()
+        if (now - lastTouchMoveAt < 70) return
+        lastTouchMoveAt = now
+        viewModelScope.launch {
+            runCatching {
+                val tool = findTool("pet_touch") ?: return@runCatching
+                client.callTool(tool, buildJsonObject {
+                    put("action", "move")
+                    put("x", nx.coerceIn(0f, 1f).toDouble())
+                    put("y", ny.coerceIn(0f, 1f).toDouble())
+                })
+            }
+        }
+    }
+
+    fun touchClick(nx: Float, ny: Float) {
+        if (!connected) return
+        viewModelScope.launch {
+            runCatching {
+                val tool = findTool("pet_touch") ?: return@runCatching
+                client.callTool(tool, buildJsonObject {
+                    put("action", "click")
+                    put("x", nx.coerceIn(0f, 1f).toDouble())
+                    put("y", ny.coerceIn(0f, 1f).toDouble())
+                })
+            }
+        }
+    }
+
+    fun toggleCast() {
+        if (castOn) stopCast() else startCast()
+    }
+
+    /** 新版投屏：独立 WS 接收 CastCap 推送的二进制 JPEG 帧（不再走手机鼠标/输入法） */
+    private fun startCast() {
+        if (castOn) return
+        castOn = true
+        castHasFrame = false
+        currentCastBitmap = null
+        castSeq = 0
+        castLastErrorAt = 0L
+        castPendingBytes.set(null)
+        castDecoding.set(false)
+        castDecoder.reset()
+        val config = ServerConfig(host.trimEnd('/'), token.trim())
+        val client = CastStreamClient(config)
+        castClient = client
+        castStreamJob = viewModelScope.launch {
+            client.onFrame = { bytes -> enqueueCastFrame(bytes) }
+            client.onError = { message ->
+                val now = System.currentTimeMillis()
+                if (now - castLastErrorAt > 3000) {
+                    castLastErrorAt = now
+                    log("投屏：$message")
+                }
+            }
+            try {
+                client.start(CastStreamClient.Options(maxWidth = 1280, fps = 24, quality = 70, display = 1))
+                castFrameIdleAt = System.currentTimeMillis()
+                while (castOn && client.alive) {
+                    delay(2000)
+                    if (System.currentTimeMillis() - castFrameIdleAt > 8000) {
+                        log("投屏超过 8 秒无帧，自动重连")
+                        client.stop()
+                        throw McpException("投屏无帧")
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (castOn) log("投屏连接失败：${e.message ?: "未知错误"}")
+                stopCast()
+            }
+        }
+    }
+
+    private fun enqueueCastFrame(bytes: ByteArray) {
+        if (!castOn || bytes.isEmpty()) return
+        castFrameIdleAt = System.currentTimeMillis()
+        castPendingBytes.set(bytes)
+        if (!castDecoding.compareAndSet(false, true)) return
+        viewModelScope.launch(Dispatchers.Default) {
+            try {
+                while (castOn) {
+                    val data = castPendingBytes.getAndSet(null) ?: break
+                    val bmp = try { castDecoder.decode(data) } catch (e: OutOfMemoryError) { null } catch (e: Exception) { null }
+                    if (bmp != null) {
+                        withContext(Dispatchers.Main) {
+                            if (castOn) {
+                                currentCastBitmap = bmp
+                                castHasFrame = true
+                                castSeq += 1
+                            }
+                        }
+                    }
+                }
+            } finally {
+                castDecoding.set(false)
+            }
+        }
+    }
+
+    fun stopCast() {
+        castOn = false
+        castKeyboardWanted = false
+        castStreamJob?.cancel()
+        castStreamJob = null
+        runCatching { castClient?.stop() }
+        castClient = null
+        castPendingBytes.set(null)
+        castDecoding.set(false)
+        castHasFrame = false
+        currentCastBitmap = null
+        castSeq = 0
+        castDecoder.reset()
+    }
+
+    fun openPage(page: AppPage) {
+        val wasChat = this.page == AppPage.CHAT
+        val wasCast = this.page == AppPage.CAST
+        this.page = page
+        if (page == AppPage.CHAT) {
+            // 打开对话页时把鼠标移到桌宠视线原点（只触发一次）
+            if (connected) viewModelScope.launch { runCatching { client.cursorToGazeOrigin() } }
+            // 进入对话页自动显示桌宠（开关可关；连接/WS 就绪后由 startAvatar 自行重试）
+            if (autoAvatarOnChat && connected && appForeground && !avatarOn) startAvatar(auto = true)
+        } else if (wasChat && avatarAutoStarted) {
+            // 离开对话页自动停止，省电省流量；手动开的头像保持手动语义
+            stopAvatar()
+        }
+        // 投屏页自动启停（24fps 流比较吃带宽，离开即停）
+        if (page == AppPage.CAST && connected && !castOn && appForeground) startCast()
+        if (wasCast && page != AppPage.CAST) {
+            stopCast()
+        }
+    }
+
+    /** Activity onResume/onStop 调用：后台暂停头像流，回前台且停在对话页时自动恢复 */
+    fun onAppForeground() {
+        appForeground = true
+        if (page == AppPage.CHAT && autoAvatarOnChat && connected && !avatarOn) startAvatar(auto = true)
+        if (page == AppPage.CAST && connected && !castOn) startCast()
+    }
+
+    fun onAppBackground() {
+        appForeground = false
+        if (avatarAutoStarted) stopAvatar()
+        // 投屏 24fps 很耗流量/电量：后台立即停，回前台若仍在投屏页再恢复
+        if (castOn) stopCast()
+    }
 
     fun sendChat(text: String) {
         val msg = text.trim()
@@ -469,11 +869,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun toggleAvatar() {
-        if (avatarOn) stopAvatar() else startAvatar()
+        if (avatarOn) {
+            stopAvatar()
+        } else {
+            avatarAutoStarted = false
+            startAvatar(auto = false)
+        }
     }
 
-    private fun startAvatar() {
-        if (!connected) return
+    private fun startAvatar(auto: Boolean = false) {
+        if (!connected || avatarOn) return
+        avatarAutoStarted = auto
+        avatarHasFrame = false
+        currentAvatarBitmap = null
+        avatarSeq += 1
+        if (!avatarDecoding.get()) avatarDecoder.reset()
+        avatarPendingBytes.set(null)
+        avatarDecodeFailures = 0
+        decodeEmaMs = 0.0
+        decodeSlowStreak = 0
         lastAvatarAt = System.currentTimeMillis()
         avatarOn = true
         avatarWatchJob?.cancel()
@@ -488,19 +902,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     avatarRetryAt = now + 5000
                     continue
                 }
-                if (avatarRetryCount >= 6) {
+                if (avatarRetryCount >= 8) {
                     log("头像流多次无帧，停止自动重试（可手动关闭再开启）")
                     avatarOn = false
                     break
                 }
                 avatarRetryCount += 1
                 avatarRetryAt = now + (2000L shl (avatarRetryCount - 1).coerceAtMost(4))
-                runCatching { client.avatarStart(220) }
+                runCatching { requestAvatarStart() }
             }
         }
         viewModelScope.launch {
             try {
-                client.avatarStart(220)
+                requestAvatarStart()
             } catch (e: Exception) {
                 avatarOn = false
                 log("头像流启动失败：${e.message}")
@@ -517,82 +931,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun stopAvatar() {
         if (!avatarOn) return
         avatarOn = false
+        avatarAutoStarted = false
         avatarWatchJob?.cancel()
         avatarWatchJob = null
+        currentAvatarBitmap = null
+        avatarHasFrame = false
+        avatarSeq += 1
+        // 解码协程可能还在用旧 buffer：进行中先不 recycle，等下次启动再复位
+        avatarPendingBytes.set(null)
+        if (!avatarDecoding.get()) avatarDecoder.reset()
         viewModelScope.launch { runCatching { client.avatarStop() } }
-    }
-
-    private var lastTouchMoveAt = 0L
-
-    fun touchMove(nx: Float, ny: Float) {
-        if (!connected) return
-        val now = System.currentTimeMillis()
-        if (now - lastTouchMoveAt < 70) return
-        lastTouchMoveAt = now
-        viewModelScope.launch {
-            runCatching {
-                val tool = findTool("pet_touch") ?: return@runCatching
-                client.callTool(tool, buildJsonObject {
-                    put("action", "move")
-                    put("x", nx.coerceIn(0f, 1f).toDouble())
-                    put("y", ny.coerceIn(0f, 1f).toDouble())
-                })
-            }
-        }
-    }
-
-    fun touchClick(nx: Float, ny: Float) {
-        if (!connected) return
-        viewModelScope.launch {
-            runCatching {
-                val tool = findTool("pet_touch") ?: return@runCatching
-                val out = client.callTool(tool, buildJsonObject {
-                    put("action", "click")
-                    put("x", nx.coerceIn(0f, 1f).toDouble())
-                    put("y", ny.coerceIn(0f, 1f).toDouble())
-                })
-                chatLines = chatLines + ChatLine("system", resultText(out))
-            }.onFailure { chatLines = chatLines + ChatLine("system", "点击失败：${it.message ?: "未知错误"}") }
-        }
-    }
-
-    fun toggleCast() {
-        if (castOn) stopCast() else startCast()
-    }
-
-    private fun startCast() {
-        if (!connected) return
-        castOn = true
-        castJob = viewModelScope.launch {
-            while (castOn) {
-                try {
-                    val tool = findTool("pet_screenshot")
-                    if (tool != null) {
-                        val out = client.callTool(tool, buildJsonObject {})
-                        val data = runCatching { out.jsonObject["content"]?.jsonArray?.firstOrNull()?.jsonObject?.get("data")?.jsonPrimitive?.content }.getOrNull()
-                        if (data != null) {
-                            val bytes = Base64.decode(data, Base64.DEFAULT)
-                            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                            if (bmp != null) castImage = bmp.asImageBitmap()
-                        }
-                    }
-                } catch (e: Exception) {
-                    if (e is CancellationException) throw e
-                    // 投屏持续失败（多半是断线）：限频记一次，避免无声空转
-                    if (System.currentTimeMillis() - castLastErrorAt > 5000) {
-                        castLastErrorAt = System.currentTimeMillis()
-                        log("投屏帧失败：${e.message ?: "未知错误"}")
-                    }
-                }
-                delay(1000)
-            }
-        }
-    }
-
-    fun stopCast() {
-        castOn = false
-        castJob?.cancel()
-        castJob = null
     }
 
     fun toggleComboTool(name: String) {

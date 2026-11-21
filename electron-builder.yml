@@ -9,6 +9,7 @@
 
 appId: com.pet.desktop
 productName: Pet
+icon: local-assets/pet-icon.ico
 
 # 打包完成后给 Pet.exe 翻 Electron fuses（关掉 ELECTRON_RUN_AS_NODE / --inspect / NODE_OPTIONS，
 # 并强制只从 app.asar 加载应用代码）。见 scripts/after-pack.js 的注释与失败策略。
@@ -57,6 +58,12 @@ extraResources:
     to: THIRD_PARTY_NOTICES.md
   # 桌面快捷方式用的 .ico（signAndEditExecutable=false 时 exe 内嵌图标不会被改写，
   # 所以快捷方式图标单独引用这个文件；托盘/窗口图标走 assets/tray-icon.png）
+  # 手机投屏原生抓屏助手（.NET GDI，详见 src/main/ai/castCapture.ts）
+  - from: local-assets/cast-cap
+    to: cast-cap
+  # 手机投屏鼠标控制助手（SetCursorPos/mouse_event）
+  - from: local-assets/mouse-helper
+    to: mouse-helper
   - from: local-assets/pet-icon.ico
     to: pet-icon.ico
 
@@ -73,9 +80,12 @@ win:
     - en-US
   # 无代码签名证书；跳过 exe 资源编辑/签名以规避 winCodeSign 符号链接权限问题
   # （Windows 下 rcedit 由 app-builder 内建执行，本开关仅跳过签名相关步骤）
-  signAndEditExecutable: false
+  signAndEditExecutable: true
 
 nsis:
+  installerIcon: local-assets/pet-icon.ico
+  uninstallerIcon: local-assets/pet-icon.ico
+  installerHeaderIcon: local-assets/pet-icon.ico
   # 一键安装会给用户装到 AppData 且不问路径；这里让用户能选目录、建桌面快捷方式
   oneClick: false
   perMachine: false

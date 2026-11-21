@@ -11,7 +11,7 @@ HTTP + WebSocket 双通道，所有调用带超时；手机原生能力可反向
 | PC 端 `/ws`（自实现 RFC6455 子集） | ✅ 能用：握手/mask/文本帧/ping-pong/close；**不支持分片/续帧**（文本 JSON-RPC 用单帧） |
 | PC 端 `phone/register|unregister|poll|result` | ✅ 已完成；30s 超时 fail-closed，超时调用会从队列摘除 |
 | PC 端 `pet/confirmRequest` → 手机 `pet/confirmReply` | ✅ 已完成；socket 断开/dispose 时按 disconnect 结算 |
-| Android 客户端源码 | ✅ 已实现：4 屏 Compose UI、双通道、动态工具列表、超时/错误提示、手机工具注册与执行循环、头像流、投屏 |
+| Android 客户端源码 | ✅ 已实现：Compose UI、双通道、动态工具列表、超时/错误提示、手机工具注册与执行循环、头像流 v2（二进制帧/自适应清晰度/对话页自动显示）、投屏 |
 | Android 客户端验证 | ❌ **未接真机**；无 Gradle wrapper，需 Android Studio 生成后构建；APK 不纳入版本库 |
 | 自动化测试 | PC 侧有 `tests/mcpServer*.test.js`；Android 侧无自动化测试 |
 
@@ -87,4 +87,5 @@ HTTP + WebSocket 双通道，所有调用带超时；手机原生能力可反向
 6. 设置页点「注册手机工具」后，PC `/mcp` 里工具数 +N，`tools/list` 出现 `phone_*`；
    PC 侧调用 `phone_battery` 能在手机上执行并回执。
 7. 断网/关闭 PC 服务：手机显示可读错误，恢复后自动重连。
-8. 头像流：点头像后画面同步；断线恢复后自动重开。
+8. **投屏交互（v0.4.4）**：双指缩放/平移、横屏、真全屏；双击移动、三击左键、放大后长按1s拖动取景、长按3s右键；点击输入框自动弹手机输入法注入文字。打开对话页时自动把电脑鼠标移到桌宠视线原点；手机触屏不再覆盖视线。
+9. 头像流：点头像或打开对话页（默认自动）画面同步；设置页可切换清晰度；断线恢复后自动重开；后台自动暂停。

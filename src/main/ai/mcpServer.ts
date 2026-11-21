@@ -27,8 +27,26 @@ export interface PetMcpServerDeps {
   /** 只读资源清单与读取（pet://…） */
   resourceList(): Array<{ uri: string; name: string; description?: string }>;
   resourceRead(uri: string): string | null;
-  /** 抓一帧桌宠窗口（手机 Live2D 头像用），返回 PNG base64 */
-  avatarFrame?(maxWidth?: number): Promise<{ data: string; width: number; height: number }>;
+  /** 抓一帧桌宠窗口（手机 Live2D 头像用）；可配置分辨率/格式/质量/透明边裁剪 */
+  avatarFrame?(opts: AvatarFrameOptions): Promise<AvatarFrameResult>;
+  /** 抓一帧电脑屏幕（手机投屏流用）；JPEG，不落盘，支持 maxWidth/quality/display */
+  castFrame?(opts: CastFrameOptions): Promise<AvatarFrameResult>;
+  /** 启动 renderer 持续抓屏（getDisplayMedia），帧通过 main 的 pushCastFrame 广播 */
+  startCastCapture?(opts: CastStreamOptions): Promise<boolean>;
+  /** 停止 renderer 抓屏 */
+  stopCastCapture?(): void;
+  /** 手机投屏双击：移动鼠标到屏幕归一化坐标 0~1 */
+  mouseMove?(x: number, y: number, display: number): Promise<string>;
+  /** 手机投屏三击：移动鼠标并左键单击 */
+  mouseClick?(x: number, y: number, display: number): Promise<string>;
+  /** 手机投屏长按 3s：鼠标右键 */
+  mouseRightClick?(x: number, y: number, display: number): Promise<string>;
+  /** 当前焦点是否可输入（手机投屏自动弹输入法） */
+  isEditableFocused?(): Promise<boolean>;
+  /** 向电脑当前焦点输入文本（手机输入法代替电脑键盘） */
+  typeText?(text: string): Promise<string>;
+  /** 手机打开对话页：把电脑鼠标移到桌宠视线原点 */
+  cursorToGazeOrigin?(): Promise<string>;
   /** 手机触摸：action=move/click，x/y 为桌宠窗口内归一化坐标 0..1 */
   touch?(action: 'move' | 'click', x: number, y: number): Promise<string>;
   /** 电脑端聊天历史：无 sessionId 时返回会话列表，否则返回该会话消息（JSON 文本） */
@@ -37,6 +55,43 @@ export interface PetMcpServerDeps {
   chatDetail?(prompt: string): Promise<{ reply: string; thinking: string }>;
   /** 任意一次 MCP 工具调用（含手机工具）成功后通知主进程，用于触发"行为触发 → MCP 调用" */
   onToolCall?(name: string): void;
+}
+
+/** 头像抓帧参数（手机端头像流可配置；旧客户端不传时用默认值） */
+export interface AvatarFrameOptions {
+  maxWidth: number;
+  /** png 保留透明（清晰优先）；jpeg 体积小、适合高帧率（透明区为黑底） */
+  format: 'png' | 'jpeg';
+  /** JPEG 质量 40~95 */
+  quality: number;
+  /** 是否按透明像素裁剪掉四周空白（默认 true） */
+  trim: boolean;
+}
+
+export interface AvatarFrameResult {
+  buffer: Buffer;
+  width: number;
+  height: number;
+  format: 'png' | 'jpeg';
+  bytes: number;
+}
+
+export interface CastFrameOptions {
+  maxWidth: number;
+  quality: number;
+  display: number;
+}
+
+export interface CastStreamOptions extends CastFrameOptions {
+  fps: number;
+  binary: boolean;
+}
+
+export interface AvatarStreamOptions extends AvatarFrameOptions {
+  /** 目标帧率 1~30（服务端会按处理耗时自动跳帧） */
+  fps: number;
+  /** true：用 WS 二进制帧（图片原始字节）推流；false：JSON+base64（兼容旧客户端） */
+  binary: boolean;
 }
 
 export interface PetMcpServerOptions {
@@ -149,7 +204,7 @@ const TOOL_DEFS = [
   },
   {
     name: 'pet_avatar',
-    description: '抓取当前桌宠窗口的一帧画面（手机端 Live2D 头像用）。maxWidth 可选（120~640）。',
+    description: '抓取当前桌宠窗口的一帧画面（手机端 Live2D 头像用）。maxWidth 可选（120~1024）。',
     inputSchema: { type: 'object', properties: { maxWidth: { type: 'number' } } },
     annotations: { readOnlyHint: true, timeoutMs: 15_000 },
   },
@@ -228,7 +283,11 @@ export class PetMcpServer {
   private started = false;
   private readonly opts: PetMcpServerOptions;
   private readonly wsSockets = new Set<Duplex>();
-  private readonly wsAvatarTimers = new Map<Duplex, { timer: NodeJS.Timeout | null; busy: boolean }>();
+  private readonly wsAvatarTimers = new Map<Duplex, { timer: NodeJS.Timeout | null }>();
+    /** 投屏订阅者：socket → 参数；帧由 renderer 持续推来，main 调 pushCastFrame 广播 */
+  private readonly castWatchers = new Map<Duplex, CastStreamOptions>();
+  private castFrameFailures = 0;
+  private castWarnAt = 0;
   /** 手机确认请求：id → resolve；socket 断开/超时会自动清算 */
   private readonly pendingConfirms = new Map<string, { resolve: (choice: string) => void; timer: NodeJS.Timeout }>();
   private confirmSeq = 0;
@@ -398,9 +457,10 @@ export class PetMcpServer {
     this.server = null;
     this.started = false;
     for (const state of this.wsAvatarTimers.values()) {
-      if (state.timer) clearInterval(state.timer);
+      if (state.timer) clearTimeout(state.timer);
     }
     this.wsAvatarTimers.clear();
+    this.castWatchers.clear();
     for (const socket of this.wsSockets) {
       try { socket.destroy(); } catch { /* ignore */ }
     }
@@ -524,12 +584,14 @@ export class PetMcpServer {
       });
       socket.on('close', () => {
         this.stopAvatarStream(socket);
+        this.stopCastStream(socket);
         this.wsSockets.delete(socket);
         // 最后一个连接断开时，挂着的手机确认立即按 disconnect 结算（fail-closed）
         if (this.wsSockets.size === 0) this.settlePendingConfirms('disconnect');
       });
       socket.on('error', () => {
         this.stopAvatarStream(socket);
+        this.stopCastStream(socket);
         this.wsSockets.delete(socket);
         if (this.wsSockets.size === 0) this.settlePendingConfirms('disconnect');
       });
@@ -570,6 +632,8 @@ export class PetMcpServer {
       }
       buffer = buffer.subarray(offset + length);
       if (opcode === 0x8) {
+        this.stopAvatarStream(socket);
+        this.stopCastStream(socket);
         try { socket.end(Buffer.from([0x88, 0x00])); } catch { /* ignore */ }
         this.wsSockets.delete(socket);
         return Buffer.alloc(0);
@@ -627,11 +691,116 @@ export class PetMcpServer {
         }
         return;
       }
+      if (msg && (msg.method === 'pet/mouseMove' || msg.method === 'pet/mouseClick' || msg.method === 'pet/mouseRightClick')) {
+        const id = typeof msg.id === 'number' ? msg.id : null;
+        const params = msg.params ?? {};
+        const x = typeof params.x === 'number' ? params.x : NaN;
+        const y = typeof params.y === 'number' ? params.y : NaN;
+        const display = typeof params.display === 'number' ? Math.round(params.display) : 1;
+        if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > 1 || y < 0 || y > 1) {
+          if (id !== null) this.wsSendJson(socket, { jsonrpc: '2.0', id, error: { code: -32602, message: 'x/y 必须是 0~1' } });
+          return;
+        }
+        try {
+          const text = msg.method === 'pet/mouseMove'
+            ? await this.opts.deps.mouseMove?.(x, y, display)
+            : msg.method === 'pet/mouseRightClick'
+              ? await this.opts.deps.mouseRightClick?.(x, y, display)
+              : await this.opts.deps.mouseClick?.(x, y, display);
+          if (id !== null) this.wsSendJson(socket, { jsonrpc: '2.0', id, result: { ok: true, text: text ?? 'ok' } });
+        } catch (err) {
+          if (id !== null) this.wsSendJson(socket, { jsonrpc: '2.0', id, error: { code: -32603, message: (err as Error).message } });
+        }
+        return;
+      }
+      if (msg && (msg.method === 'pet/inputFocus' || msg.method === 'pet/typeText')) {
+        const id = typeof msg.id === 'number' ? msg.id : null;
+        try {
+          if (msg.method === 'pet/inputFocus') {
+            const editable = await this.opts.deps.isEditableFocused?.();
+            if (id !== null) this.wsSendJson(socket, { jsonrpc: '2.0', id, result: { ok: true, editable: editable === true } });
+          } else {
+            const text = typeof msg.params?.text === 'string' ? msg.params.text : '';
+            if (!text) {
+              if (id !== null) this.wsSendJson(socket, { jsonrpc: '2.0', id, error: { code: -32602, message: 'text 不能为空' } });
+              return;
+            }
+            const result = await this.opts.deps.typeText?.(text.slice(0, 4000));
+            if (id !== null) this.wsSendJson(socket, { jsonrpc: '2.0', id, result: { ok: true, text: result ?? 'ok' } });
+          }
+        } catch (err) {
+          if (id !== null) this.wsSendJson(socket, { jsonrpc: '2.0', id, error: { code: -32603, message: (err as Error).message } });
+        }
+        return;
+      }
+      if (msg && msg.method === 'pet/cursorToGazeOrigin') {
+        const id = typeof msg.id === 'number' ? msg.id : null;
+        try {
+          const text = await this.opts.deps.cursorToGazeOrigin?.();
+          if (id !== null) this.wsSendJson(socket, { jsonrpc: '2.0', id, result: { ok: true, text: text ?? 'ok' } });
+        } catch (err) {
+          if (id !== null) this.wsSendJson(socket, { jsonrpc: '2.0', id, error: { code: -32603, message: (err as Error).message } });
+        }
+        return;
+      }
+      if (msg && (msg.method === 'pet/castStart' || msg.method === 'pet/castStop')) {
+        const id = typeof msg.id === 'number' ? msg.id : null;
+        if (msg.method === 'pet/castStart') {
+          const params = msg.params ?? {};
+          const opts: CastStreamOptions = {
+            maxWidth: Math.max(320, Math.min(1920, typeof params.maxWidth === 'number' ? Math.round(params.maxWidth) : 1280)),
+            fps: Math.max(1, Math.min(30, typeof params.fps === 'number' ? Math.round(params.fps) : 24)),
+            quality: Math.max(35, Math.min(95, typeof params.quality === 'number' ? Math.round(params.quality) : 70)),
+            display: Math.max(1, Math.min(8, typeof params.display === 'number' ? Math.round(params.display) : 1)),
+            binary: params.binary !== false,
+          };
+          this.castWatchers.set(socket, opts);
+          if (this.castWatchers.size === 1) {
+            try {
+              await this.opts.deps.startCastCapture?.(opts);
+            } catch (err) {
+              this.castWatchers.delete(socket);
+              console.warn('[mcp] 投屏抓屏启动失败：', (err as Error).message);
+              if (id !== null) this.wsSendJson(socket, { jsonrpc: '2.0', id, error: { code: -32603, message: `投屏启动失败：${(err as Error).message}` } });
+              return;
+            }
+          }
+          if (id !== null) this.wsSendJson(socket, {
+            jsonrpc: '2.0',
+            id,
+            result: { ok: true, binary: opts.binary, fps: 30, maxWidth: opts.maxWidth, display: opts.display },
+          });
+          return;
+        }
+        this.removeCastWatcher(socket);
+        if (id !== null) this.wsSendJson(socket, { jsonrpc: '2.0', id, result: { ok: true } });
+        return;
+      }
       if (msg && (msg.method === 'pet/avatarStart' || msg.method === 'pet/avatarStop')) {
         const id = typeof msg.id === 'number' ? msg.id : null;
         if (msg.method === 'pet/avatarStart') {
-          const raw = typeof msg.params?.maxWidth === 'number' ? Math.round(msg.params.maxWidth) : 300;
-          this.startAvatarStream(socket, Math.max(120, Math.min(640, raw)));
+          const params = msg.params ?? {};
+          const rawWidth = typeof params.maxWidth === 'number' ? Math.round(params.maxWidth) : 300;
+          const rawFps = typeof params.fps === 'number' ? Math.round(params.fps) : 24;
+          const rawQuality = typeof params.quality === 'number' ? Math.round(params.quality) : 82;
+          const format = params.format === 'jpeg' ? 'jpeg' : 'png';
+          const opts: AvatarStreamOptions = {
+            maxWidth: Math.max(120, Math.min(1024, rawWidth)),
+            fps: Math.max(1, Math.min(30, rawFps)),
+            quality: Math.max(40, Math.min(95, rawQuality)),
+            format,
+            trim: params.trim !== false,
+            binary: params.binary === true,
+          };
+          this.startAvatarStream(socket, opts);
+          if (id !== null) {
+            this.wsSendJson(socket, {
+              jsonrpc: '2.0',
+              id,
+              result: { ok: true, binary: opts.binary, format: opts.format, fps: opts.fps, maxWidth: opts.maxWidth },
+            });
+            return;
+          }
         } else {
           this.stopAvatarStream(socket);
         }
@@ -646,32 +815,97 @@ export class PetMcpServer {
   }
 
 
-  /** 24fps 头像推流；上一帧未完成时跳帧（背压），避免拖慢主进程 */
-  private startAvatarStream(socket: Duplex, maxWidth: number): void {
-    this.stopAvatarStream(socket);
-    const state = { timer: null as NodeJS.Timeout | null, busy: false };
-    this.wsAvatarTimers.set(socket, state);
-    const tick = async (): Promise<void> => {
-      if (state.busy || !this.wsSockets.has(socket)) return;
-      // 发送端积压时跳帧：慢网络/手机解码慢时别把 PNG 帧堆在 Node 缓冲里
-      if (socket.writableLength > 512 * 1024) return;
-      if (!this.opts.deps.avatarFrame) return;
-      state.busy = true;
-      let timeoutTimer: NodeJS.Timeout | null = null;
+  /** 广播 renderer 推来的投屏 JPEG 帧给所有订阅者（背压保护） */
+  pushCastFrame(buffer: Buffer): void {
+    for (const socket of this.castWatchers.keys()) {
+      const opts = this.castWatchers.get(socket);
+      if (!opts || !this.wsSockets.has(socket)) continue;
+      if (socket.writableLength > 2 * 1024 * 1024) continue;
+      if (opts.binary) {
+        this.wsSendFrame(socket, 0x2, buffer);
+      } else {
+        // 兼容旧客户端：JSON + base64
+        this.wsSendJson(socket, {
+          jsonrpc: '2.0',
+          method: 'pet/castFrame',
+          params: { data: buffer.toString('base64'), format: 'jpeg' },
+        });
+      }
+    }
+  }
+
+  private removeCastWatcher(socket: Duplex): void {
+    if (!this.castWatchers.delete(socket)) return;
+    if (this.castWatchers.size === 0) {
       try {
-        // capturePage 在窗口隐藏/切模型等场景可能不 resolve：超时兜底，否则 busy 永久 true → 手机端画面卡死
-        const frame = await Promise.race([
-          this.opts.deps.avatarFrame(maxWidth),
-          new Promise<never>((_, reject) => {
-            timeoutTimer = setTimeout(() => reject(new Error('avatar frame timeout')), 1500);
-          }),
-        ]);
-        this.avatarFrameFailures = 0;
-        if (this.wsSockets.has(socket)) {
-          this.wsSendJson(socket, { jsonrpc: '2.0', method: 'pet/avatarFrame', params: frame });
+        this.opts.deps.stopCastCapture?.();
+      }
+      catch { /* ignore */ }
+    }
+  }
+
+  private stopCastStream(socket: Duplex): void {
+    this.removeCastWatcher(socket);
+  }
+
+  /**
+   * 头像推流：自适应定时抓帧（上一帧完成后按剩余间隔调度），不会重叠抓帧。
+   * binary=true 发 WS 二进制帧（图片原始字节）；旧客户端仍走 JSON+base64。
+   * 背压：发送端积压超过 512KB 跳帧；capturePage 超过 5s 未返回则停止推流（避免卡死）。
+   */
+  private startAvatarStream(socket: Duplex, opts: AvatarStreamOptions): void {
+    this.stopAvatarStream(socket);
+    const state: { timer: NodeJS.Timeout | null } = { timer: null };
+    this.wsAvatarTimers.set(socket, state);
+    const intervalMs = Math.max(16, Math.round(1000 / opts.fps));
+    let stopped = false;
+
+    const schedule = (delayMs: number): void => {
+      if (stopped || !this.wsSockets.has(socket)) return;
+      state.timer = setTimeout(() => {
+        state.timer = null;
+        void loop();
+      }, Math.max(1, delayMs));
+      state.timer.unref?.();
+    };
+
+    const loop = async (): Promise<void> => {
+      if (stopped || !this.wsSockets.has(socket)) return;
+      // 发送端积压时跳帧：慢网络/手机解码慢时别把帧堆在 Node 缓冲里
+      if (socket.writableLength > 512 * 1024) {
+        schedule(intervalMs);
+        return;
+      }
+      const frameFn = this.opts.deps.avatarFrame;
+      if (!frameFn) return;
+      const startedAt = Date.now();
+      let watchdog: NodeJS.Timeout | null = null;
+      try {
+        // 等 capture 真正结束再调度下一帧：避免超时后与挂死的 capture 并发抓帧
+        const capture = frameFn(opts);
+        watchdog = setTimeout(() => {
+          if (!this.wsSockets.has(socket)) return;
+          console.warn('[mcp] 头像捕获超过 5s 未返回，停止头像推流');
+          this.stopAvatarStream(socket);
+        }, 5000);
+        const frame = await capture;
+        if (!this.wsSockets.has(socket)) return;
+        if (opts.binary) {
+          this.wsSendFrame(socket, 0x2, frame.buffer);
+        } else {
+          this.wsSendJson(socket, {
+            jsonrpc: '2.0',
+            method: 'pet/avatarFrame',
+            params: {
+              data: frame.buffer.toString('base64'),
+              width: frame.width,
+              height: frame.height,
+              format: frame.format,
+            },
+          });
         }
+        this.avatarFrameFailures = 0;
       } catch (err) {
-        // 单帧失败可跳过，但必须留下限频日志，否则推流静默卡死无法排查
         this.avatarFrameFailures += 1;
         const now = Date.now();
         if (now - this.avatarWarnAt > 5000) {
@@ -679,13 +913,14 @@ export class PetMcpServer {
           console.warn(`[mcp] 头像帧失败（连续 ${this.avatarFrameFailures} 次）：${(err as Error).message}`);
         }
       } finally {
-        if (timeoutTimer) clearTimeout(timeoutTimer); // 成功路径也必须清，否则每帧泄漏一个 1.5s timer
-        state.busy = false;
+        if (watchdog) clearTimeout(watchdog);
       }
+      if (!this.wsSockets.has(socket)) return;
+      const elapsed = Date.now() - startedAt;
+      schedule(Math.max(1, intervalMs - elapsed));
     };
-    state.timer = setInterval(() => void tick(), 50);
-    state.timer.unref?.();
-    void tick();
+
+    schedule(0);
   }
 
   /** 请手机端确认一次操作（供手机对话工具使用）；返回 allow/deny/timeout/disconnect/unavailable */
@@ -713,7 +948,7 @@ export class PetMcpServer {
   private stopAvatarStream(socket: Duplex): void {
     const state = this.wsAvatarTimers.get(socket);
     if (!state) return;
-    if (state.timer) clearInterval(state.timer);
+    if (state.timer) clearTimeout(state.timer);
     this.wsAvatarTimers.delete(socket);
   }
 
@@ -994,11 +1229,16 @@ export class PetMcpServer {
           if (!this.opts.deps.avatarFrame)
             return { isError: true, content: [{ type: 'text', text: '头像抓帧不可用' }] };
           const maxWidth = typeof args.maxWidth === 'number' ? Math.round(args.maxWidth) : 300;
-          const frame = await this.opts.deps.avatarFrame(Math.max(120, Math.min(640, maxWidth)));
+          const frame = await this.opts.deps.avatarFrame({
+            maxWidth: Math.max(120, Math.min(1024, maxWidth)),
+            format: 'png',
+            quality: 85,
+            trim: true,
+          });
           return {
             content: [
-              { type: 'image', data: frame.data, mimeType: 'image/png' },
-              { type: 'text', text: `${frame.width}×${frame.height}` },
+              { type: 'image', data: frame.buffer.toString('base64'), mimeType: 'image/png' },
+              { type: 'text', text: `${frame.width}×${frame.height}（${Math.round(frame.bytes / 1024)}KB）` },
             ],
           };
         }

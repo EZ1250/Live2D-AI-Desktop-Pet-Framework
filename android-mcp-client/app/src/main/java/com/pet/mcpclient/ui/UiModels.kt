@@ -13,3 +13,7 @@ data class ChatLine(val role: String, val text: String)
 data class PhoneConfirm(val id: String, val tool: String, val detail: String)
 
 data class RemoteSession(val id: String, val title: String, val count: Int, val startedAt: Long)
+
+/** 投屏流参数（目标帧率/最大宽度） */
+const val CAST_TARGET_FPS = 24
+const val CAST_MAX_WIDTH = 1280

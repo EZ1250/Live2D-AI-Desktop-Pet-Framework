@@ -4,10 +4,18 @@
 工具清单连接后从 `tools/list` 运行时拉取；HTTP + WebSocket 双通道（WS 优先，失败自动回退 HTTP）；
 所有调用带超时与可读错误；手机原生能力可通过 `phone/register` 暴露给电脑端。
 
-## 当前状态
+## 当前状态（v0.5.1，versionCode 51）
 
-- 源码完整：`data/`（McpClient + WS/HTTP transport）、`ui/`（连接/工具/执行/设置 4 屏）、
+- 源码完整：`data/`（McpClient + WS/HTTP transport）、`ui/`（连接/工具/执行/设置 4 屏 + 对话/投屏/组合）、
   `phone/`（电量、设备信息、网络、剪贴板读写、粗略定位）。
+- **头像流 v2（本次优化）**：WS 二进制帧（免 base64/JSON，省约 33% 带宽、免解析开销）、服务端可配置
+  `maxWidth/fps/format/quality/binary/trim`、手机端按屏幕密度请求足够分辨率（不再 220px 放大发虚）、
+  Bitmap 复用解码（`inBitmap`，30fps 下避免每帧 ~2MB 分配）、Compose 仅在 draw 阶段更新头像
+  （不再每帧重组整个对话页）、解码慢/失败自动降清晰度、后台自动暂停。
+- **对话页自动显示桌宠（默认开启）**：进入对话页自动开头像流，离开自动停（省电），可在设置页关闭/切换清晰度。
+- **头像黑方框修复（v0.3.9）**：头像球的 clip(CircleShape) 必须在 ackground/border 之前，否则深色圆底不裁剪会溢出成黑色方块。
+- **头像球大小（v0.4.1）**：设置页可选中/大/超大（默认 260dp，接近源窗口 711px 的 1:1 显示）。
+- **电脑投屏 v2（v0.3.9）**：独立 WS 连接订阅 pet/castStart 二进制 JPEG 帧（不再走 pet_screenshot 1fps），支持横屏/双指缩放拖动；旧电脑端自动降级 1fps。
 - **未接真机验证**；无自动化测试。仓库只提交源码，APK 请用 Android Studio 构建（不纳入版本库）。
 - 电脑端桥接（LAN 开关、`/ws`、`phone/register|poll|result`）见 `../docs/ANDROID_MCP_CLIENT.md`。
 

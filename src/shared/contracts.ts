@@ -236,6 +236,12 @@ export const IPC_DSH_RESET_SESSION = 'dsh:reset-session';
 
 /** 附件兼容性检查（invoke）：发送前判断当前接入方式/模型能否处理这些附件。 */
 export const IPC_MEDIA_CHECK = 'chat:media-check';
+/** 主进程→渲染层：启动/停止投屏抓屏（getDisplayMedia，持续帧） */
+export const IPC_CAST_CAPTURE_CONTROL = 'pet:cast-capture-control';
+/** 渲染层→主进程：投屏 JPEG 帧（ArrayBuffer） */
+export const IPC_CAST_CAPTURE_FRAME = 'pet:cast-capture-frame';
+/** 渲染层→主进程：投屏原始 RGBA 帧（main 用 nativeImage 原生编码 JPEG，避免 JS 编码 ~70ms） */
+export const IPC_CAST_RAW_FRAME = 'pet:cast-raw-frame';
 /** 附件暂存（invoke）：渲染层把剪贴板/拖入的字节交给主进程落盘，返回本地路径。 */
 export const IPC_ATTACHMENT_STAGE = 'chat:attachment-stage';
 /** AI 回发媒体（main→renderer 推送）：图片/音频/文件卡片。 */
@@ -813,6 +819,13 @@ export interface ElectronAPI {
   /** 加载指定模型，resolve 为 ModelManifest（url 指向主进程静态服务）。 */
   loadModel(modelName: string): Promise<ModelManifest>;
   /** 发送消息触发 AI 对话；流式结果经 onChat 订阅推送。attachments 为图片/音频/文件（发送前会做兼容性检查）。 */
+  /** 接收主进程投屏抓屏控制（start/stop） */
+  onCastCapture(cb: (payload: { action: 'start' | 'stop'; maxWidth?: number; fps?: number; quality?: number; sourceId?: string }) => void): () => void;
+  /** 把一帧投屏 JPEG 发给主进程（ArrayBuffer） */
+  sendCastFrame(data: ArrayBuffer): void;
+  /** 投屏原始 RGBA 帧：main 侧 nativeImage 编码，显著提高 fps */
+  sendCastRawFrame(data: ArrayBuffer, width: number, height: number, quality: number): void;
+
   sendMessage(text: string, attachments?: AttachmentRef[]): Promise<{ ok: boolean }>;
   /** 订阅活动窗口变化；返回取消订阅函数。 */
   onWindowChange(cb: (info: WindowInfo | null) => void): () => void;

@@ -126,3 +126,49 @@ export async function captureScreen(args: CaptureArgs): Promise<string> {
     return `执行截屏过程中发生异常：${err.message || '未知错误'}`;
   }
 }
+
+/** 投屏帧参数（不落盘，直接编码成 JPEG 交给 MCP WS 二进制帧） */
+export interface ScreenFrameOptions {
+  maxWidth?: number;
+  quality?: number;
+  display?: number;
+}
+
+export interface ScreenFrameResult {
+  buffer: Buffer;
+  width: number;
+  height: number;
+  format: 'jpeg';
+}
+
+/**
+ * 抓一帧屏幕（用于手机投屏流）：不写文件、JPEG 编码、按 maxWidth 等比缩放，支持多显示器。
+ * 注意：desktopCapturer.getSources 本身有成本，调用方需控制帧率与背压。
+ */
+export async function captureScreenFrame(opts: ScreenFrameOptions = {}): Promise<ScreenFrameResult> {
+  const displays = screen.getAllDisplays();
+  if (!displays.length) throw new Error('无法获取屏幕信息');
+  const displayIndex = typeof opts.display === 'number' && Number.isInteger(opts.display) && opts.display >= 1 ? opts.display : 1;
+  const target = displays[displayIndex - 1] || displays[0];
+  if (!target) throw new Error('未找到指定屏幕');
+
+  const physicalW = Math.max(1, Math.round(target.size.width * target.scaleFactor));
+  const physicalH = Math.max(1, Math.round(target.size.height * target.scaleFactor));
+  const maxWidth = Math.max(320, Math.min(1920, Math.round(opts.maxWidth ?? 1280)));
+  const targetW = Math.min(maxWidth, physicalW);
+  const targetH = Math.max(1, Math.round(targetW * (physicalH / physicalW)));
+
+  const sources = await desktopCapturer.getSources({
+    types: ['screen'],
+    thumbnailSize: { width: targetW, height: targetH },
+  });
+  const matched = sources.find((s) => s.display_id === target.id.toString()) || sources[0];
+  if (!matched) throw new Error('找不到可用屏幕资源');
+  const image = matched.thumbnail;
+  if (image.isEmpty()) throw new Error('截图为空');
+
+  const quality = Math.max(35, Math.min(95, Math.round(opts.quality ?? 70)));
+  const buffer = image.toJPEG(quality);
+  const size = image.getSize();
+  return { buffer, width: size.width, height: size.height, format: 'jpeg' };
+}

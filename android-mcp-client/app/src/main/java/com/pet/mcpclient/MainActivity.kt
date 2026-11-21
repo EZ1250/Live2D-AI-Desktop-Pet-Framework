@@ -9,12 +9,26 @@ import com.pet.mcpclient.ui.PetMcpApp
 import com.pet.mcpclient.ui.PetMcpTheme
 
 class MainActivity : ComponentActivity() {
+    private var appVm: AppViewModel? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
             PetMcpTheme {
-                PetMcpApp(viewModel<AppViewModel>())
+                val vm = viewModel<AppViewModel>()
+                appVm = vm
+                PetMcpApp(vm)
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        appVm?.onAppForeground()
+    }
+
+    override fun onStop() {
+        appVm?.onAppBackground()
+        super.onStop()
     }
 }

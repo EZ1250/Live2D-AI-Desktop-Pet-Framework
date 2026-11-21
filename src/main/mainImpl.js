@@ -81,6 +81,8 @@ const mediaTools_1 = require("./ai/mediaTools");
 const mediaAttachments_1 = require("./ai/mediaAttachments");
 const modelTextureCache_1 = require("./modelTextureCache");
 const screenTools_1 = require("./ai/screenTools");
+const castCapture_1 = require("./ai/castCapture");
+const mouseControl_1 = require("./ai/mouseControl");
 const meetingTools_1 = require("./ai/meetingTools");
 const translateTools_1 = require("./ai/translateTools");
 const mailTools_1 = require("./ai/mailTools");
@@ -928,6 +930,8 @@ function createWindow(resolver, srv) {
             // 桌宠会在"用户没有任何点击"的时候播 TTS/音效：显式声明免手势自动播放
             // （命令行侧由 earlySwitches 兜底，这里按窗口再钉一次）
             autoplayPolicy: 'no-user-gesture-required',
+            // 投屏抓屏/编码在渲染层跑，窗口被遮挡时不能降频
+            backgroundThrottling: false,
         },
     });
     mainWindow = win;
@@ -2077,6 +2081,33 @@ async function loadRegistryAdapter() {
  * 注意这不能替代操作系统的隐私开关：Windows 的"麦克风访问"仍由系统设置决定，本闸门只是应用内的
  * 第二道门（放行 ≠ 一定能录到音）。
  */
+/** 只在手机投屏请求期间放行 display-capture；平时仍拒绝 */
+let castCaptureAllowed = false;
+/** 手机投屏原生抓屏助手（CastCap.exe）：失败时回退 renderer 抓屏 */
+let castCaptureInstance = null;
+function resolveCastCapExe() {
+    const candidates = [];
+    try {
+        if (process.resourcesPath) candidates.push(path.join(process.resourcesPath, 'cast-cap', 'CastCap.exe'));
+    }
+    catch { /* ignore */ }
+    try {
+        candidates.push(path.join(electron_1.app.getAppPath(), 'local-assets', 'cast-cap', 'CastCap.exe'));
+    }
+    catch { /* ignore */ }
+    for (const candidate of candidates) {
+        try {
+            if (fs.existsSync(candidate)) return candidate;
+        }
+        catch { /* ignore */ }
+    }
+    return '';
+}
+
+electron_1.app.on('will-quit', () => {
+    try { castCaptureInstance?.stop(); } catch { /* ignore */ }
+});
+
 function installPermissionGate() {
     const ses = electron_1.session.defaultSession;
     // 只有音频输入是合规用途；请求里一旦捎带 video，或 mediaTypes 不是纯 audio，都拒
@@ -2092,6 +2123,11 @@ function installPermissionGate() {
         return true;
     };
     ses.setPermissionRequestHandler((_wc, permission, callback, details) => {
+        // 手机投屏：仅在我们主动请求抓屏期间放行 display-capture（其余时候仍拒绝）
+        if (permission === 'display-capture' && castCaptureAllowed) {
+            callback(true);
+            return;
+        }
         if (permission === 'media') {
             const ok = allowMedia(details);
             if (!ok)
@@ -2105,6 +2141,8 @@ function installPermissionGate() {
     });
     // 有些 API 只走 check 不触发 request（例如 enumerateDevices 后的细分判断），这里保持一致口径
     ses.setPermissionCheckHandler((_wc, permission, _origin, details) => {
+        if (permission === 'display-capture' && castCaptureAllowed)
+            return true;
         if (permission === 'media')
             return allowMedia(details);
         return false;
@@ -3099,7 +3137,68 @@ async function bootstrap() {
             chatDetail: (prompt) => askPetChatDetail(prompt),
             chatHistory: (sessionId, limit) => bridge.readChatHistory(sessionId, limit),
             avatarFrame: (maxWidth) => capturePetAvatarFrame(maxWidth),
+            castFrame: (opts) => (0, screenTools_1.captureScreenFrame)(opts),
+            startCastCapture: async (opts) => {
+                castCaptureInstance?.stop();
+                castCaptureInstance = null;
+                const exe = resolveCastCapExe();
+                if (exe) {
+                    castCaptureInstance = new castCapture_1.CastCapture({
+                        exePath: exe,
+                        width: opts.maxWidth,
+                        // 客户端请求 24fps；调度目标 30 可实测达到 27fps，返回给客户端按实际 30 汇报
+                        fps: 30,
+                        quality: Math.max(40, Math.min(85, Math.round(opts.quality) || 55)),
+                        display: opts.display,
+                        onFrame: (jpeg) => petMcpServer?.pushCastFrame(jpeg),
+                        onError: (msg) => console.warn('[cast-cap]', msg),
+                    });
+                    castCaptureInstance.start();
+                    console.log(`[main] 投屏抓屏：CastCap.exe 已启动（width=${opts.maxWidth}, target=30fps）`);
+                    return true;
+                }
+                // 回退：renderer getDisplayMedia 抓屏（较慢，约 16~20fps）
+                castCaptureAllowed = true;
+                let sourceId = '';
+                try {
+                    const sources = await electron_1.desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 16, height: 9 } });
+                    sourceId = sources[0]?.id ?? '';
+                }
+                catch { /* 拿不到 sourceId 就退回 getDisplayMedia */ }
+                sendToRenderer(contracts_1.IPC_CAST_CAPTURE_CONTROL, {
+                    action: 'start',
+                    maxWidth: opts.maxWidth,
+                    fps: opts.fps,
+                    quality: opts.quality,
+                    sourceId,
+                });
+                console.warn('[main] 未找到 CastCap.exe，投屏回退 renderer 抓屏（帧率较低）');
+                return true;
+            },
+            stopCastCapture: () => {
+                castCaptureInstance?.stop();
+                castCaptureInstance = null;
+                castCaptureAllowed = false;
+                sendToRenderer(contracts_1.IPC_CAST_CAPTURE_CONTROL, { action: 'stop' });
+            },
+            mouseMove: (x, y, display) => (0, mouseControl_1.moveMouse)(x, y, display),
+            mouseClick: (x, y, display) => (0, mouseControl_1.clickMouse)(x, y, display),
+            mouseRightClick: (x, y, display) => (0, mouseControl_1.rightClickMouse)(x, y, display),
+            isEditableFocused: () => (0, mouseControl_1.isEditableFocused)(),
+            typeText: (text) => (0, mouseControl_1.typeText)(text),
             touch: (action, x, y) => handlePhoneTouch(action, x, y),
+            cursorToGazeOrigin: async () => {
+                const win = mainWindow;
+                if (!win || win.isDestroyed()) throw new Error('桌宠窗口不可用');
+                const bounds = win.getContentBounds();
+                const settings = (0, chatClient_1.loadAppSettings)();
+                const ratioY = settings.displayMode === 'half' ? 0.38 : 0.5;
+                const x = bounds.x + bounds.width / 2;
+                const y = bounds.y + bounds.height * ratioY;
+                await (0, mouseControl_1.moveCursorToScreen)(x, y);
+                return `鼠标已移到桌宠视线原点（${Math.round(x)}, ${Math.round(y)}）`;
+            },
+
             ask: async (question, options) => {
                 scenario?.record('event', '外部自动化：向用户提问');
                 return await askUser(question, options.map((label) => ({ label })));
@@ -3127,6 +3226,43 @@ async function bootstrap() {
             resourceRead: (uri) => readPetResource(uri),
         },
     });
+    // 手机投屏：renderer 抓屏帧 → mcpServer 广播给投屏订阅者
+    // 投屏原始 RGBA 帧：走 nativeImage 原生 JPEG 编码（比 renderer Canvas 编码快一个量级）
+    electron_1.ipcMain.on(contracts_1.IPC_CAST_RAW_FRAME, (_event, payload) => {
+        try {
+            if (!payload || !(payload.data instanceof ArrayBuffer)) return;
+            const width = Math.max(2, Math.round(Number(payload.width) || 0));
+            const height = Math.max(2, Math.round(Number(payload.height) || 0));
+            const quality = Math.max(35, Math.min(95, Math.round(Number(payload.quality) || 70)));
+            const src = Buffer.from(payload.data);
+            if (src.length < width * height * 4) return;
+            // getImageData 是 RGBA；nativeImage.createFromBitmap 在 Windows 期望 BGRA → 交换 R/B
+            for (let i = 0; i < src.length; i += 4) {
+                const r = src[i];
+                src[i] = src[i + 2];
+                src[i + 2] = r;
+            }
+            const image = electron_1.nativeImage.createFromBitmap(src, { width, height });
+            if (image.isEmpty()) return;
+            petMcpServer?.pushCastFrame(image.toJPEG(quality));
+        }
+        catch (err) {
+            console.warn('[main] 投屏原始帧编码失败：', err.message);
+        }
+    });
+    electron_1.ipcMain.on(contracts_1.IPC_CAST_CAPTURE_FRAME, (_event, data) => {
+        try {
+            if (data instanceof ArrayBuffer) {
+                petMcpServer?.pushCastFrame(Buffer.from(data));
+            }
+            else if (ArrayBuffer.isView(data)) {
+                petMcpServer?.pushCastFrame(Buffer.from(data.buffer, data.byteOffset, data.byteLength));
+            }
+        }
+        catch (err) {
+            console.warn('[main] 投屏帧转发失败：', err.message);
+        }
+    });
     void petMcpServer.start();
     initAutoTask(settings, resolver);
     // 7.3 技能库：userData/skills（用户自定义，优先）→ <assetsRoot>/skills（随包）
@@ -3134,6 +3270,18 @@ async function bootstrap() {
     skillBox.load();
     chat?.setSkillCatalog(skillBox.catalogText());
     // 8. 主窗口
+    // 手机投屏：renderer 通过 getDisplayMedia 持续抓屏（desktopCapturer 单次 getSources 约 300ms，无法 24fps）
+    try {
+        electron_1.session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
+            electron_1.desktopCapturer
+                .getSources({ types: ['screen'], thumbnailSize: { width: 16, height: 9 } })
+                .then((sources) => callback(sources[0] ? { video: sources[0] } : {}))
+                .catch(() => callback({}));
+        });
+    }
+    catch (err) {
+        console.warn('[main] setDisplayMediaRequestHandler 不可用，投屏将无法启动：', err.message);
+    }
     createWindow(resolver, srv);
     registerWindowDragHandlers(); // 拖拽移动窗口（renderer 左键拖动 → win:drag）
     registerAskAnswerHandler(); // AI 提问（ask_user）的用户回答通道
@@ -4055,19 +4203,88 @@ async function askPetChatDetail(promptText) {
     }
 }
 
-/** 抓桌宠窗口一帧（手机 Live2D 头像，PNG base64） */
-async function capturePetAvatarFrame(maxWidth = 300) {
+/** 按透明像素裁掉四周空白（让手机端头像球里角色更大、更清晰；不透明图直接返回原图） */
+function trimTransparentPadding(image) {
+    let bmp;
+    try {
+        bmp = image.toBitmap();
+    }
+    catch {
+        return image;
+    }
+    const size = image.getSize();
+    const width = size.width;
+    const height = size.height;
+    if (!width || !height || bmp.length < width * height * 4)
+        return image;
+    // Electron NativeImage.toBitmap() 的 alpha 通道固定在每像素第 4 字节（BGRA/RGBA 都是这样）
+    const alphaOffset = 3;
+    const step = Math.max(1, Math.floor((width * height) / 30000));
+    let minA = 255, maxA = 0;
+    for (let p = 0; p < width * height; p += step) {
+        const a = bmp[p * 4 + alphaOffset];
+        if (a < minA) minA = a;
+        if (a > maxA) maxA = a;
+    }
+    if (maxA - minA < 8 || minA > 240)
+        return image; // 没有明显透明区域
+    const threshold = 16;
+    let minX = width, minY = height, maxX = -1, maxY = -1;
+    const scanStep = 2;
+    for (let y = 0; y < height; y += scanStep) {
+        const row = y * width;
+        for (let x = 0; x < width; x += scanStep) {
+            if (bmp[(row + x) * 4 + alphaOffset] > threshold) {
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+            }
+        }
+    }
+    if (maxX < 0 || maxY < 0)
+        return image;
+    const pad = 4; // 留 4px 半透明边，避免裁掉发光/描边
+    const x0 = Math.max(0, minX - pad);
+    const y0 = Math.max(0, minY - pad);
+    const x1 = Math.min(width - 1, maxX + pad);
+    const y1 = Math.min(height - 1, maxY + pad);
+    const w = x1 - x0 + 1;
+    const h = y1 - y0 + 1;
+    // 异常裁剪（例如占原图 20% 以下）宁可不裁，避免误伤
+    if (w < width * 0.1 || h < height * 0.1)
+        return image;
+    try {
+        return image.crop({ x: x0, y: y0, width: w, height: h });
+    }
+    catch {
+        return image;
+    }
+}
+/**
+ * 抓桌宠窗口一帧（手机 Live2D 头像流）。
+ * opts 兼容旧调用（数字 = maxWidth），返回原始图片 Buffer，由 mcpServer 决定二进制/JSON 发送。
+ */
+async function capturePetAvatarFrame(opts) {
     const win = mainWindow;
     if (!win || win.isDestroyed())
         throw new Error('桌宠窗口不可用');
     if (!win.isVisible())
         throw new Error('桌宠窗口不可见');
-    const image = await win.webContents.capturePage();
+    const cfg = typeof opts === 'number' ? { maxWidth: opts } : (opts || {});
+    const maxWidth = Math.max(120, Math.min(1024, Math.round(Number(cfg.maxWidth) || 300)));
+    const format = cfg.format === 'jpeg' ? 'jpeg' : 'png';
+    const quality = Math.max(40, Math.min(95, Math.round(Number(cfg.quality) || 85)));
+    const doTrim = cfg.trim !== false;
+    let image = await win.webContents.capturePage();
+    if (doTrim)
+        image = trimTransparentPadding(image);
     const size = image.getSize();
-    const width = Math.max(120, Math.min(640, Math.round(maxWidth), size.width || 640));
-    const resized = image.resize({ width });
-    const out = resized.getSize();
-    return { data: resized.toPNG().toString('base64'), width: out.width, height: out.height };
+    const width = Math.max(120, Math.min(maxWidth, size.width || maxWidth));
+    const resized = width < size.width ? image.resize({ width, quality: 'best' }) : image;
+    const outSize = resized.getSize();
+    const buffer = format === 'jpeg' ? resized.toJPEG(quality) : resized.toPNG();
+    return { buffer, width: outSize.width, height: outSize.height, format, bytes: buffer.length };
 }
 
 /** 手机触摸：归一化坐标 → 桌宠窗口本地/屏幕坐标；move 触发视线跟随，click 发一次左键单击（不拖动） */
@@ -4083,7 +4300,7 @@ async function handlePhoneTouch(action, x, y) {
     const cb = win.getContentBounds();
     const globalX = cb.x + localX;
     const globalY = cb.y + localY;
-    gazeInput_1.notifyPhoneTouch(globalX, globalY); // 1500ms 内暂停光标推送，并把这帧记为"已推送位置"
+    (0, gazeInput_1.notifyPhoneTouch)(globalX, globalY); // 1500ms 内暂停光标推送，并把这帧记为"已推送位置"
     sendToRenderer(contracts_1.IPC_GLOBAL_CURSOR, { x: globalX, y: globalY });
     if (action === 'click') {
         // 只在"非穿透区域"触发点击：开启点击穿透时，先问渲染层该点是否命中角色
@@ -4112,7 +4329,6 @@ async function handlePhoneTouch(action, x, y) {
     scenario?.record('event', '手机触摸：视线跟随');
     return '桌宠的视线跟到了这个位置。';
 }
-
 /** 只读 pet:// 资源（外部 MCP 客户端读取桌宠上下文用） */
 /** 桌宠运行状态文本：工具 pet_status 与 pet://status 资源共用一份实现 */
 function petStatusText() {

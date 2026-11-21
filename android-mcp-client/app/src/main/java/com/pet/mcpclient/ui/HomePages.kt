@@ -4,7 +4,43 @@
  * 对话页的球心坐标映射在 ChatScreen 内，改动时注意与 pet_touch 协议保持一致。
  */
 package com.pet.mcpclient.ui
+import android.app.Activity
+import android.content.ContextWrapper
+import android.content.pm.ActivityInfo
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.graphics.drawscope.withTransform
+import kotlin.math.min
+import android.os.SystemClock
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.draw.shadow
+import androidx.activity.compose.BackHandler
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.imePadding
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -53,8 +89,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
@@ -82,7 +122,7 @@ fun HomeScreen(vm: AppViewModel) {
         ) {
             Text("已连接（${vm.channel}）· ${vm.tools.size} 个工具", fontSize = 12.sp, color = MaterialTheme.colorScheme.secondary)
             HomeEntry("💬  对话", "和桌宠 AI 聊天，Live2D 模式实时互动") { vm.openPage(AppPage.CHAT) }
-            HomeEntry("🖥  电脑投屏", "查看电脑屏幕（低帧截图镜像）") { vm.openPage(AppPage.CAST) }
+            HomeEntry("🖥  电脑投屏", "查看电脑屏幕（实时投屏（约 24fps+））") { vm.openPage(AppPage.CAST) }
             HomeEntry("🧰  工具（${vm.tools.size}）", "运行时拉取的工具清单，点开即用") { vm.openPage(AppPage.TOOLS) }
             HomeEntry("➕  自由组合", "多选工具，依次执行") { vm.openPage(AppPage.COMBO) }
             Spacer(Modifier.height(8.dp))
@@ -114,22 +154,26 @@ fun ChatScreen(vm: AppViewModel) {
                 navigationIcon = { TextButton(onClick = { vm.openPage(AppPage.HOME) }) { Text("返回") } },
                 title = { Text("对话") },
                 actions = {
-                    TextButton(onClick = { menuOpen = true }) { Text("＋") }
+                    TextButton(onClick = { menuOpen = true }) { Text("⋮") }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                         DropdownMenuItem(text = { Text("新对话") }, onClick = { vm.newChat(); menuOpen = false })
                         DropdownMenuItem(text = { Text("历史对话（电脑端）") }, onClick = { vm.loadRemoteHistory(); historyOpen = true; menuOpen = false })
                         DropdownMenuItem(text = { Text(if (vm.showThinking) "隐藏思考过程" else "显示思考过程") }, onClick = { vm.showThinking = !vm.showThinking; menuOpen = false })
                         DropdownMenuItem(text = { Text("对话信息") }, onClick = { infoOpen = true; menuOpen = false })
-                        DropdownMenuItem(text = { Text("开始/停止头像") }, onClick = { vm.toggleAvatar(); menuOpen = false })
-                        DropdownMenuItem(text = { Text("收起（返回主页）") }, onClick = { vm.openPage(AppPage.HOME); menuOpen = false })
+                        DropdownMenuItem(text = { Text(if (vm.avatarOn) "隐藏桌宠" else "显示桌宠") }, onClick = { vm.toggleAvatar(); menuOpen = false })
                     }
                 },
             )
         },
     ) { padding ->
-        BoxWithConstraints(Modifier.fillMaxSize().padding(padding)) {
+        BoxWithConstraints(
+            Modifier
+                .fillMaxSize()
+                .imePadding()
+                .padding(padding)
+        ) {
             val density = LocalDensity.current
-            val ballDp = 210.dp
+            val ballDp = vm.avatarBallSizeDp.dp
             val ballPx = with(density) { ballDp.toPx() }
             val areaW = with(density) { maxWidth.toPx() }
             val areaH = with(density) { maxHeight.toPx() }
@@ -142,23 +186,23 @@ fun ChatScreen(vm: AppViewModel) {
             val padTopPx = with(density) { 4.dp.toPx() }
             Column(Modifier.fillMaxSize().padding(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 8.dp)) {
                 LazyColumn(
-                    Modifier.weight(1f).pointerInput(ball, ballPx) {
-                        detectTapGestures { tap ->
-                            // 球中心为坐标原点：球心 = (0.5,0.5)，球半径 = 0.5
-                            val nx = 0.5f + (tap.x + padLeftPx - (ball.x + ballPx / 2)) / ballPx
-                            val ny = 0.5f + (tap.y + padTopPx - (ball.y + ballPx / 2)) / ballPx
-                            vm.touchMove(nx.coerceIn(0f, 1f), ny.coerceIn(0f, 1f))
-                            if (nx in 0f..1f && ny in 0f..1f) vm.touchClick(nx.coerceIn(0f, 1f), ny.coerceIn(0f, 1f))
+                    Modifier.weight(1f)
+                        .pointerInput(ball, ballPx) {
+                            detectTapGestures { tap ->
+                                // v1.0.5 基线：球心 = (0.5,0.5)，球径为 1 单位
+                                val nx = 0.5f + (tap.x + padLeftPx - (ball.x + ballPx / 2)) / ballPx
+                                val ny = 0.5f + (tap.y + padTopPx - (ball.y + ballPx / 2)) / ballPx
+                                vm.touchMove(nx.coerceIn(0f, 1f), ny.coerceIn(0f, 1f))
+                                // 保留“点击只在悬浮球”修复：列表区域只跟踪视线，不触发点击
+                            }
                         }
-                    }
-                    .pointerInput(ball, ballPx) {
-                        // 页面拖动（不只点击）也触发视线跟随；不消费事件，消息仍可滚动
-                        detectDragGestures { change, _ ->
-                            val nx = 0.5f + (change.position.x + padLeftPx - (ball.x + ballPx / 2)) / ballPx
-                            val ny = 0.5f + (change.position.y + padTopPx - (ball.y + ballPx / 2)) / ballPx
-                            vm.touchMove(nx.coerceIn(0f, 1f), ny.coerceIn(0f, 1f))
-                        }
-                    },
+                        .pointerInput(ball, ballPx) {
+                            detectDragGestures { change, _ ->
+                                val nx = 0.5f + (change.position.x + padLeftPx - (ball.x + ballPx / 2)) / ballPx
+                                val ny = 0.5f + (change.position.y + padTopPx - (ball.y + ballPx / 2)) / ballPx
+                                vm.touchMove(nx.coerceIn(0f, 1f), ny.coerceIn(0f, 1f))
+                            }
+                        },
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     items(vm.chatLines) { line -> ChatBubble(line) }
@@ -177,35 +221,42 @@ fun ChatScreen(vm: AppViewModel) {
                     SendBall(enabled = !vm.chatBusy) { vm.sendChat(input); input = "" }
                 }
             }
+            // v0.4.7 悬浮球：透明 PNG 用白色磨砂底；JPEG 黑底用深色球
+            val transparentBall = vm.avatarTransparent
+            val ballBrush = if (transparentBall) {
+                Brush.radialGradient(colors = listOf(Color(0xE6FFFFFF), Color(0xB8FFFFFF), Color(0x66FFFFFF)))
+            } else {
+                Brush.radialGradient(colors = listOf(Color(0xFF121A24), Color(0xFF05080C)))
+            }
             Box(
                 Modifier
                     .offset { IntOffset(ball.x.roundToInt(), ball.y.roundToInt()) }
                     .size(ballDp)
-                    .border(3.dp, Color.Black, CircleShape)
+                    .shadow(10.dp, CircleShape)
                     .clip(CircleShape)
+                    .background(ballBrush)
+                    .border(1.5.dp, if (transparentBall) Color(0xCCFFFFFF) else Color(0x66333B45), CircleShape)
                     .pointerInput(vm.avatarOn) {
-                        detectTapGestures { offset ->
+                        detectTapGestures { pos ->
                             if (vm.avatarOn) {
-                                val nx = 0.5f + (offset.x - size.width / 2f) / size.width
-                                val ny = 0.5f + (offset.y - size.height / 2f) / size.height
+                                val nx = 0.5f + (pos.x - size.width / 2f) / size.width
+                                val ny = 0.5f + (pos.y - size.height / 2f) / size.height
                                 vm.touchClick(nx.coerceIn(0f, 1f), ny.coerceIn(0f, 1f))
                             } else vm.toggleAvatar()
                         }
                     }
-                    // key 不能包含 ball：拖拽中 ball 变化会重启手势导致拖不动
-                    .pointerInput(vm.avatarOn) {
+                    .pointerInput(Unit) {
                         detectDragGestures { change, drag ->
                             change.consume()
                             avatarOffset = clampBall((avatarOffset ?: ball) + drag)
                         }
                     },
             ) {
-                val bmp = vm.avatar
-                if (bmp != null) {
-                    Image(bitmap = bmp, contentDescription = "桌宠", modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
-                } else {
+                // 头像绘制：帧号在 draw 阶段读取 → 只重绘这块，不重组整个对话页
+                PetAvatarCanvas(vm)
+                if (!vm.avatarHasFrame) {
                     Text(
-                    if (vm.avatarOn) "头像加载中…" else "点头像\n同步 Live2D",
+                        if (vm.avatarOn) "头像加载中…" else "点头像\n同步 Live2D",
                         modifier = Modifier.fillMaxSize(),
                         fontSize = 11.sp,
                         color = MaterialTheme.colorScheme.secondary,
@@ -295,30 +346,307 @@ private fun SendBall(enabled: Boolean, onClick: () -> Unit) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CastScreen(vm: AppViewModel) {
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                navigationIcon = { TextButton(onClick = { vm.openPage(AppPage.HOME) }) { Text("返回") } },
-                title = { Text("电脑投屏") },
-                actions = {
-                    TextButton(onClick = { vm.toggleCast() }) { Text(if (vm.castOn) "停止" else "开始") }
-                },
-            )
-        },
-    ) { padding ->
-        Box(Modifier.fillMaxSize().padding(padding).padding(12.dp)) {
-            val img = vm.castImage
-            if (img != null) {
-                Image(bitmap = img, contentDescription = "电脑屏幕", modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
+    val context = LocalContext.current
+    val activity = remember(context) { context.findActivity() }
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+    var scale by remember { mutableFloatStateOf(1f) }
+    var pan by remember { mutableStateOf(Offset.Zero) }
+    var pointerDown by remember { mutableStateOf(false) }
+    var rightClickJob by remember { mutableStateOf<Job?>(null) }
+    var panUnlockAt by remember { mutableStateOf(0L) }
+    var moreOpen by remember { mutableStateOf(false) }
+    var fullscreen by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    val haptics = LocalHapticFeedback.current
+    var hint by remember { mutableStateOf("") }
+    var hintJob by remember { mutableStateOf<Job?>(null) }
+    fun showHint(text: String) {
+        hint = text
+        hintJob?.cancel()
+        hintJob = scope.launch {
+            delay(1500)
+            if (hint == text) hint = ""
+        }
+    }
+    val focusRequester = remember { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+    var keyboardOpen by remember { mutableStateOf(false) }
+    var inputText by remember { mutableStateOf("") }
+    fun closeKeyboard() {
+        keyboardOpen = false
+        keyboardController?.hide()
+        vm.consumeCastKeyboardWanted()
+    }
+    BackHandler(enabled = fullscreen || keyboardOpen) {
+        if (keyboardOpen) closeKeyboard() else if (fullscreen) fullscreen = false
+    }
+    DisposableEffect(fullscreen, activity) {
+        val window = activity?.window
+        val controller = window?.let { WindowCompat.getInsetsController(it, it.decorView) }
+        if (window != null && controller != null) {
+            if (fullscreen) {
+                WindowCompat.setDecorFitsSystemWindows(window, false)
+                controller.hide(WindowInsetsCompat.Type.systemBars())
+                controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             } else {
-                Text(
-                    if (vm.castOn) "正在抓取电脑屏幕…" else "点右上角「开始」查看电脑屏幕（约 1 帧/秒）",
-                    color = MaterialTheme.colorScheme.secondary,
-                    fontSize = 13.sp,
-                )
+                WindowCompat.setDecorFitsSystemWindows(window, true)
+                controller.show(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+        onDispose {
+            if (window != null && controller != null) {
+                WindowCompat.setDecorFitsSystemWindows(window, true)
+                controller.show(WindowInsetsCompat.Type.systemBars())
             }
         }
     }
+    DisposableEffect(Unit) {
+        onDispose {
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            rightClickJob?.cancel()
+        }
+    }
+    // 点击输入框后电脑端通知“可输入”→ 自动弹手机输入法
+    LaunchedEffect(vm.castKeyboardWanted) {
+        if (vm.castKeyboardWanted) {
+            vm.consumeCastKeyboardWanted()
+            keyboardOpen = true
+        }
+    }
+    LaunchedEffect(keyboardOpen) {
+        if (keyboardOpen) {
+            withFrameNanos { }
+            runCatching { focusRequester.requestFocus() }
+            keyboardController?.show()
+        }
+    }
+    val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+    LaunchedEffect(imeVisible) {
+        // 用户用手势/系统按钮收起键盘时，同步状态；避免 BackHandler 永远认为键盘还开着
+        if (!imeVisible && keyboardOpen) keyboardOpen = false
+    }
+    Scaffold(
+        topBar = {
+            if (!fullscreen) {
+                TopAppBar(
+                    navigationIcon = { TextButton(onClick = { vm.openPage(AppPage.HOME) }) { Text("返回") } },
+                    title = { Text(if (vm.castOn) "电脑投屏 · 已连接" else "电脑投屏 · 未连接") },
+                    actions = {
+                        TextButton(onClick = { vm.requestCastKeyboard() }) { Text("键盘") }
+                        TextButton(onClick = { vm.toggleCast() }) { Text(if (vm.castOn) "停止" else "开始") }
+                        TextButton(onClick = { moreOpen = true }) { Text("更多") }
+                        DropdownMenu(expanded = moreOpen, onDismissRequest = { moreOpen = false }) {
+                            DropdownMenuItem(text = { Text("复位缩放") }, onClick = { scale = 1f; pan = Offset.Zero; moreOpen = false })
+                            DropdownMenuItem(text = { Text("全屏") }, onClick = { fullscreen = true; moreOpen = false })
+                            DropdownMenuItem(text = { Text(if (isLandscape) "竖屏" else "横屏") }, onClick = {
+                                activity?.requestedOrientation = if (isLandscape) {
+                                    ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                                } else {
+                                    ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                                }
+                                moreOpen = false
+                            })
+                        }
+                    },
+                )
+            }
+        },
+    ) { padding ->
+        BoxWithConstraints(
+            Modifier.fillMaxSize()
+                .then(if (fullscreen) Modifier else Modifier.padding(padding))
+                .then(if (fullscreen) Modifier else Modifier.padding(8.dp))
+                .clipToBounds(),
+        ) {
+            val density = androidx.compose.ui.platform.LocalDensity.current
+            val tapSlopPx = with(density) { 24.dp.toPx() }
+            val containerW = constraints.maxWidth.toFloat()
+            val containerH = constraints.maxHeight.toFloat()
+            val imgW = (vm.currentCastBitmap?.width ?: 16).toFloat()
+            val imgH = (vm.currentCastBitmap?.height ?: 9).toFloat()
+            val fitScale = min(containerW / imgW, containerH / imgH)
+            val fittedW = (imgW * fitScale).coerceAtLeast(1f)
+            val fittedH = (imgH * fitScale).coerceAtLeast(1f)
+            fun clampPan(value: Offset, s: Float): Offset {
+                val boundX = ((fittedW * s - containerW) / 2f).coerceAtLeast(0f)
+                val boundY = ((fittedH * s - containerH) / 2f).coerceAtLeast(0f)
+                return Offset(value.x.coerceIn(-boundX, boundX), value.y.coerceIn(-boundY, boundY))
+            }
+            LaunchedEffect(containerW, containerH, scale) { pan = clampPan(pan, scale) }
+            val pivot = Offset(fittedW / 2f, fittedH / 2f)
+            val imageLeft = (containerW - fittedW) / 2f + pan.x
+            val imageTop = (containerH - fittedH) / 2f + pan.y
+            fun normalizeTap(pos: Offset): Offset? {
+                val qx = pivot.x + (pos.x - imageLeft - pivot.x) / scale
+                val qy = pivot.y + (pos.y - imageTop - pivot.y) / scale
+                if (qx < 0f || qx > fittedW || qy < 0f || qy > fittedH) return null
+                return Offset((qx / fittedW).coerceIn(0f, 1f), (qy / fittedH).coerceIn(0f, 1f))
+            }
+            val tapTimes = remember { mutableListOf<Long>() }
+            var lastTapPos by remember { mutableStateOf(Offset.Zero) }
+            var tapJob by remember { mutableStateOf<Job?>(null) }
+            val handleTap = rememberUpdatedState<(Offset) -> Unit> { pos ->
+                val n = normalizeTap(pos) ?: return@rememberUpdatedState
+                val now = SystemClock.uptimeMillis()
+                tapTimes.removeAll { now - it > 700 }
+                if (tapTimes.isNotEmpty() && (pos - lastTapPos).getDistance() > tapSlopPx) tapTimes.clear()
+                lastTapPos = pos
+                tapTimes.add(now)
+                tapJob?.cancel()
+                when (tapTimes.size) {
+                    2 -> tapJob = scope.launch {
+                        delay(380)
+                        if (tapTimes.size == 2) {
+                            tapTimes.clear()
+                            if (vm.castMouseMove(n.x, n.y)) showHint("鼠标移动") else showHint("投屏未连接")
+                        }
+                    }
+                    3 -> {
+                        tapTimes.clear()
+                        if (vm.castMouseClick(n.x, n.y)) showHint("鼠标左键单击") else showHint("投屏未连接")
+                    }
+                }
+            }
+            val longPressHandler = rememberUpdatedState<(Offset) -> Unit> { pos ->
+                val n = normalizeTap(pos) ?: return@rememberUpdatedState
+                panUnlockAt = SystemClock.uptimeMillis() + 500L
+                rightClickJob?.cancel()
+                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                showHint("移动可拖动取景；按住不动 3s 右键")
+                rightClickJob = scope.launch {
+                    delay(2500) // 长按约 500ms + 2500ms = 3s
+                    if (pointerDown) {
+                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                        if (vm.castMouseRightClick(n.x, n.y)) showHint("鼠标右键") else showHint("投屏未连接")
+                    }
+                }
+            }
+            Canvas(
+                Modifier
+                    .fillMaxSize()
+                    .pointerInput(containerW.toInt(), containerH.toInt(), imgW.toInt(), imgH.toInt()) {
+                        detectTapGestures(
+                            onTap = { pos -> handleTap.value(pos) },
+                            onLongPress = { pos -> longPressHandler.value(pos) },
+                        )
+                    }
+                    .pointerInput(containerW.toInt(), containerH.toInt(), imgW.toInt(), imgH.toInt()) {
+                        detectDragGesturesAfterLongPress(
+                            // 注意：onDragStart 在长按刚成立时就会触发；不能在这里取消右键计时，
+                            // 否则 3s 右键永远到不了。只有真正移动手指才取消。
+                            onDragStart = { },
+                            onDrag = { change, drag ->
+                                if (drag.getDistance() > 2f) rightClickJob?.cancel()
+                                if (scale > 1.01f && SystemClock.uptimeMillis() >= panUnlockAt) {
+                                    change.consume()
+                                    pan = clampPan(pan + drag, scale)
+                                }
+                            },
+                        )
+                    }
+                    .pointerInput(Unit) {
+                        awaitEachGesture {
+                            awaitFirstDown(requireUnconsumed = false)
+                            pointerDown = true
+                            try {
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    if (event.changes.all { !it.pressed }) break
+                                }
+                            } finally {
+                                pointerDown = false
+                                rightClickJob?.cancel()
+                            }
+                        }
+                    }
+                    .pointerInput(containerW.toInt(), containerH.toInt(), imgW.toInt(), imgH.toInt()) {
+                        detectTransformGestures { centroid, panChange, zoom, _ ->
+                            val newScale = (scale * zoom).coerceIn(0.5f, 8f)
+                            val center = Offset(containerW / 2f, containerH / 2f)
+                            val anchorPoint = centroid - center
+                            val newPan = pan + anchorPoint * (1f - newScale / scale) + panChange
+                            scale = newScale
+                            pan = clampPan(newPan, newScale)
+                        }
+                    },
+            ) {
+                val frame = vm.currentCastBitmap ?: return@Canvas
+                if (frame.isRecycled) return@Canvas
+                vm.castSeq
+                val fit = min(size.width / frame.width, size.height / frame.height)
+                val dw = frame.width * fit
+                val dh = frame.height * fit
+                val left = (size.width - dw) / 2f + pan.x
+                val top = (size.height - dh) / 2f + pan.y
+                withTransform({
+                    translate(left, top)
+                    scale(scale, scale, pivot = Offset(dw / 2f, dh / 2f))
+                }) {
+                    drawImage(
+                        image = frame.asImageBitmap(),
+                        dstSize = IntSize(dw.roundToInt().coerceAtLeast(1), dh.roundToInt().coerceAtLeast(1)),
+                        filterQuality = FilterQuality.High,
+                    )
+                }
+            }
+            if (!vm.castHasFrame) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text(
+                        if (vm.castOn) "正在连接投屏（目标 24fps）…" else "点「开始」查看电脑屏幕（可双指缩放/横屏/全屏）",
+                        color = MaterialTheme.colorScheme.secondary,
+                        fontSize = 13.sp,
+                    )
+                }
+            }
+            if (hint.isNotEmpty()) {
+                Text(hint, modifier = Modifier.align(Alignment.TopCenter).padding(8.dp), fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+            }
+            if (fullscreen) {
+                TextButton(
+                    onClick = { fullscreen = false },
+                    modifier = Modifier.align(Alignment.TopEnd).padding(12.dp)
+                        .background(Color.Black.copy(alpha = 0.35f), RoundedCornerShape(20.dp)),
+                ) { Text("退出全屏", color = Color.White) }
+            }
+            if (keyboardOpen) {
+                Card(Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(8.dp)) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        OutlinedTextField(
+                            value = inputText,
+                            onValueChange = { inputText = it },
+                            modifier = Modifier.weight(1f).focusRequester(focusRequester),
+                            placeholder = { Text("输入文字到电脑…", fontSize = 12.sp) },
+                            maxLines = 3,
+                            textStyle = androidx.compose.ui.text.TextStyle(fontSize = 13.sp),
+                        )
+                        Column {
+                            TextButton(onClick = {
+                                if (vm.castTypeText(inputText)) {
+                                    inputText = ""
+                                    showHint("已输入到电脑")
+                                } else {
+                                    showHint("投屏未连接")
+                                }
+                            }) { Text("发送") }
+                            TextButton(onClick = { closeKeyboard() }) { Text("关闭") }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** 从 Compose Context 找到宿主 Activity（用于横屏/恢复方向） */
+private fun android.content.Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -361,5 +689,30 @@ fun ComboScreen(vm: AppViewModel) {
                 }
             }
         }
+    }
+}
+
+
+/**
+ * 桌宠头像画布。
+ * 关键点：bitmap/帧号都在 DrawScope 内读取——Compose 只会让绘制阶段失效，
+ * 不会因为每帧新图片而重组 ChatScreen（旧实现每帧 setState(ImageBitmap) 是掉帧主因）。
+ */
+@Composable
+private fun PetAvatarCanvas(vm: AppViewModel) {
+    Canvas(Modifier.fillMaxSize()) {
+        val bmp = vm.currentAvatarBitmap ?: return@Canvas
+        if (bmp.isRecycled) return@Canvas
+        vm.avatarSeq // 触发 draw 阶段失效
+        // 等比缩放（等价原 ContentScale.Fit）：竖图在圆球里不会横向拉宽
+        val scale = minOf(size.width / bmp.width, size.height / bmp.height)
+        val dstW = (bmp.width * scale).roundToInt().coerceAtLeast(1)
+        val dstH = (bmp.height * scale).roundToInt().coerceAtLeast(1)
+        drawImage(
+            image = bmp.asImageBitmap(),
+            dstOffset = IntOffset(((size.width - dstW) / 2f).roundToInt(), ((size.height - dstH) / 2f).roundToInt()),
+            dstSize = IntSize(dstW, dstH),
+            filterQuality = FilterQuality.High,
+        )
     }
 }

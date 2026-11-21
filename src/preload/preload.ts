@@ -29,6 +29,9 @@ import {
   IPC_ASSET_REMOVE,
   IPC_ASSET_SCAN,
   IPC_ATTACHMENT_STAGE,
+  IPC_CAST_CAPTURE_CONTROL,
+  IPC_CAST_CAPTURE_FRAME,
+  IPC_CAST_RAW_FRAME,
   IPC_MEDIA_CHECK,
   IPC_CHAT_CONTEXT_RESET,
   IPC_CHAT_HISTORY_CLEAR,
@@ -520,6 +523,15 @@ const api: ElectronAPI = {
       IPC_THINK_PUSH,
       cb,
     );
+  },
+  onCastCapture(cb) {
+    return subscribeChannel(IPC_CAST_CAPTURE_CONTROL, cb);
+  },
+  sendCastFrame(data) {
+    ipcRenderer.send(IPC_CAST_CAPTURE_FRAME, data);
+  },
+  sendCastRawFrame(data, width, height, quality) {
+    ipcRenderer.send(IPC_CAST_RAW_FRAME, { data, width, height, quality });
   },
 };
 

@@ -842,7 +842,10 @@ stdio 用 `command/args/cwd/env`，http 用 `url/headers`；`toolCallTimeoutMs` 
 
 ## 7.13 手机端能力接口（头像流 / 触摸 / 思考对话）
 
-- `pet/avatarStart` / `pet/avatarStop`（WS 扩展）：订阅后电脑端以 50ms 间隔（20fps）抓桌宠窗口（`BrowserWindow.capturePage`，默认缩到 300px 宽）并推 `pet/avatarFrame` 通知（PNG base64）；上一帧未编码完时跳帧（背压）；停止后立即不再推送；
+- `pet/avatarStart` / `pet/avatarStop`（WS 扩展）：订阅后电脑端按客户端请求抓桌宠窗口（`BrowserWindow.capturePage`）推帧。
+  参数：`maxWidth`(120~1024) / `fps`(1~30) / `format`('png'|'jpeg') / `quality`(40~95) / `binary`(true 时发 WS 二进制帧) / `trim`(裁掉透明边，默认 true)。
+  `binary=false`（旧客户端/默认）仍推 `pet/avatarFrame` 通知（JSON + base64 PNG）；`binary=true` 直接发图片原始字节（省 ~33% 带宽与解析）。
+  帧率以 33~50ms 定时抓帧 + 发送端积压跳帧（背压）控制；JPEG 透明区为黑底，PNG 保留透明。；上一帧未编码完时跳帧（背压）；停止后立即不再推送；
 - 工具 `pet_avatar`：一次性抓帧（HTTP 回退/单帧预览用）；
 - 工具 `pet_touch`：`{action:'move'|'click', x, y}`，x/y 为桌宠窗口归一化坐标；move 合成全局光标位置触发视线跟随（触摸后 1.5s 内真实鼠标轮询不覆盖）；click 在桌宠窗口内发一次左键单击（不做拖动）；
 - 工具 `pet_chat_detail`：在 `pet_chat` 基础上返回思考过程（手机对话页用，消耗模型额度）；

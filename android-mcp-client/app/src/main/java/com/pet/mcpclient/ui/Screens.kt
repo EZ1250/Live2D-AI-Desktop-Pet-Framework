@@ -23,15 +23,19 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -272,10 +276,12 @@ private fun ToolRunScreen(vm: AppViewModel) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SettingsScreen(vm: AppViewModel) {
+    var advancedOpen by remember { mutableStateOf(false) }
+    var confirmDisconnect by remember { mutableStateOf(false) }
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("设置 / 自检") },
+                title = { Text("设置") },
                 navigationIcon = { TextButton(onClick = { vm.showSettings = false }) { Text("返回") } },
             )
         },
@@ -284,25 +290,95 @@ private fun SettingsScreen(vm: AppViewModel) {
             Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            val context = LocalContext.current
-            val version = remember { runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "-" }.getOrDefault("-") }
-            InfoRow("版本", "v$version")
-            InfoRow("连接状态", if (vm.connected) "已连接（${vm.channel}）" else "未连接")
-            InfoRow("工具目录", "${vm.tools.size} 个（运行时拉取）")
-            InfoRow("手机原生工具", "${vm.phoneToolCount} 个")
+            // 用户侧：桌宠显示
+            Text("桌宠显示", fontWeight = FontWeight.Medium, fontSize = 13.sp)
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Switch(
+                    checked = vm.autoAvatarOnChat,
+                    onCheckedChange = { vm.setAutoAvatarOnChatEnabled(it) },
+                )
+                Text("打开对话页时自动显示桌宠", fontSize = 13.sp)
+            }
+            InfoRow(
+                "头像流",
+                when {
+                    !vm.avatarOn -> "关闭"
+                    vm.avatarHasFrame -> "显示中"
+                    else -> "连接中…"
+                },
+            )
+            Text("头像清晰度（越高越清晰，也越费流量）", fontSize = 12.sp, color = MaterialTheme.colorScheme.secondary)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { vm.registerPhoneTools() }, enabled = vm.connected) { Text("注册手机工具") }
-                Button(onClick = { vm.refresh() }, enabled = vm.connected && !vm.busy) { Text("重新拉取工具") }
+                listOf("sharp" to "清晰", "balanced" to "均衡", "smooth" to "流畅", "data" to "省流").forEach { (id, label) ->
+                    FilterChip(
+                        selected = vm.avatarQuality == id,
+                        onClick = { vm.selectAvatarQuality(id) },
+                        label = { Text(label, fontSize = 12.sp) },
+                    )
+                }
             }
-            if (vm.connected) {
-                TextButton(onClick = { vm.disconnect() }) { Text("断开连接") }
+            Text("头像球大小", fontSize = 12.sp, color = MaterialTheme.colorScheme.secondary)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(160 to "小", 210 to "中", 260 to "大").forEach { (size, label) ->
+                    FilterChip(
+                        selected = vm.avatarBallSizeDp == size,
+                        onClick = { vm.setAvatarBallSize(size) },
+                        label = { Text(label, fontSize = 12.sp) },
+                    )
+                }
             }
+            Text(
+                "透明磨砂=540px PNG（约 15fps，PNG 透明才能看到磨砂球背景）；均衡=720px JPEG 黑底（约 27fps）；流畅 540 / 省流 360。头像球默认 210dp（原 260dp 的 4/5）。",
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.secondary,
+            )
+
+            HorizontalDivider()
+            // 高级/自检：默认折叠，避免开发术语干扰普通用户
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text("高级 / 自检", fontWeight = FontWeight.Medium, fontSize = 13.sp)
+                TextButton(onClick = { advancedOpen = !advancedOpen }) { Text(if (advancedOpen) "收起" else "展开") }
+            }
+            if (advancedOpen) {
+                val context = LocalContext.current
+                val version = remember { runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "-" }.getOrDefault("-") }
+                InfoRow("版本", "v$version")
+                InfoRow("连接状态", if (vm.connected) "已连接（${vm.channel}）" else "未连接")
+                InfoRow("工具目录", "${vm.tools.size} 个（运行时拉取）")
+                InfoRow("手机原生工具", "${vm.phoneToolCount} 个")
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { vm.registerPhoneTools() }, enabled = vm.connected) { Text("注册手机工具") }
+                    Button(onClick = { vm.refresh() }, enabled = vm.connected && !vm.busy) { Text("重新拉取工具") }
+                }
+                if (vm.connected) {
+                    TextButton(onClick = { confirmDisconnect = true }) { Text("断开连接") }
+                }
+            }
+
             HorizontalDivider()
             Text("最近日志（脱敏）", fontWeight = FontWeight.Medium, fontSize = 13.sp)
             vm.logs.take(12).forEach {
                 Text(it, fontSize = 11.sp, color = MaterialTheme.colorScheme.secondary)
             }
         }
+    }
+    if (confirmDisconnect) {
+        AlertDialog(
+            onDismissRequest = { confirmDisconnect = false },
+            title = { Text("断开连接？") },
+            text = { Text("断开后投屏、对话和手机工具都会停止，需要重新填写地址/token 连接。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmDisconnect = false
+                    vm.disconnect()
+                }) { Text("断开") }
+            },
+            dismissButton = { TextButton(onClick = { confirmDisconnect = false }) { Text("取消") } },
+        )
     }
 }
 

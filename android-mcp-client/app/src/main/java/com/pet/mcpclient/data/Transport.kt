@@ -23,6 +23,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import okio.ByteString
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
@@ -95,6 +96,8 @@ class WsTransport(private val server: ServerConfig) : McpTransport {
     @Volatile
     var alive: Boolean = false
     var onNotification: ((method: String, params: JsonObject) -> Unit)? = null
+    /** 服务端头像二进制帧（图片原始字节，免 base64/JSON 解析）；仅 WS 通道有效 */
+    var onBinaryFrame: ((ByteArray) -> Unit)? = null
     /** 通过 WS 发一条客户端通知（如 pet/confirmReply）；HTTP 通道不可用 */
     override val label = "WebSocket"
 
@@ -125,6 +128,11 @@ class WsTransport(private val server: ServerConfig) : McpTransport {
                     return
                 }
                 pending.remove(id)?.complete(text)
+            }
+
+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                // 头像流二进制帧：直接给解码器，省掉 base64 编解码与 JSON 解析
+                onBinaryFrame?.invoke(bytes.toByteArray())
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {

@@ -34,6 +34,14 @@ export function installEarlySwitches(): void {
     if (current !== AUTOPLAY_POLICY_VALUE) {
       app.commandLine.appendSwitch(AUTOPLAY_POLICY_SWITCH, AUTOPLAY_POLICY_VALUE);
     }
+    // 手机投屏：renderer 负责 30fps 抓屏编码；桌宠窗口常在后台/被遮挡，
+    // 默认的 timer throttling 会把编码循环压到 ~20fps。这些开关只影响本进程，代价可接受。
+    for (const sw of ['disable-background-timer-throttling', 'disable-renderer-backgrounding', 'disable-backgrounding-occluded-windows']) {
+      try {
+        if (!app.commandLine.hasSwitch(sw)) app.commandLine.appendSwitch(sw);
+      }
+      catch { /* ignore */ }
+    }
   } catch (err) {
     console.warn('[main] 设置自动播放策略失败（语音可能需要先点一下页面）：', err instanceof Error ? err.message : err);
   }

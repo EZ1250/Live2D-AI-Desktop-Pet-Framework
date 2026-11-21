@@ -12,8 +12,8 @@ android {
         applicationId = "com.pet.mcpclient"
         minSdk = 26
         targetSdk = 35
-        versionCode = 28
-        versionName = "0.3.7"
+        versionCode = 52
+        versionName = "0.5.2"
     }
 
     buildTypes {

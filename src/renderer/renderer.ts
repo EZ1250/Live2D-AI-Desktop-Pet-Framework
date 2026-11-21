@@ -4495,3 +4495,237 @@ function installChatAttachmentUi(bridge: RendererBridge): void {
   }
 }
 
+
+
+/* ================================================================
+   投屏抓屏（手机端「电脑投屏」需要 ≥24fps）：
+   desktopCapturer.getSources 单次约 300ms，无法做 24fps；
+   这里用 getDisplayMedia 拿持续 MediaStream，按目标帧率 draw 到隐藏 canvas，
+   编码 JPEG 后经 IPC 交给主进程广播（不落盘、不阻塞 UI）。
+   ================================================================ */
+let castCaptureStream: MediaStream | null = null;
+let castCaptureTimer: number | null = null;
+let castCaptureVideo: HTMLVideoElement | null = null;
+let castCaptureCanvas: HTMLCanvasElement | null = null;
+let castCaptureWorkers: Worker[] | null = null;
+let castCaptureWorkerUrl: string | null = null;
+
+function stopCastCapture(): void {
+  if (castCaptureTimer !== null) {
+    window.clearInterval(castCaptureTimer);
+    castCaptureTimer = null;
+  }
+  if (castCaptureStream) {
+    for (const track of castCaptureStream.getTracks()) {
+      try { track.stop(); } catch { /* ignore */ }
+    }
+    castCaptureStream = null;
+  }
+  if (castCaptureVideo) {
+    try { castCaptureVideo.pause(); } catch { /* ignore */ }
+    castCaptureVideo.srcObject = null;
+    castCaptureVideo.remove();
+    castCaptureVideo = null;
+  }
+  castCaptureCanvas = null;
+  if (castCaptureWorkers) {
+    for (const w of castCaptureWorkers) {
+      try { w.terminate(); } catch { /* ignore */ }
+    }
+    castCaptureWorkers = null;
+  }
+  if (castCaptureWorkerUrl) {
+    try { URL.revokeObjectURL(castCaptureWorkerUrl); } catch { /* ignore */ }
+    castCaptureWorkerUrl = null;
+  }
+}
+
+async function startCastCapture(payload: { maxWidth?: number; fps?: number; quality?: number; sourceId?: string }): Promise<void> {
+  stopCastCapture();
+  const fps = Math.max(1, Math.min(30, Math.round(payload.fps ?? 24)));
+  const maxWidth = Math.max(320, Math.min(1920, Math.round(payload.maxWidth ?? 1280)));
+  const quality = Math.max(0.35, Math.min(0.95, Number(payload.quality ?? 70) / 100));
+  try {
+    // 优先 legacy desktop getUserMedia（部分 Windows/Electron 环境比 getDisplayMedia 帧率高）；
+    // 失败则退回 getDisplayMedia（由主进程 setDisplayMediaRequestHandler 选屏）。
+    let stream: MediaStream | null = null;
+    if (payload.sourceId) {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: {
+            mandatory: {
+              chromeMediaSource: 'desktop',
+              chromeMediaSourceId: payload.sourceId,
+              maxWidth,
+              maxHeight: 1200,
+              maxFrameRate: 30,
+            },
+          },
+        } as unknown as MediaStreamConstraints);
+      } catch (err) {
+        console.warn('[renderer] legacy getUserMedia 抓屏失败，回退 getDisplayMedia：', err);
+        stream = null;
+      }
+    }
+    if (!stream) {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: Math.max(fps, 30), max: 30 } },
+        audio: false,
+      } as MediaStreamConstraints);
+    }
+    castCaptureStream = stream;
+    try {
+      await stream.getVideoTracks()[0]?.applyConstraints({ frameRate: { ideal: 30, max: 30 } } as MediaTrackConstraints);
+    } catch { /* 部分平台不支持在 track 上改帧率 */ }
+    const video = document.createElement('video');
+    video.muted = true;
+    video.playsInline = true;
+    video.style.cssText = 'position:fixed;left:-10000px;top:-10000px;width:1px;height:1px;opacity:0;pointer-events:none;';
+    video.srcObject = stream;
+    document.body.appendChild(video);
+    castCaptureVideo = video;
+    const castStats: any = {
+      videoFrames: 0, sourceFps: 0, tickCount: 0, tickFps: 0,
+      workerDone: 0, workerFps: 0, encodeMsTotal: 0, encodeMsAvg: 0,
+      startedAt: Date.now(), settings: null,
+    };
+    (window as any).__petCastStats = castStats;
+    const countVideoFrame = (): void => {
+      castStats.videoFrames += 1;
+      const elapsed = (Date.now() - castStats.startedAt) / 1000;
+      if (elapsed > 0) castStats.sourceFps = Math.round((castStats.videoFrames / elapsed) * 10) / 10;
+      if (typeof video.requestVideoFrameCallback === 'function') video.requestVideoFrameCallback(countVideoFrame);
+    };
+    if (typeof video.requestVideoFrameCallback === 'function') video.requestVideoFrameCallback(countVideoFrame);
+    await video.play().catch(() => { /* Electron 自动播放策略通常允许 */ });
+    castStats.settings = JSON.stringify(stream.getVideoTracks()[0]?.getSettings() ?? {});
+    // 等首帧尺寸就绪（部分机器 videoWidth 在 play 后下一拍才更新）
+    for (let i = 0; i < 30 && (!video.videoWidth || !video.videoHeight); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const vw = video.videoWidth || 1280;
+    const vh = video.videoHeight || 720;
+    const scale = Math.min(1, maxWidth / vw);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(2, Math.round(vw * scale));
+    canvas.height = Math.max(2, Math.round(vh * scale));
+    castCaptureCanvas = canvas;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) throw new Error('canvas 2d 不可用');
+    const intervalMs = Math.max(16, Math.round(1000 / fps));
+    // JPEG 编码放 Worker 池（2 路并行）：浏览器主线程编码 ~20fps，达不到 24fps
+    const workerCode = `
+      // 关键：canvas/context 必须复用。每帧 new OffscreenCanvas 在本机实测多出 ~60ms。
+      let sharedCanvas = null;
+      let sharedCtx = null;
+      let sharedW = 0;
+      let sharedH = 0;
+      self.onmessage = async (e) => {
+        const { frame, bitmap, width, height, quality, id } = e.data;
+        try {
+          if (!sharedCanvas || sharedW !== width || sharedH !== height) {
+            sharedCanvas = new OffscreenCanvas(width, height);
+            sharedCtx = sharedCanvas.getContext('2d', { alpha: false });
+            sharedW = width;
+            sharedH = height;
+          }
+          const src = frame || bitmap;
+          sharedCtx.drawImage(src, 0, 0, width, height);
+          if (src && src.close) src.close();
+          const encodeStart = performance.now();
+          const blob = await sharedCanvas.convertToBlob({ type: 'image/webp', quality });
+          const encodeMs = performance.now() - encodeStart;
+          const buf = await blob.arrayBuffer();
+          self.postMessage({ id, buf, encodeMs }, [buf]);
+        } catch (err) {
+          self.postMessage({ id, error: String(err) });
+        }
+      };
+    `;
+    const workerUrl = URL.createObjectURL(new Blob([workerCode], { type: 'text/javascript' }));
+    const castWorkers = [new Worker(workerUrl), new Worker(workerUrl)];
+    castCaptureWorkers = castWorkers;
+    castCaptureWorkerUrl = workerUrl;
+    const castInFlight = [0, 0];
+    let castWorkerIndex = 0;
+    let castFrameId = 0;
+    for (let wi = 0; wi < castWorkers.length; wi += 1) {
+      castWorkers[wi].onmessage = (event: MessageEvent) => {
+        castInFlight[wi] = Math.max(0, castInFlight[wi] - 1);
+        const data = event.data as { buf?: ArrayBuffer; error?: string; id?: number; encodeMs?: number };
+        castStats.workerDone += 1;
+        const workerElapsed = (Date.now() - castStats.startedAt) / 1000;
+        if (workerElapsed > 0) castStats.workerFps = Math.round((castStats.workerDone / workerElapsed) * 10) / 10;
+        if (typeof data.encodeMs === 'number') {
+          castStats.encodeMsTotal += data.encodeMs;
+          castStats.encodeMsAvg = Math.round((castStats.encodeMsTotal / castStats.workerDone) * 10) / 10;
+        }
+        if (data.buf && castCaptureStream) {
+          try { window.electron.sendCastFrame(data.buf); } catch (err) { console.warn('[renderer] 投屏帧发送失败：', err); }
+        }
+      };
+    }
+    const imageCapture = (() => {
+      try {
+        const track = stream.getVideoTracks()[0];
+        return track && typeof ImageCapture !== 'undefined' ? (new ImageCapture(track) as any) : null;
+      }
+      catch { return null; }
+    })();
+    let castRawInFlight = false;
+    const tick = (): void => {
+      if (!castCaptureStream || !castCaptureVideo || castRawInFlight) return;
+      castStats.tickCount += 1;
+      const tickElapsed = (Date.now() - castStats.startedAt) / 1000;
+      if (tickElapsed > 0) castStats.tickFps = Math.round((castStats.tickCount / tickElapsed) * 10) / 10;
+      castRawInFlight = true;
+      const grab: Promise<ImageBitmap> = imageCapture
+        ? (imageCapture as any).grabFrame()
+        : createImageBitmap(castCaptureVideo);
+      grab.then((bitmap: ImageBitmap) => {
+        if (!castCaptureStream) { bitmap.close(); castRawInFlight = false; return; }
+        try {
+          // 原始像素交 main：nativeImage.toJPEG 原生编码，远快于 Canvas/Worker 的 JS 编码
+          ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+          bitmap.close();
+          const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          window.electron.sendCastRawFrame(pixels.data.buffer, canvas.width, canvas.height, Math.round(quality * 100));
+          castStats.workerDone += 1;
+          const workerElapsed = (Date.now() - castStats.startedAt) / 1000;
+          if (workerElapsed > 0) castStats.workerFps = Math.round((castStats.workerDone / workerElapsed) * 10) / 10;
+        }
+        catch (err) {
+          console.warn('[renderer] 投屏原始帧发送失败：', err);
+        }
+        finally {
+          castRawInFlight = false;
+        }
+      }).catch(() => { castRawInFlight = false; });
+    };
+    castCaptureTimer = window.setInterval(tick, intervalMs);
+    tick();
+    const track = stream.getVideoTracks()[0];
+    track?.addEventListener('ended', () => {
+      console.warn('[renderer] 投屏共享被系统结束');
+      stopCastCapture();
+    });
+  } catch (err) {
+    console.warn('[renderer] 投屏抓屏启动失败（getDisplayMedia）：', err);
+    stopCastCapture();
+  }
+}
+
+function installCastCapture(): void {
+  const bridge = window.electron;
+  if (!bridge?.onCastCapture) return;
+  bridge.onCastCapture((payload) => {
+    if (payload.action === 'start') {
+      void startCastCapture(payload);
+    } else {
+      stopCastCapture();
+    }
+  });
+}
+
+installCastCapture();

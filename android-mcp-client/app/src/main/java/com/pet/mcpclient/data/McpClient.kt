@@ -20,6 +20,16 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 
+/** 头像流参数：分辨率/帧率/格式/质量/二进制帧/透明边裁剪（由手机端按清晰度预设填写） */
+data class AvatarOptions(
+    val maxWidth: Int = 640,
+    val fps: Int = 24,
+    val format: String = "png",
+    val quality: Int = 82,
+    val binary: Boolean = false,
+    val trim: Boolean = true,
+)
+
 /**
  * 极简 MCP 客户端：只实现 initialize / tools/list / tools/call / ping。
  * 工具名与 schema 全部来自服务端返回，客户端不内置任何工具名（要求：不硬编码）。
@@ -261,8 +271,27 @@ class McpClient {
         if (t is WsTransport) t.onNotification = listener
     }
 
-    suspend fun avatarStart(maxWidth: Int = 300) {
-        request("pet/avatarStart", buildJsonObject { put("maxWidth", maxWidth) }, 8_000)
+    /** 订阅 WS 二进制头像帧（重连/升级 WS 后需要重新注册） */
+    fun setBinaryFrameListener(listener: ((ByteArray) -> Unit)?) {
+        (transport as? WsTransport)?.onBinaryFrame = listener
+    }
+
+    /** 返回电脑端 avatarStart 的能力回执：新版会带 binary/format/fps/maxWidth，旧版只有 {ok:true} */
+    /** 手机打开对话页：让电脑端把鼠标移到桌宠视线原点 */
+    suspend fun cursorToGazeOrigin() {
+        request("pet/cursorToGazeOrigin", buildJsonObject { }, 3_000)
+    }
+
+    suspend fun avatarStart(opts: AvatarOptions = AvatarOptions()): JsonElement {
+        val params = buildJsonObject {
+            put("maxWidth", opts.maxWidth)
+            put("fps", opts.fps)
+            put("format", opts.format)
+            put("quality", opts.quality)
+            put("binary", opts.binary)
+            put("trim", opts.trim)
+        }
+        return request("pet/avatarStart", params, 8_000)
     }
 
     suspend fun avatarStop() {
