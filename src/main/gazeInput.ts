@@ -72,7 +72,11 @@ export function startGazeInput(opts: GazeInputOptions): void {
   cursorFast = true;
   const poll = (): void => {
     const win = opts.getWindow();
-    if (!win || win.isDestroyed()) return;
+    if (!win || win.isDestroyed()) {
+      // 窗口销毁后不要留下无人管理的定时器
+      if (cursorTimer !== null) { clearInterval(cursorTimer); cursorTimer = null; }
+      return;
+    }
     const now = Date.now();
     const phoneTouchBypass = now < phoneTouchUntil; // 手机触摸期间：只暂停光标推送，不跳过穿透/鼠标状态维护
     const p = screen.getCursorScreenPoint();
@@ -116,8 +120,8 @@ export function startGazeInput(opts: GazeInputOptions): void {
         lastMouseIdleSceneAt = now;
         opts.onMouseIdle(now);
       }
-    } catch {
-      /* screen 暂不可用等场景静默，下轮重试 */
+    } catch (err) {
+      console.warn('[gaze] poll error:', (err && (err as Error).message) || err);
     }
   };
   // 先建 80ms 定时器，再跑首轮轮询：首轮若判定"远离窗口"，poll 内部会 clearInterval 后

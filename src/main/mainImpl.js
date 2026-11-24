@@ -83,6 +83,7 @@ const modelTextureCache_1 = require("./modelTextureCache");
 const screenTools_1 = require("./ai/screenTools");
 const castCapture_1 = require("./ai/castCapture");
 const mouseControl_1 = require("./ai/mouseControl");
+const computerUseTools_1 = require("./ai/computerUseTools");
 const meetingTools_1 = require("./ai/meetingTools");
 const translateTools_1 = require("./ai/translateTools");
 const mailTools_1 = require("./ai/mailTools");
@@ -591,6 +592,7 @@ function onMouseIdle(now) {
  */
 let hitIgnoreActive = false;
 let clickThroughEnabled = false;
+let clickThroughTimer = null;
 /** 记录 enable 状态与上次探测时间，供调试与兜底 */
 let lastHitProbeAt = 0;
 function setHitIgnore(win, ignore) {
@@ -700,7 +702,7 @@ function installClickThrough() {
      * 设置页可能在运行中改这一项。轮询本身很便宜（读一次小 JSON 也不贵，但没必要），
      * 所以按 2s 节流；关掉时立刻恢复可交互——否则窗口会停在"穿透"状态，用户点不动。
      */
-    setInterval(() => {
+    clickThroughTimer = setInterval(() => {
         let next = false;
         try {
             next = (0, chatClient_1.loadAppSettings)().clickThrough === true;
@@ -2105,7 +2107,7 @@ function resolveCastCapExe() {
 }
 
 electron_1.app.on('will-quit', () => {
-    try { castCaptureInstance?.stop(); } catch { /* ignore */ }
+    try { castCaptureInstance?.stop(); } catch (e) { console.warn('[main] castCapture stop failed:', (e && e.message) || e); }
 });
 
 function installPermissionGate() {
@@ -2894,6 +2896,16 @@ async function bootstrap() {
             case 'media_control':
                 // 发系统媒体键：不改文件、不联网，用户明说才调，所以不弹确认。
                 return await (0, mediaTools_1.mediaControl)(args);
+            case 'computer_list_windows':
+            case 'computer_ui_tree':
+            case 'computer_ui_find':
+            case 'computer_window_activate':
+            case 'computer_ui_click':
+            case 'computer_ui_type':
+            case 'computer_key_press':
+            case 'computer_mouse_scroll':
+            case 'computer_screen_click':
+                return executeComputerTool(name, args);
             case 'screen_capture':
                 // 截屏会把屏幕内容写进磁盘 → 属于"留下痕迹"的操作，先请用户点一次确认。
                 {
@@ -3859,6 +3871,30 @@ async function captureDebugScreenshots(dir, round = 0) {
     }
 }
 /** MCP 工具：权限模式检查 → 用户确认（autoApprove 跳过）→ 调用外部服务 */
+/** 内置电脑控制：动作类工具先确认，只读工具直接执行。 */
+async function executeComputerTool(name, rawArgs) {
+    const args = rawArgs ?? {};
+    const preview = (() => {
+        try { return JSON.stringify(args).slice(0, 300); }
+        catch { return String(args).slice(0, 300); }
+    })();
+    if (name !== 'computer_list_windows' && name !== 'computer_ui_tree' && name !== 'computer_ui_find') {
+        const verdict = await askUser(`电脑控制操作：${name}
+参数：${preview}`, [
+            { label: '允许', description: '执行这一次电脑控制' },
+            { label: '拒绝', description: '不执行，让模型如实说明' },
+        ]);
+        if (verdict !== '允许')
+            return '用户已拒绝该电脑控制操作，未执行。';
+    }
+    try {
+        return await (0, computerUseTools_1.executeComputerTool)(name, args);
+    }
+    catch (err) {
+        return `电脑控制工具失败：${err instanceof Error ? err.message : String(err)}`;
+    }
+}
+
 async function execMcpTool(name, rawArgs) {
     const client = mcpClient;
     if (!client)
@@ -4304,6 +4340,9 @@ async function handlePhoneTouch(action, x, y) {
     sendToRenderer(contracts_1.IPC_GLOBAL_CURSOR, { x: globalX, y: globalY });
     if (action === 'click') {
         // 只在"非穿透区域"触发点击：开启点击穿透时，先问渲染层该点是否命中角色
+        if (clickThroughEnabled && phoneHitPending !== null) {
+            return '上一次点击命中检测尚未完成，请稍后再点。';
+        }
         if (clickThroughEnabled && phoneHitPending === null) {
             const hit = await new Promise((resolve) => {
                 phoneHitPending = resolve;
@@ -4320,6 +4359,8 @@ async function handlePhoneTouch(action, x, y) {
             if (hit === null)
                 return '位置命中检测超时，本次没有触发点击。';
         }
+        if (!win || win.isDestroyed())
+            return '桌宠窗口已关闭，本次点击没有执行。';
         win.webContents.sendInputEvent({ type: 'mouseMove', x: localX, y: localY });
         win.webContents.sendInputEvent({ type: 'mouseDown', x: localX, y: localY, button: 'left', clickCount: 1 });
         win.webContents.sendInputEvent({ type: 'mouseUp', x: localX, y: localY, button: 'left', clickCount: 1 });
@@ -4335,8 +4376,8 @@ function petStatusText() {
     const settings = (0, chatClient_1.loadAppSettings)();
     const info = monitor?.getCurrentInfo() ?? null;
     const todos = toolbox?.getTodos() ?? [];
-    const model = settings.modelName || (appResolver ? appResolver.modelList()[0] : '') || '未设置';
-    const mcpIn = mcpClient ? mcpClient.statusText().split('\n')[0] : 'MCP 工具：未配置';
+    const model = settings.modelName || (appResolver?.modelList?.()[0] ?? '') || '未设置';
+    const mcpIn = mcpClient ? String(mcpClient.statusText?.() ?? '').split('\n')[0] : 'MCP 工具：未配置';
     return [
         `桌宠：${settings.petName || model}`,
         `模型：${model}`,
@@ -4349,7 +4390,7 @@ function petStatusText() {
 function readPetResource(uri) {
     switch (uri) {
         case 'pet://status': {
-            const panel = mcpPanelStatusNow();
+            const panel = mcpPanelStatusNow() ?? {};
             return [petStatusText(), panel.clientText, panel.serverText].filter(Boolean).join('\n\n');
         }
         case 'pet://todos': {
@@ -4656,6 +4697,10 @@ function shutdown() {
         clearInterval(tickTimer);
         tickTimer = null;
     }
+    if (clickThroughTimer !== null) {
+        clearInterval(clickThroughTimer);
+        clickThroughTimer = null;
+    }
     gazeInput_1.stopGazeInput(); // 停掉全局光标轮询（并清掉"已推送光标"记忆）
     if (bubbleTimer !== null) {
         clearTimeout(bubbleTimer);
@@ -4673,6 +4718,9 @@ function shutdown() {
     closeThinkWindowWindow();
     destroyTray(); // 托盘不销毁会在退出时留一个僵尸图标
     unregisterGlobalShortcuts(); // 不注销会把组合键一直占着，用户会以为键盘坏了
+    try { castCaptureInstance?.stop(); } catch (err) { console.warn('[main] shutdown cast stop failed:', (err && err.message) || err); }
+    try { mouseControl_1.killActiveMouseHelpers(); } catch { /* ignore */ }
+    try { computerUseTools_1.killActiveUiHelpers(); } catch { /* ignore */ }
     monitor?.stop();
     chat?.cancel();
     toolbox?.stop(); // 停止所有提醒定时器（数据已持久化，下次启动恢复）

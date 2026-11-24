@@ -89,7 +89,7 @@ test('投屏协议：binary 协商、帧推送、鼠标/输入法', async () => 
     const ack = await waitResponse(start);
     assert.equal(ack.result.ok, true);
     assert.equal(ack.result.binary, true);
-    assert.equal(ack.result.fps, 30);
+    assert.equal(ack.result.fps, 24);
     assert.equal(ack.result.maxWidth, 1280);
     server.pushCastFrame(Buffer.from('fake-jpeg'));
     await waitFor(() => messages.binary.length > 0);

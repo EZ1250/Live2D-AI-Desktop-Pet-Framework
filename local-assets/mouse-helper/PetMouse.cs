@@ -25,6 +25,8 @@ class PetMouse
     const uint MOUSEEVENTF_RIGHTUP = 0x0010;
     const byte VK_CONTROL = 0x11;
     const byte VK_V = 0x56;
+    const uint MOUSEEVENTF_WHEEL = 0x0800;
+    const uint MOUSEEVENTF_HWHEEL = 0x01000;
 
     [STAThread]
     static int Main(string[] args)
@@ -38,7 +40,7 @@ class PetMouse
             if (args.Length > 1) int.TryParse(args[1], out x);
             if (args.Length > 2) int.TryParse(args[2], out y);
 
-            if (command == "move" || command == "moveclick" || command == "moverightclick")
+            if (command == "move" || command == "moveclick" || command == "moverightclick" || command == "movedoubleclick")
             {
                 if (!SetCursorPos(x, y)) return 2;
             }
@@ -51,6 +53,29 @@ class PetMouse
             {
                 mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, UIntPtr.Zero);
                 mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, UIntPtr.Zero);
+            }
+            if (command == "doubleclick" || command == "movedoubleclick")
+            {
+                mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
+                mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
+                Thread.Sleep(40);
+                mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
+                mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
+            }
+            if (command == "scroll")
+            {
+                if (args.Length < 4) return 4;
+                int delta;
+                if (!int.TryParse(args[3], out delta)) return 4;
+                int sx, sy;
+                if (int.TryParse(args[1], out sx) && int.TryParse(args[2], out sy) && sx != 0 && sy != 0) SetCursorPos(sx, sy);
+                bool horizontal = args.Length > 4 && args[4].Equals("h", StringComparison.OrdinalIgnoreCase);
+                mouse_event(horizontal ? MOUSEEVENTF_HWHEEL : MOUSEEVENTF_WHEEL, 0, 0, unchecked((uint)delta), UIntPtr.Zero);
+            }
+            if (command == "key")
+            {
+                if (args.Length < 2) return 5;
+                SendCombo(args[1]);
             }
             if (command == "is-editable")
             {
@@ -92,6 +117,66 @@ class PetMouse
             Console.Error.WriteLine(err.Message);
             return 1;
         }
+    }
+
+    static byte Vk(string key)
+    {
+        key = key.Trim().ToLowerInvariant();
+        switch (key)
+        {
+            case "ctrl": case "control": return 0x11;
+            case "shift": return 0x10;
+            case "alt": return 0x12;
+            case "win": return 0x5B;
+            case "enter": case "return": return 0x0D;
+            case "tab": return 0x09;
+            case "esc": case "escape": return 0x1B;
+            case "backspace": return 0x08;
+            case "delete": return 0x2E;
+            case "space": return 0x20;
+            case "up": return 0x26;
+            case "down": return 0x28;
+            case "left": return 0x25;
+            case "right": return 0x27;
+            case "home": return 0x24;
+            case "end": return 0x23;
+            case "pageup": return 0x21;
+            case "pagedown": return 0x22;
+        }
+        if (key.Length == 1)
+        {
+            char c = key[0];
+            if (c >= 'a' && c <= 'z') return (byte)(0x41 + (c - 'a'));
+            if (c >= '0' && c <= '9') return (byte)(0x30 + (c - '0'));
+        }
+        if (key.StartsWith("f"))
+        {
+            int n;
+            if (int.TryParse(key.Substring(1), out n) && n >= 1 && n <= 12) return (byte)(0x6F + n);
+        }
+        return 0;
+    }
+
+    static void SendCombo(string combo)
+    {
+        var parts = combo.Split('+');
+        var modifiers = new System.Collections.Generic.List<byte>();
+        var keys = new System.Collections.Generic.List<byte>();
+        foreach (var part in parts)
+        {
+            byte vk = Vk(part);
+            if (vk == 0) continue;
+            if (vk == 0x11 || vk == 0x10 || vk == 0x12 || vk == 0x5B) modifiers.Add(vk);
+            else keys.Add(vk);
+        }
+        if (keys.Count == 0) return;
+        foreach (var m in modifiers) keybd_event(m, 0, 0, UIntPtr.Zero);
+        foreach (var k in keys)
+        {
+            keybd_event(k, 0, 0, UIntPtr.Zero);
+            keybd_event(k, 0, 2, UIntPtr.Zero);
+        }
+        for (int i = modifiers.Count - 1; i >= 0; i--) keybd_event(modifiers[i], 0, 2, UIntPtr.Zero);
     }
 
     static bool IsFocusedEditable()

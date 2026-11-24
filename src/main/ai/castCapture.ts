@@ -67,6 +67,8 @@ export class CastCapture {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (err) {
+      this.stopped = true;
+      this.child = null;
       this.opts.onError?.(`投屏抓屏助手启动失败：${(err as Error).message}`);
       return;
     }

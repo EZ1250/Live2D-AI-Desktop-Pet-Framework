@@ -64,6 +64,8 @@ extraResources:
   # 手机投屏鼠标控制助手（SetCursorPos/mouse_event）
   - from: local-assets/mouse-helper
     to: mouse-helper
+  - from: local-assets/ui-helper
+    to: ui-helper
   - from: local-assets/pet-icon.ico
     to: pet-icon.ico
 

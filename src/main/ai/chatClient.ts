@@ -44,6 +44,7 @@ import { MEDIA_ACTIONS } from './mediaTools';
 import {
   assembleSystemPrompt,
   buildPhaseInstruction,
+  type PromptOrder,
   loadPromptLibrary,
   type PromptLibrary,
   type PromptPhase,
@@ -119,6 +120,7 @@ const CONFIRM_TOOLS = new Set([
 const SHELL_TOOLS = new Set(['shell_run', 'shell_bg', 'shell_output', 'shell_kill']);
 /** 按工具类型取执行超时（等待用户确认的时间不能被算成执行超时） */
 function toolTimeoutMs(name: string): number {
+  if (name.startsWith('computer_')) return 120_000;
   if (name.startsWith(TOOL_PREFIX_MCP)) return TOOL_TIMEOUT_CONFIRM_MS; // MCP：确认等待 + 远端执行
   if (SHELL_TOOLS.has(name)) return TOOL_TIMEOUT_SHELL_MS;
   if (CONFIRM_TOOLS.has(name)) return TOOL_TIMEOUT_CONFIRM_MS;
@@ -1165,11 +1167,36 @@ export class ChatClient {
     });
   }
 
+  /** 让 AI 判断本轮是任务还是聊天；失败按任务处理（更保守，避免漏工具）。 */
+  private async classifyIntent(text: string): Promise<PromptOrder> {
+    try {
+      const prompt = [
+        '判断用户这一轮消息是「任务」还是「聊天」。',
+        '任务：要求执行操作、查资料、改文件、控制电脑、需要工具或多步完成。',
+        '聊天：寒暄、情绪表达、普通问答、不需要实际操作。',
+        '只输出一个词：TASK 或 CHAT。',
+      ].join('\n');
+      const resp = await this.requestOnce([
+        { role: 'system', content: prompt },
+        { role: 'user', content: text.slice(0, 4000) },
+      ], []);
+      const out = String(resp.text ?? '').toUpperCase();
+      const order: PromptOrder = out.includes('TASK') ? 'task' : out.includes('CHAT') ? 'chat' : 'task';
+      if (process.env.PET_LOG_PROMPT === '1') console.log(`[chat] 意图判断：${order}（${out.slice(0, 40)}）`);
+      return order;
+    } catch (err) {
+      if (process.env.PET_LOG_PROMPT === '1') console.warn('[chat] 意图判断失败，按任务处理：', (err as Error).message);
+      return 'task';
+    }
+  }
+
   /** AI 自主调用工具（function-calling）的对话循环；最终把文本经 onDone 给渲染层 */
   private async startChatWithTools(userText: string): Promise<void> {
     const generation = this.chatGeneration;
-    // 固定三层只组装一次；第 4 层「当前阶段指令」每轮换
-    const systemText = this.buildSystemPrompt(userText);
+    // 先让 AI 判断任务/聊天；任务按 1,2,3,4，聊天按 3,4,1,2 注入
+    const promptOrder = await this.classifyIntent(userText);
+    if (this.cancelled || generation !== this.chatGeneration) return;
+    const systemText = this.buildSystemPrompt(userText, promptOrder);
     const history = this.messages.filter((m) => m.role !== 'system');
     history.push({ role: 'user', content: userText });
     const rounds = Math.max(0, Math.round(this.cfg.contextRounds));
@@ -1222,7 +1249,7 @@ export class ChatClient {
           roundBudget: maxToolRounds,
           observation: phase === 'reflect' ? lastObservation : '',
         });
-        messages[0] = { role: 'system', content: `${systemText}\n\n${phaseText}` };
+        messages[0] = { role: 'system', content: this.buildSystemPrompt(userText, promptOrder, phaseText) };
         const resp = await this.requestOnce(messages, this.allToolDefs());
         const respText = typeof resp.text === 'string' ? resp.text.trim() : '';
         if (this.cancelled || generation !== this.chatGeneration) return;
@@ -1734,7 +1761,7 @@ export class ChatClient {
    * 系统提示词 = 第 1 层身份与边界 + 第 2 层工具说明 + 第 3 层任务上下文。
    * 第 4 层（当前阶段指令）由思考轮循环在每轮请求前追加，不在这里。
    */
-  private buildSystemPrompt(userRequest = ''): string {
+  private buildSystemPrompt(userRequest = '', order: PromptOrder = 'task', phaseText = ''): string {
     const lib = this.promptLibrary;
     // 用户起的名字优先：知识库里的称呼可能与用户设置不一致时，以设置为准
     const nameLine = this.petName
@@ -1780,7 +1807,7 @@ export class ChatClient {
       identityExtra,
       toolsCatalog,
       contextText: buildContextText(scenarioText),
-    });
+    }, order, phaseText);
     // 提示词体积护栏：system 最多占 maxContextTokens 的 60%。
     // 超了先逐级缩小情景提示词（2400 → 1200 → 600），仍超再整段省掉，最后才硬截断。
     const maxSystemTokens = Math.max(600, Math.floor(this.cfg.maxContextTokens * 0.6));
@@ -1791,7 +1818,7 @@ export class ChatClient {
           identityExtra,
           toolsCatalog,
           contextText: buildContextText(scenarioText),
-        });
+        }, order, phaseText);
         if (!scenarioText || estimateTokens(assembled) <= maxSystemTokens) break;
       }
       if (estimateTokens(assembled) > maxSystemTokens) {
@@ -1800,7 +1827,7 @@ export class ChatClient {
           identityExtra,
           toolsCatalog,
           contextText: buildContextText(''),
-        });
+        }, order, phaseText);
       }
     }
     if (estimateTokens(assembled) > maxSystemTokens) {
@@ -1809,7 +1836,7 @@ export class ChatClient {
       assembled = `${assembled.slice(0, maxChars)}\n…（系统提示词超长已截断：可调大设置里的 maxContextTokens 或缩短人设知识库）`;
     }
     if (process.env.PET_LOG_PROMPT === '1') {
-      console.log(`[chat] 系统提示词：${assembled.length} 字（第 1~3 层）|` +
+      console.log(`[chat] 系统提示词：${assembled.length} 字（${order === 'chat' ? '3,4,1,2' : '1,2,3,4'}）|` +
         ` 情景提示词：${scenarioText ? `${scenarioText.length} 字` : '暂无记录'}（预算 ${SCENARIO_PROMPT_BUDGET_CHARS} 字）| 第 4 层阶段指令按轮注入`);
     }
     return assembled;

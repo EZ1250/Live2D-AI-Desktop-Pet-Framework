@@ -3,10 +3,20 @@
  * 坐标：投屏 x/y 为 0~1（相对所选显示器），视线原点直接用屏幕 DIP 坐标。
  * PetMouse.exe 保持 DPI-unaware，与桌宠窗口坐标一致。
  */
-import { spawn } from 'child_process';
+import { spawn, type ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { app, screen } from 'electron';
+
+const activeMouseHelpers = new Set<ChildProcess>();
+
+/** 应用退出时清理仍在跑的 PetMouse 子进程（防止孤儿进程） */
+export function killActiveMouseHelpers(): void {
+  for (const child of activeMouseHelpers) {
+    try { child.kill(); } catch { /* ignore */ }
+  }
+  activeMouseHelpers.clear();
+}
 
 function resolveHelper(): string {
   const candidates: string[] = [];
@@ -28,10 +38,13 @@ function runHelperCapture(args: string[], timeoutMs = 2500): Promise<string> {
   return new Promise((resolve, reject) => {
     let settled = false;
     const child = spawn(exe, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    activeMouseHelpers.add(child);
+    const cleanup = (): void => { activeMouseHelpers.delete(child); };
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      try { child.kill(); } catch { /* ignore */ }
+      try { child.kill(); } catch (e) { console.warn('[mouse] kill helper failed:', (e as Error).message); }
+      cleanup();
       reject(new Error('鼠标控制超时'));
     }, Math.max(500, Math.min(5000, timeoutMs)));
     let stdout = '';
@@ -42,16 +55,23 @@ function runHelperCapture(args: string[], timeoutMs = 2500): Promise<string> {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      cleanup();
       reject(new Error(`鼠标控制助手启动失败：${err.message}`));
     });
     child.on('exit', (code) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      cleanup();
       if (code === 0) resolve(stdout);
       else reject(new Error(stderr.trim() || `鼠标控制助手退出（code=${code ?? 'null'}）`));
     });
   });
+}
+
+/** 直接执行 PetMouse 命令并返回 stdout（供内置电脑控制工具用） */
+export async function runPetMouse(args: string[], timeoutMs = 3000): Promise<string> {
+  return runHelperCapture(args, timeoutMs);
 }
 
 async function runHelper(args: string[], timeoutMs = 2500): Promise<void> {

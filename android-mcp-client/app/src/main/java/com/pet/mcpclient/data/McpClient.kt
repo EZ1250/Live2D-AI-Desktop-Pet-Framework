@@ -8,6 +8,7 @@ package com.pet.mcpclient.data
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withTimeout
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -38,7 +39,7 @@ class McpClient {
     private val json = Json { ignoreUnknownKeys = true }
     private var transport: McpTransport? = null
     private var serverConfig: ServerConfig? = null
-    private var nextId = 1L
+    private val nextId = AtomicLong(1L)
     var channel: String = "—"
         private set
 
@@ -215,7 +216,7 @@ class McpClient {
         val t = transport ?: throw McpException("尚未连接电脑端")
         val payload = buildJsonObject {
             put("jsonrpc", "2.0")
-            put("id", nextId++)
+            put("id", nextId.getAndIncrement())
             put("method", method)
             put("params", params)
         }.toString()
@@ -227,7 +228,8 @@ class McpClient {
             } catch (e: TimeoutCancellationException) {
                 throw e // 交给 request() 统一映射，别按连接错误改写
             } catch (e: McpException) {
-                if (t is WsTransport) fallbackToHttp(payload, timeoutMs, e) else throw mapFailure(e, timeoutMs)
+                // 业务错误（方法不存在/参数错误等）不降级 HTTP；否则一次业务错误会断掉 WS 通知通道
+                throw e
             } catch (e: Exception) {
                 throw mapFailure(e, timeoutMs)
             }

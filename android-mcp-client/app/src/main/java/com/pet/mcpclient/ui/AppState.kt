@@ -403,6 +403,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return true
     }
 
+    override fun onCleared() {
+        stopCast()
+        stopAvatar()
+        super.onCleared()
+    }
+
     fun setAvatarBallSize(dp: Int) {
         val value = dp.coerceIn(160, 260)
         avatarBallSizeDp = value
@@ -686,7 +692,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 throw e
             } catch (e: Exception) {
                 if (castOn) log("投屏连接失败：${e.message ?: "未知错误"}")
-                stopCast()
+            } finally {
+                // 协程取消/异常都释放投屏 WS/解码缓冲，避免幽灵连接
+                if (castOn) castOn = false
+                runCatching { castClient?.stop() }
+                castClient = null
+                castPendingBytes.set(null)
+                castDecoding.set(false)
+                castHasFrame = false
             }
         }
     }

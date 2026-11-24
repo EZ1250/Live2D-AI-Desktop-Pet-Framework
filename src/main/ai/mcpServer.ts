@@ -768,7 +768,7 @@ export class PetMcpServer {
           if (id !== null) this.wsSendJson(socket, {
             jsonrpc: '2.0',
             id,
-            result: { ok: true, binary: opts.binary, fps: 30, maxWidth: opts.maxWidth, display: opts.display },
+            result: { ok: true, binary: opts.binary, fps: opts.fps, maxWidth: opts.maxWidth, display: opts.display },
           });
           return;
         }
@@ -792,6 +792,10 @@ export class PetMcpServer {
             trim: params.trim !== false,
             binary: params.binary === true,
           };
+          if (!this.opts.deps.avatarFrame) {
+            if (id !== null) this.wsSendJson(socket, { jsonrpc: '2.0', id, error: { code: -32603, message: '电脑端未提供头像帧能力' } });
+            return;
+          }
           this.startAvatarStream(socket, opts);
           if (id !== null) {
             this.wsSendJson(socket, {
@@ -940,7 +944,7 @@ export class PetMcpServer {
         params: { id, tool, detail, timeoutMs: Math.min(300_000, timeoutMs) },
       };
       for (const sock of sockets) {
-        try { this.wsSendJson(sock, payload); } catch { /* 单个连接异常忽略 */ }
+        try { this.wsSendJson(sock, payload); } catch (err) { console.warn('[mcp] confirm request send failed:', (err as Error).message); }
       }
     });
   }

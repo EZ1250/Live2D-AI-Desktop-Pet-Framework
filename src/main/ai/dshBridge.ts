@@ -3,7 +3,7 @@
  *
  * 为什么需要：桌宠除了直连 OpenAI 兼容 API，还可以把对话交给本机已登录的 DeepSeek Harness（dsh）
  * 处理——用户不用再配 API Key/地址，直接用 DSH 里已配置的模型与账号。按用户要求：
- * **桥接 DSH 时只转对话**（只把用户文字发过去、只取最终回复文字；不传工具、不传截图）。
+ * **桥接 DSH 时以文本协议传对话**：用户文字、附件路径/元数据（图片由 DSH 的 read_image 查看，音频先 ASR），只取最终回复文字；桌宠不向 DSH 注入自己的工具/截图。
  *
  * 实现方式（实测本机 dsh 0.2.0-rc.2）：
  *   dsh --profile headless --json [--session-id <id>] -   ← stdin 传任务文本，stdout 输出 NDJSON 事件
@@ -19,6 +19,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { ensureDshWebRunning } from './dshWebManager';
 
 export type DshErrorCode = 'NOT_FOUND' | 'TIMEOUT' | 'EXIT' | 'CANCELLED' | 'UNKNOWN';
 
@@ -222,6 +223,9 @@ export class DshBridge {
   private generation = 0;
   /** 命令路径不安全时置位：不 spawn，状态直接报不可用 */
   private commandInvalid = false;
+  /** 同一时刻只跑一次 DSH web 检测/启动 */
+  private webEnsurePromise: Promise<void> | null = null;
+  private webPid: number | null = null;
 
   constructor(options: DshBridgeOptions) {
     const env = options.env ?? process.env;
@@ -382,10 +386,31 @@ export class DshBridge {
     });
   }
 
+  /** 桥接 DSH 前后台没有 DSH web 时，自动最小化拉起一次；失败不阻断 headless 对话。 */
+  private async ensureWebRunning(): Promise<void> {
+    if (this.webPid) return;
+    if (this.webEnsurePromise) return this.webEnsurePromise;
+    if (this.commandInvalid) return;
+    this.webEnsurePromise = (async () => {
+      try {
+        const plan = buildDshSpawnPlan(this.commandPath, ['web']);
+        const result = await ensureDshWebRunning(plan, { timeoutMs: 12000 });
+        this.webPid = result.pid;
+        console.log(`[dsh] 后台 DSH ${result.started ? '已启动' : '已在运行'}${result.pid ? `（pid=${result.pid}）` : ''}`);
+      } catch (err) {
+        // DSH headless 对话不依赖 web，启动失败只记录，不阻断桥接
+        this.lastError = `DSH 后台启动失败：${formatDshError(err)}`;
+        console.warn('[dsh] 后台 DSH 启动失败：', this.lastError);
+      }
+    })().finally(() => { this.webEnsurePromise = null; });
+    return this.webEnsurePromise;
+  }
+
   private async processQueue(): Promise<void> {
     if (this.processing) return;
     this.processing = true;
     try {
+      await this.ensureWebRunning();
       while (this.pending.length > 0) {
         const item = this.pending.shift();
         if (!item) continue;

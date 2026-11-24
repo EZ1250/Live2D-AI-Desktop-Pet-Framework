@@ -4,6 +4,8 @@ MCP 传输层：HTTP POST /mcp 与 WebSocket /ws 两种通道。
  */
 package com.pet.mcpclient.data
 
+import android.util.Log
+
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -160,7 +162,8 @@ class WsTransport(private val server: ServerConfig) : McpTransport {
             val sock = ws ?: return false
             sock.send(JsonObject(mapOf("jsonrpc" to JsonPrimitive("2.0"), "method" to JsonPrimitive(method), "params" to params)).toString())
             true
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.w("WsTransport", "sendNotification($method) failed", e)
             false
         }
     }

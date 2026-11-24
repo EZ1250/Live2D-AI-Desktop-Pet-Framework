@@ -44,6 +44,15 @@ import { tool_shell_run } from './dev';
 import { tool_shell_bg } from './dev';
 import { tool_shell_output } from './dev';
 import { tool_shell_kill } from './dev';
+import { tool_computer_list_windows } from './computer';
+import { tool_computer_ui_tree } from './computer';
+import { tool_computer_ui_find } from './computer';
+import { tool_computer_window_activate } from './computer';
+import { tool_computer_ui_click } from './computer';
+import { tool_computer_ui_type } from './computer';
+import { tool_computer_key_press } from './computer';
+import { tool_computer_mouse_scroll } from './computer';
+import { tool_computer_screen_click } from './computer';
 
 /** 模型可见工具清单：顺序与拆分前完全一致（tests/toolCatalog.test.js 有快照） */
 export const TOOL_DEFS: ToolDef[] = [
@@ -92,4 +101,13 @@ export const TOOL_DEFS: ToolDef[] = [
   tool_shell_bg,
   tool_shell_output,
   tool_shell_kill,
+  tool_computer_list_windows,
+  tool_computer_ui_tree,
+  tool_computer_ui_find,
+  tool_computer_window_activate,
+  tool_computer_ui_click,
+  tool_computer_ui_type,
+  tool_computer_key_press,
+  tool_computer_mouse_scroll,
+  tool_computer_screen_click,
 ];

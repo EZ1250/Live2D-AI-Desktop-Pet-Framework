@@ -17,6 +17,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 export type PromptPhase = 'think' | 'act' | 'reflect';
+/** task=任务：1,2,3,4；chat=聊天：3,4,1,2 */
+export type PromptOrder = 'task' | 'chat';
 
 export interface PromptLibrary {
   identity: string;
@@ -125,12 +127,24 @@ const LAYER_TITLES = [
  * 组装固定的三层（第 4 层阶段指令在每轮请求前单独拼在最前面/最后面）。
  * 输出稳定有序：层标题 + 文案 + 追加内容。
  */
-export function assembleSystemPrompt(lib: PromptLibrary, parts: SystemPromptParts = {}): string {
-  const sec: string[] = [];
-  sec.push(`${LAYER_TITLES[0]}\n${lib.identity}${parts.identityExtra ? `\n${parts.identityExtra}` : ''}`);
-  sec.push(`${LAYER_TITLES[1]}\n${lib.tools}${parts.toolsCatalog ? `\n${parts.toolsCatalog}` : ''}`);
-  sec.push(`${LAYER_TITLES[2]}\n${lib.context}${parts.contextText ? `\n${parts.contextText}` : ''}`);
-  return sec.join('\n\n');
+function sections(lib: PromptLibrary, parts: SystemPromptParts): { l1: string; l2: string; l3: string } {
+  return {
+    l1: `${LAYER_TITLES[0]}\n${lib.identity}${parts.identityExtra ? `\n${parts.identityExtra}` : ''}`,
+    l2: `${LAYER_TITLES[1]}\n${lib.tools}${parts.toolsCatalog ? `\n${parts.toolsCatalog}` : ''}`,
+    l3: `${LAYER_TITLES[2]}\n${lib.context}${parts.contextText ? `\n${parts.contextText}` : ''}`,
+  };
+}
+
+export function assembleSystemPrompt(
+  lib: PromptLibrary,
+  parts: SystemPromptParts = {},
+  order: PromptOrder = 'task',
+  phaseText = '',
+): string {
+  const s = sections(lib, parts);
+  return order === 'chat'
+    ? [s.l3, phaseText, s.l1, s.l2].filter(Boolean).join('\n\n')
+    : [s.l1, s.l2, s.l3, phaseText].filter(Boolean).join('\n\n');
 }
 
 export interface PhaseExtra {
@@ -160,7 +174,7 @@ export function buildRoundSystemPrompt(
   parts: SystemPromptParts,
   phase: PromptPhase,
   extra: PhaseExtra = {},
+  order: PromptOrder = 'task',
 ): string {
-  const base = assembleSystemPrompt(lib, parts);
-  return `${base}\n\n${buildPhaseInstruction(lib, phase, extra)}`;
+  return assembleSystemPrompt(lib, parts, order, buildPhaseInstruction(lib, phase, extra));
 }

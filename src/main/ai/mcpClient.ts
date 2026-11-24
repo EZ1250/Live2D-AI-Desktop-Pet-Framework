@@ -12,7 +12,7 @@ export interface McpToolDef {
   function: { name: string; description: string; parameters: Record<string, unknown> };
 }
 
-interface McpServerConfig {
+export interface McpServerConfig {
   serverName: string;
   transport: 'stdio' | 'http';
   command?: string;
@@ -250,6 +250,7 @@ export class McpClient {
   private connecting: Promise<void> | null = null;
   private reloading: Promise<void> | null = null;
 
+  private readonly builtinServers: McpServerConfig[];
   constructor(
     private readonly opts: {
       configPath: string;
@@ -257,8 +258,12 @@ export class McpClient {
       log?: (message: string) => void;
       /** 工具集变化（首次连上 / list_changed）时回调，让 ChatClient 重新取工具定义 */
       onToolsChanged?: () => void;
+      /** 内置 server（如 DSH computer-use）；与用户 mcp.json 合并，同名时用户配置优先 */
+      builtinServers?: McpServerConfig[];
     },
-  ) {}
+  ) {
+    this.builtinServers = Array.isArray(opts.builtinServers) ? opts.builtinServers : [];
+  }
 
   private log(message: string): void {
     this.opts.log?.(message);
@@ -274,18 +279,21 @@ export class McpClient {
     this.connecting = (async () => {
       let raw: unknown = null;
       try {
-        if (!fs.existsSync(this.opts.configPath)) {
-          this.log('MCP：未配置（mcp.json 不存在），跳过');
-          return;
+        if (fs.existsSync(this.opts.configPath)) {
+          const text = fs.readFileSync(this.opts.configPath, 'utf8').replace(/^\uFEFF/, '');
+          raw = JSON.parse(text);
+        } else {
+          this.log('MCP：mcp.json 不存在，外部 MCP 跳过');
         }
-        const text = fs.readFileSync(this.opts.configPath, 'utf8').replace(/^\uFEFF/, '');
-        raw = JSON.parse(text);
       } catch (err) {
-        this.log(`MCP：mcp.json 读取/解析失败（${(err as Error).message}），跳过`);
-        return;
+        this.log(`MCP：mcp.json 读取/解析失败（${(err as Error).message}），仅加载内置 server`);
+        raw = null;
       }
-      const { servers, errors } = parseMcpConfig(raw);
+      const { servers: userServers, errors } = parseMcpConfig(raw ?? { servers: [] });
       for (const e of errors) this.log(`MCP 配置错误：${e}`);
+      const userNames = new Set(userServers.map((s) => s.serverName));
+      const builtin = this.builtinServers.filter((s) => !userNames.has(s.serverName));
+      const servers = [...userServers, ...builtin];
       if (servers.length === 0) {
         this.log('MCP：没有可用的服务器配置');
         return;

@@ -571,7 +571,7 @@ export async function prepareAttachmentsForApi(
   return { promptText };
 }
 
-/** DSH 模式：附件复制到 bridge/inbox，prompt 里给路径与读取提示；音频先 ASR。 */
+/** DSH 模式：附件全部复制到 bridge/inbox，prompt 里给路径/类型/大小和读取提示；音频先 ASR。 */
 export async function prepareAttachmentsForDsh(
   settings: AppSettings,
   bridgeDir: string,
@@ -584,33 +584,39 @@ export async function prepareAttachmentsForDsh(
   } catch {
     /* 后面复制会失败并给可读错误 */
   }
-  const lines: string[] = [];
-  const images: Array<{ path: string; name: string; mime: string }> = [];
+  const lines: string[] = ['以下是用户随消息发来的真实附件（路径均可读取，不要忽略；先读取/查看再回答）：'];
   try {
     for (const att of attachments) {
+      const dest = path.join(inbox, uniqueCopyName(att.name));
+      fs.copyFileSync(att.path, dest);
+      const mime = att.mime || mimeForName(att.name);
+      const meta = `${mime}，${att.size} 字节`;
       if (att.kind === 'image') {
-        const dest = path.join(inbox, uniqueCopyName(att.name));
-        fs.copyFileSync(att.path, dest);
-        images.push({ path: dest, name: att.name, mime: att.mime || mimeForName(att.name) });
-        lines.push(`- 图片：${dest}（请先用 read_image 工具查看这张图片，再结合它回答）`);
+        let visionNote = '';
+        try {
+          const [desc] = await describeImages(settings, [{ path: dest, name: att.name, mime }]);
+          if (desc) visionNote = `\n  视觉转述：${desc}`;
+        } catch (err) {
+          visionNote = `\n  （视觉转述不可用：${(err as Error).message}；请优先用 read_image 读取）`;
+        }
+        lines.push(`- 图片：${dest}（${meta}）。请先用 read_image 工具查看这张图片，再结合图片内容回答；不要凭空猜测。${visionNote}`);
       } else if (att.kind === 'audio') {
-        const texts = await transcribeAudioAttachments(settings, [att]);
-        lines.push(`- 语音（${att.name}）转写：${texts[0]}`);
+        try {
+          const texts = await transcribeAudioAttachments(settings, [att]);
+          lines.push(`- 音频：${dest}（${meta}）。转写：${texts[0]}`);
+        } catch (err) {
+          lines.push(`- 音频：${dest}（${meta}）。当前没有可用语音转写（${(err as Error).message}），只能提供文件路径与元数据。`);
+        }
       } else if (att.kind === 'text') {
-        const dest = path.join(inbox, uniqueCopyName(att.name));
-        fs.copyFileSync(att.path, dest);
-        lines.push(`- 文本文件：${dest}\n${readTextInline(dest)}`);
+        lines.push(`- 文本文件：${dest}（${meta}）。内容如下：\n${readTextInline(dest)}`);
       } else {
-        const dest = path.join(inbox, uniqueCopyName(att.name));
-        fs.copyFileSync(att.path, dest);
-        lines.push(`- 文件：${dest}（可用文件读取工具查看内容）`);
+        lines.push(`- 文件：${dest}（${meta}）。如果是 PDF/Office/压缩包/视频等二进制，请用当前可用的文件读取或解析工具；无法读取时如实说明，不要编造内容。`);
       }
     }
   } catch (err) {
     return { promptText: '', blockedError: (err as Error).message };
   }
-  const block = lines.length ? `【用户附件】\n${lines.join('\n')}` : '';
-  return { promptText: block };
+  return { promptText: `【用户附件】\n${lines.join('\n')}` };
 }
 
 /** 给 DSH 的固定约定：需要回发文件时怎么写标记。 */

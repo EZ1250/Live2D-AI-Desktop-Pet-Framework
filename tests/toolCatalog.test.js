@@ -53,6 +53,15 @@ const EXPECTED_NAMES = [
   'shell_bg',
   'shell_output',
   'shell_kill',
+  'computer_list_windows',
+  'computer_ui_tree',
+  'computer_ui_find',
+  'computer_window_activate',
+  'computer_ui_click',
+  'computer_ui_type',
+  'computer_key_press',
+  'computer_mouse_scroll',
+  'computer_screen_click',
 ];
 
 test('工具目录：数量/名称/顺序与拆分前一致', () => {
