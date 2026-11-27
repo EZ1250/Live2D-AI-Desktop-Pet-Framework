@@ -587,7 +587,7 @@
             const r = Number(pj && pj.gazeOriginRatio);
             if (Number.isFinite(r) && r > 0 && r < 1) json.__petGazeOriginRatio = r;
             // 可选：隐藏模型里不该显示的 drawable（例如作者遗留的黑色条状贴图）。
-            // 模型特定的 id 只写在模型自己的 pet-model.json，不放框架代码里。
+            // 模型特定的 id 优先写在模型自己的 pet-model.json；框架只保留按内容指纹的兜底（见 mountLive2D）。
             const hidden = Array.isArray(pj && pj.hiddenDrawables)
               ? pj.hiddenDrawables.filter((x: Any) => typeof x === 'string' && x.trim()).slice(0, 32)
               : [];
@@ -1463,7 +1463,8 @@
         // —— pet-model.json 的 hiddenDrawables：**按 drawable ID 匹配**，不依赖序号 ——
         // 序号只在内部用于写 opacities 数组；缓存每帧都用 getDrawableId 复核是否仍对得上，
         // 模型换版本 / 调整 drawable 顺序时不会误隐藏别的部件。
-        const hiddenDrawableIds: string[] = settings && Array.isArray((settings as Any).__petHiddenDrawables)
+        // 模型没配时才走下面的作者遗留黑条兜底，所以这里用 let。
+        let hiddenDrawableIds: string[] = settings && Array.isArray((settings as Any).__petHiddenDrawables)
           ? ((settings as Any).__petHiddenDrawables as string[]).filter((x) => typeof x === 'string' && x)
           : [];
         const hiddenDrawableIndexCache = new Map<string, number>();
@@ -1501,6 +1502,35 @@
           }
           if (index >= 0) hiddenDrawableIndexCache.set(id, index);
           return index;
+        }
+        /**
+         * 作者遗留的「鼻子黑条」：DeepSeek 大肥鱼模型鼻子上那两条重复网格（UV 相同，必须一起隐藏，
+         * 只藏一条另一条照样画出来；同部件的 ArtMesh44/45/46 是真正的高光，不能动）。
+         * 只在模型没自己配 hiddenDrawables 时兜底，按 drawable 内容认模型，改名/换目录也命中。
+         */
+        const LEGACY_NOSE_BAR_DRAWABLE_IDS = ['ArtMesh246', 'ArtMesh682'];
+        function legacyNoseBarDrawableIds(core: Any): string[] {
+          try {
+            const raw = core && typeof core.getModel === 'function' ? core.getModel() : null;
+            const parents = raw && raw.drawables && raw.drawables.parentPartIndices;
+            if (!parents) return [];
+            const indexes = LEGACY_NOSE_BAR_DRAWABLE_IDS.map((id) => hiddenDrawableIndex(core, id));
+            if (indexes.some((i) => i < 0 || i >= parents.length)) return [];
+            // 要求同一父部件：别的模型碰巧有同名 ID 时不误隐藏
+            const parent = parents[indexes[0]];
+            if (!indexes.every((i) => parents[i] === parent)) return [];
+            return LEGACY_NOSE_BAR_DRAWABLE_IDS.slice();
+          } catch {
+            return [];
+          }
+        }
+        if (!hiddenDrawableIds.length) {
+          const core = model && model.internalModel ? model.internalModel.coreModel : null;
+          const fallback = legacyNoseBarDrawableIds(core);
+          if (fallback.length) {
+            hiddenDrawableIds = fallback;
+            log('hiddenDrawables 兜底（作者遗留黑条）:', fallback.join(', '));
+          }
         }
         /** hiddenDrawables 接管状态（只用于一次告警与调试） */
         let hiddenDrawablePatchOk = false;

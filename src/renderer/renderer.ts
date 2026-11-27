@@ -1828,6 +1828,13 @@ async function loadAutoTaskRound(bridge: RendererBridge): Promise<void> {
 /** 启动时把历史记录渲染出来（不再回写，避免重复） */
 async function loadChatLog(bridge: RendererBridge): Promise<void> {
   if (!chatLogEl || typeof bridge.chatLogGet !== 'function') return;
+  // 回到当前对话/清空历史：恢复输入态，并清掉查看历史时挂的「返回当前」按钮
+  const chatInput = elementById<HTMLInputElement>('chat-input');
+  if (chatInput) chatInput.disabled = false;
+  const statusBar = elementById<HTMLElement>('chat-toolbar-status');
+  if (statusBar) {
+    for (const old of Array.from(statusBar.querySelectorAll('[data-history-back]'))) old.remove();
+  }
   try {
     const snap = await bridge.chatLogGet();
     const entries = Array.isArray(snap?.entries) ? snap.entries : [];
@@ -1979,9 +1986,12 @@ async function openChatSession(id: string, bridge: RendererBridge | null): Promi
     setChatToolbarStatus('正在查看历史对话（只读）');
     const status = elementById<HTMLElement>('chat-toolbar-status');
     if (status) {
+      // 重复打开历史时先清旧的，避免按钮叠加
+      for (const old of Array.from(status.querySelectorAll('[data-history-back]'))) old.remove();
       const back = document.createElement('button');
       back.type = 'button';
       back.className = 'chat-tool';
+      back.dataset.historyBack = '1';
       back.textContent = '返回当前';
       back.addEventListener('click', () => {
         void (async () => {
