@@ -27,7 +27,7 @@
     "node": ">=22.12.0"
   },
   "dependencies": {
-    "active-win": "^8",
+    "active-win": "^9",
     "msedge-tts": "^2.1.1",
     "ws": "^8.22.1"
   },
