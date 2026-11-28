@@ -30,7 +30,8 @@ import * as http from 'http';
 import * as https from 'https';
 import * as path from 'path';
 import { app } from 'electron';
-import { DshBridge, formatDshError } from './dshBridge';
+import { DshBridge, dshSessionFileName, formatDshError } from './dshBridge';
+import type { DshMcpEndpoint } from './dshMcpPatch';
 import {
   checkMediaCompatibility,
   DSH_MEDIA_OUT_INSTRUCTION,
@@ -575,6 +576,29 @@ export class ChatClient {
   private aiMode: 'api' | 'dsh' = 'api';
   /** DSH 桥接实例（按需创建；aiMode!=='dsh' 时不会 spawn 任何进程） */
   private dsh: DshBridge | null = null;
+  /** 刚切到 DSH（或重置会话）时，下一条消息先交接一次旧聊天记录。 */
+  private dshHistoryPending = false;
+  /** 是否允许做上面那次聊天记录交接（静默的自主任务不需要继承对话上下文） */
+  private dshHistoryHandoffEnabled = true;
+  /** 本实例的 DSH 会话文件标识：chat=主对话（dsh-session.json），其它实例各用一份，避免抢同一把会话写锁 */
+  private dshSessionKey = 'chat';
+  /** 可选：桌宠 MCP 服务端端点；DSH 模式下生成 MCP stdio patch 用 */
+  private dshMcpProvider: (() => DshMcpEndpoint | null) | null = null;
+
+  /** main 注入：返回当前运行中的桌宠 MCP 服务端端点（未启用返回 null）。 */
+  setDshMcpProvider(provider: (() => DshMcpEndpoint | null) | null): void {
+    this.dshMcpProvider = provider;
+  }
+
+  /** main 注入：关闭 DSH 聊天记录交接（自主任务这类非对话场景用）。 */
+  setDshHistoryHandoff(enabled: boolean): void {
+    this.dshHistoryHandoffEnabled = enabled === true;
+  }
+
+  /** main 注入：本实例的 DSH 会话文件标识（必须在第一次 DSH 对话前设置；chat=主对话）。 */
+  setDshSessionKey(key: string): void {
+    this.dshSessionKey = String(key ?? '').trim() || 'chat';
+  }
 
   /** 更新开发工作区根目录（设置变化时由 main/ipc 调用） */
   setWorkspaceRoot(root: string): void {
@@ -658,6 +682,7 @@ export class ChatClient {
       showThinking: settings.showThinking !== false,
     };
     this.aiMode = settings.aiMode === 'dsh' ? 'dsh' : 'api';
+    if (this.aiMode === 'dsh') this.dshHistoryPending = true;
     this.appSettings = settings;
   }
 
@@ -680,7 +705,11 @@ export class ChatClient {
       this.dsh = new DshBridge({
         bridgeDir,
         env,
-        sessionFile: path.join(app.getPath('userData'), 'dsh-session.json'),
+        sessionFile: path.join(app.getPath('userData'), dshSessionFileName(this.dshSessionKey)),
+        mcpEndpoint: () => (this.dshMcpProvider ? this.dshMcpProvider() : null),
+        onThink: (text) => {
+          if (text) this.handlers.onThink?.({ kind: 'reasoning', text });
+        },
       });
     }
     return this.dsh;
@@ -689,6 +718,40 @@ export class ChatClient {
   /** DSH 桥接目录（main 的媒体回发白名单需要 outbox 路径）。 */
   dshBridgeDir(): string {
     return this.dshBridge().dir;
+  }
+
+  /** 后台预热 DSH 启动（App 启动后调用一次，避免第一条消息等冷启动）。 */
+  warmDsh(): void {
+    if (this.aiMode !== 'dsh') return;
+    this.dshBridge().warmUp();
+  }
+
+  /** DSH 新会话首次对话时，把本机最近聊天记录作为一次性的上下文交接。 */
+  private dshHistoryHandoff(): string {
+    if (!this.dshHistoryHandoffEnabled || !this.userDataDir) return '';
+    try {
+      const file = path.join(this.userDataDir, 'chat-log.json');
+      if (!fs.existsSync(file)) return '';
+      const data = JSON.parse(fs.readFileSync(file, 'utf8')) as {
+        currentId?: string;
+        sessions?: Array<{ id?: string; entries?: Array<{ role?: string; text?: string }> }>;
+      };
+      const sessions = Array.isArray(data.sessions) ? data.sessions : [];
+      const current = sessions.find((s) => s.id === data.currentId) ?? sessions[0];
+      const entries = Array.isArray(current?.entries) ? current.entries : [];
+      const lines = entries
+        .filter((e) => (e.role === 'user' || e.role === 'pet') && typeof e.text === 'string' && e.text.trim())
+        .slice(-12)
+        .map((e) => `${e.role === 'user' ? '用户' : '桌宠'}：${e.text!.trim().slice(0, 500)}`);
+      if (!lines.length) return '';
+      return (
+        '【切换前的桌宠对话记录（只作为上下文，不要逐条复述；如果与当前请求冲突，以当前请求为准）】\n' +
+        lines.join('\n') +
+        '\n【当前新消息】'
+      );
+    } catch {
+      return '';
+    }
   }
 
   /** 读取 DSH 桥接状态（设置页用；不发起对话）。 */
@@ -736,7 +799,10 @@ export class ChatClient {
       maxContextTokens: settings.maxContextTokens ?? 4000,
       showThinking: settings.showThinking !== false,
     };
-    this.aiMode = settings.aiMode === 'dsh' ? 'dsh' : 'api';
+    // 只有真的从 api 切到 dsh 才做一次聊天记录交接；保存任意设置都会走到这里，不能每次都置位。
+    const nextMode: 'api' | 'dsh' = settings.aiMode === 'dsh' ? 'dsh' : 'api';
+    if (nextMode === 'dsh' && this.aiMode !== 'dsh') this.dshHistoryPending = true;
+    this.aiMode = nextMode;
     this.appSettings = settings;
   }
 
@@ -825,11 +891,14 @@ export class ChatClient {
     this.busy = true;
     try {
       if (this.aiMode === 'dsh') {
+        // 新一轮开始：先清空思考浮窗旧内容（DSH 没有 API 工具循环的 start 事件）。
+        this.handlers.onThink?.({ kind: 'start', text: '开始思考…' });
         // 桥接 DSH：图片复制进 bridge/inbox 让它用 read_image 看；音频 ASR；文件给路径。
         const prep = attachments?.length
           ? await prepareAttachmentsForDsh(this.appSettings, this.dshBridge().dir, attachments)
           : { promptText: '' };
         if (prep.blockedError) {
+          this.handlers.onThink?.({ kind: 'error', text: prep.blockedError });
           this.handlers.onError(prep.blockedError);
           return;
         }
@@ -838,8 +907,11 @@ export class ChatClient {
         } catch {
           /* 建不出来时 DSH 自己 mkdir 也会失败，给后续错误 */
         }
-        const promptText = [text, prep.promptText, DSH_MEDIA_OUT_INSTRUCTION].filter(Boolean).join('\n\n');
-        const reply = await this.dshBridge().chat(promptText);
+        const bridge = this.dshBridge();
+        const handoff = !bridge.hasSession() || this.dshHistoryPending ? this.dshHistoryHandoff() : '';
+        this.dshHistoryPending = false;
+        const promptText = [handoff, text, prep.promptText, DSH_MEDIA_OUT_INSTRUCTION].filter(Boolean).join('\n\n');
+        const reply = await bridge.chat(promptText);
         // DSH 回发媒体：解析 [[send:相对路径]]（只允许 bridge 目录内），复制到 chat-media 并推送卡片。
         const parsed = parseMediaMarkers(reply, path.join(this.dshBridge().dir, 'outbox'));
         let delivered = 0;
@@ -851,6 +923,7 @@ export class ChatClient {
           delivered++;
         }
         const clean = parsed.text || (delivered ? '（已把文件发给你）' : '');
+        this.handlers.onThink?.({ kind: 'done', text: '思考完成' });
         this.handlers.onDone(clean);
         return;
       }
@@ -866,7 +939,10 @@ export class ChatClient {
       await this.startChatInner(userText || text);
     } catch (err) {
       if (this.aiMode === 'dsh') {
-        this.handlers.onError(formatDshError(err));
+        const msg = formatDshError(err);
+        // 本轮以 start 事件开了思考浮窗，出错也要收尾（API 模式在 startChatWithTools 里同样发 error）
+        this.handlers.onThink?.({ kind: 'error', text: msg });
+        this.handlers.onError(msg);
         return;
       }
       throw err;

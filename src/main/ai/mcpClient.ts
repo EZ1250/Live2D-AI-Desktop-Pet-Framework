@@ -615,7 +615,12 @@ export class McpClient {
     if (!child || child.killed) return;
     try {
       if (process.platform === 'win32' && child.pid) {
-        spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+        const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+        // spawn 失败时 killer 的 error 事件没人接会崩主进程，这里消费掉并回退 kill()
+        killer.once('error', (err) => {
+          this.log(`MCP：${rt.cfg.serverName} taskkill 失败，回退 kill() (${err.message})`);
+          try { child.kill(); } catch { /* ignore */ }
+        });
       } else {
         child.kill();
       }
@@ -736,7 +741,7 @@ export class McpClient {
           reject(err instanceof Error ? err : new Error(String(err)));
         }
       } else {
-        this.httpSend(rt, body, id);
+        this.httpSend(rt, body, id, timeoutMs);
       }
     });
     return withTimeout(promise, timeoutMs + 500, method);
@@ -755,7 +760,7 @@ export class McpClient {
   }
 
   /** HTTP 请求：JSON 或 SSE 增量解析，命中本请求 id 立即结算（服务器可能保持 SSE 长连接） */
-  private httpSend(rt: ServerRuntime, body: string, id: number): void {
+  private httpSend(rt: ServerRuntime, body: string, id: number, timeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS): void {
     const url = new URL(rt.cfg.url as string);
     const client = url.protocol === 'https:' ? https : http;
     const req = client.request(
@@ -766,7 +771,8 @@ export class McpClient {
         path: url.pathname + url.search,
         method: 'POST',
         headers: this.httpHeaders(rt),
-        timeout: DEFAULT_REQUEST_TIMEOUT_MS,
+        // socket timeout 是空闲超时；比 withTimeout(+500ms) 留更多余量，保证应用层先结算
+        timeout: timeoutMs + 2000,
       },
       (res) => {
         const session = res.headers['mcp-session-id'];

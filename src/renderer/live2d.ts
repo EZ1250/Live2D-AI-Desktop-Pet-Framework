@@ -447,15 +447,61 @@
   }
 
   /**
-   * 读 model3.json 并合并 .vtube.json，再把结果交给运行库（**不改写用户模型文件**，只改内存对象）。
+   * VTS ParameterSettings → 渲染层参数映射（规则与主进程 `modelSources.normalizeVtsParamRows` 一致）。
+   * 两个来源共用：同名 `.vtube.json` 现场读到的、以及主进程通用扫描随 manifest 下发的兜底表。
+   */
+  function normalizeParamSettings(settingsList: unknown): VtsParamMap[] {
+    if (!Array.isArray(settingsList)) return [];
+    const out: VtsParamMap[] = [];
+    let invalidRangeRows = 0;
+    for (const entry of settingsList) {
+      if (!entry || typeof entry.OutputLive2D !== 'string' || !entry.OutputLive2D) continue;
+      // Input 为空的是 VTS 自带的呼吸/眨眼等行为，由模型动画负责，不走映射
+      if (typeof entry.Input !== 'string' || !entry.Input) continue;
+      // VTS 里标记为呼吸/眨眼的映射行交给引擎的 CubismBreath / EyeBlink；
+      // 如果在这里再写一次会压掉自动眨眼，表现为"眼睛不动/表情不自然"。
+      if (entry.UseBreathing === true || entry.UseBlinking === true) continue;
+      const inLow = Number(entry.InputRangeLower);
+      const inHigh = Number(entry.InputRangeUpper);
+      const outLow = Number(entry.OutputRangeLower);
+      const outHigh = Number(entry.OutputRangeUpper);
+      // 范围缺失时不能猜 0/1（会让输出直接饱和到极值）：跳过并记数，启动日志里提示
+      if (![inLow, inHigh, outLow, outHigh].every(Number.isFinite)) {
+        invalidRangeRows += 1;
+        continue;
+      }
+      out.push({
+        input: entry.Input,
+        inLow,
+        inHigh,
+        outId: entry.OutputLive2D,
+        outLow,
+        outHigh,
+        clampInput: entry.ClampInput === true,
+        clampOutput: entry.ClampOutput === true,
+        smoothing: Number(entry.Smoothing) || 0,
+      });
+    }
+    if (invalidRangeRows) console.warn(`[live2d] .vtube.json 有 ${invalidRangeRows} 条映射缺范围字段，已跳过`);
+    return out;
+  }
+
+  /**
+   * 读 model3.json，合并 .vtube.json 与主进程通用扫描（manifest.autoSources），
+   * 再把结果交给运行库（**不改写用户模型文件**，只改内存对象）。
    *
    * 为什么必须做：
    *  - VTS 导出的模型把表情/动作/热键放在 .vtube.json 里，model3.json 的 FileReferences 常常是空的，
    *    不合并的话右键菜单里没有任何表情/动作；
+   *  - 有的导出只留 `Animation/` `Exp3/` 目录、model3.json 也不引用：主进程会把它们扫出来随
+   *    manifest 下发（autoSources），这里补进同一份 settings，模型才"真的能用"而不只是"被识别到"；
    *  - ParameterSettings 是 VTS 的参数映射表（例如 FaceAngleX → AngleX/PositionX），
    *    这类模型用自定义控制器参数，不按表驱动就会"只有眨眼、头僵着"。
    */
-  async function normalizeModelSettings(url: string): Promise<{ json: Any; mapping: VtsParamMap[]; meta: VtsModelMeta } | null> {
+  async function normalizeModelSettings(
+    url: string,
+    auto?: Any,
+  ): Promise<{ json: Any; mapping: VtsParamMap[]; meta: VtsModelMeta } | null> {
     let mapping: VtsParamMap[] = [];
     const meta = emptyVtsMeta();
     try {
@@ -475,39 +521,7 @@
           const vjson = (await vres.json()) as Any;
           const hotkeys = Array.isArray(vjson.Hotkeys) ? vjson.Hotkeys : [];
           // VTS 参数映射：模型用自定义控制器参数时，必须按这张表把追踪/口型写进去
-          const settingsList = Array.isArray(vjson.ParameterSettings) ? vjson.ParameterSettings : [];          mapping = [];
-          let invalidRangeRows = 0;
-          for (const entry of settingsList) {
-            if (!entry || typeof entry.OutputLive2D !== 'string' || !entry.OutputLive2D) continue;
-            // Input 为空的是 VTS 自带的呼吸/眨眼等行为，由模型动画负责，不走映射
-            if (typeof entry.Input !== 'string' || !entry.Input) continue;
-            // VTS 里标记为呼吸/眨眼的映射行交给引擎的 CubismBreath / EyeBlink；
-            // 如果在这里再写一次会压掉自动眨眼，表现为“眼睛不动/表情不自然”。
-            if (entry.UseBreathing === true || entry.UseBlinking === true) continue;
-            const inLow = Number(entry.InputRangeLower);
-            const inHigh = Number(entry.InputRangeUpper);
-            const outLow = Number(entry.OutputRangeLower);
-            const outHigh = Number(entry.OutputRangeUpper);
-            // 范围缺失时不能猜 0/1（会让输出直接饱和到极值）：跳过并记数，启动日志里提示
-            if (![inLow, inHigh, outLow, outHigh].every(Number.isFinite)) {
-              invalidRangeRows += 1;
-              continue;
-            }
-            mapping.push({
-              input: entry.Input,
-              inLow,
-              inHigh,
-              outId: entry.OutputLive2D,
-              outLow,
-              outHigh,
-              clampInput: entry.ClampInput === true,
-              clampOutput: entry.ClampOutput === true,
-              smoothing: Number(entry.Smoothing) || 0,
-            });
-          }
-          if (invalidRangeRows) {
-            console.warn(`[live2d] .vtube.json 有 ${invalidRangeRows} 条映射缺范围字段，已跳过`);
-          }
+          mapping = normalizeParamSettings(vjson.ParameterSettings);
           const enc = (rel: string): string => rel.split('/').map((x) => encodeURIComponent(x)).join('/');
           const exists = async (rel: string): Promise<boolean> => {
             try {
@@ -576,6 +590,57 @@
         if (refs.Expressions !== undefined && !Array.isArray(refs.Expressions)) refs.Expressions = [];
         if (refs.Motions !== undefined && (typeof refs.Motions !== 'object' || Array.isArray(refs.Motions))) refs.Motions = {};
       }
+      // 主进程通用扫描（manifest.autoSources）：把 model3.json / 同名 .vtube.json 都没覆盖到的
+      // 动作/表情文件补进运行库——覆盖"不同名 .vtube.json 的热键"和"只留 Animation/ Exp3/ 目录、
+      // model3 不引用的半套导出"，让这些文件不只是被识别，而是真的能选、能播。
+      const autoAny = (auto ?? null) as Any;
+      if (autoAny) {
+        const refs2: Any =
+          json.FileReferences && typeof json.FileReferences === 'object'
+            ? json.FileReferences
+            : (json.FileReferences = {});
+        if (!refs2.Motions || typeof refs2.Motions !== 'object' || Array.isArray(refs2.Motions)) refs2.Motions = {};
+        if (!Array.isArray(refs2.Expressions)) refs2.Expressions = [];
+        const encRel = (rel: string): string => rel.split('/').map((x) => encodeURIComponent(x)).join('/');
+        // 已经用掉的资源文件（model3 引用 + 同名 vtube 合并结果）：同一个文件不重复注册
+        const usedFiles = new Set<string>();
+        const markUsed = (file: unknown): void => {
+          if (typeof file !== 'string' || !file) return;
+          usedFiles.add(file);
+          try {
+            usedFiles.add(decodeURIComponent(file));
+          } catch {
+            /* 非法转义就只用原值比较 */
+          }
+        };
+        for (const list of Object.values(refs2.Motions as Any)) {
+          if (Array.isArray(list)) for (const item of list) markUsed(item && item.File);
+        }
+        for (const item of refs2.Expressions as Any[]) markUsed(item && item.File);
+        const autoMotions = Array.isArray(autoAny.motions) ? (autoAny.motions as Any[]) : [];
+        for (const item of autoMotions) {
+          if (!item || typeof item.group !== 'string' || !item.group.trim()) continue;
+          if (typeof item.file !== 'string' || !item.file.trim()) continue;
+          if (Array.isArray((refs2.Motions as Any)[item.group])) continue;
+          if (usedFiles.has(item.file) || usedFiles.has(encRel(item.file))) continue;
+          (refs2.Motions as Any)[item.group] = [{ File: encRel(item.file) }];
+          markUsed(item.file);
+        }
+        const autoExpressions = Array.isArray(autoAny.expressions) ? (autoAny.expressions as Any[]) : [];
+        for (const item of autoExpressions) {
+          if (!item || typeof item.name !== 'string' || !item.name.trim()) continue;
+          if (typeof item.file !== 'string' || !item.file.trim()) continue;
+          const file = encRel(item.file);
+          const list = refs2.Expressions as Any[];
+          if (list.some((e) => e && (e.Name === item.name || e.File === file || e.File === item.file))) continue;
+          list.push({ Name: item.name, File: file });
+          markUsed(item.file);
+        }
+        // 参数映射兜底：本机同名 .vtube.json 没读到（没有/坏文件）时用主进程扫出来的表
+        if (!mapping.length && Array.isArray(autoAny.paramRows) && autoAny.paramRows.length) {
+          mapping = normalizeParamSettings(autoAny.paramRows);
+        }
+      }
       // Optional per-model gaze origin (0..1 of window height in half framing); default 0.38 (neck)
       try {
         const slash = url.lastIndexOf('/');
@@ -606,7 +671,7 @@
      moc3：PIXI + pixi-live2d 渲染
      ============================================================ */
 
-  async function mountLive2D(input: { container: HTMLElement; url: string }): Promise<RenderHandle | null> {
+  async function mountLive2D(input: { container: HTMLElement; url: string; auto?: Any }): Promise<RenderHandle | null> {
     if (!isLive2DAvailable()) {
       console.warn('[live2d] PIXI / Cubism Core / pixi-live2d 运行时缺失，moc3 不可用');
       return null;
@@ -943,8 +1008,9 @@
       }
     }
 
-    // 读 model3 并合并 .vtube.json（表情/动作菜单 + VTS 参数映射）；失败时退回直接给 URL
-    const normalized = await normalizeModelSettings(modelUrl);
+    // 读 model3 并合并 .vtube.json（表情/动作菜单 + VTS 参数映射）；再补上主进程通用扫描到的
+    // 额外动作/表情（松散文件、不同名 vtube 热键）；失败时退回直接给 URL
+    const normalized = await normalizeModelSettings(modelUrl, input.auto);
     const settings = normalized ? normalized.json : null;
     const vtsMapping = normalized ? normalized.mapping : [];
     const vtsMeta = normalized ? normalized.meta : emptyVtsMeta();
@@ -1628,7 +1694,9 @@
             try {
               const em = expressionManager();
               const d = em && Array.isArray(em.definitions) ? em.definitions : [];
-              return d.map((x: Any) => (x && typeof x.Name === 'string' ? x.Name : '')).filter(Boolean);
+              return d
+                .map((x: Any) => (x && typeof x.Name === 'string' ? x.Name : ''))
+                .filter((n: string) => n.trim().length > 0);
             } catch {
               return [];
             }
@@ -1638,7 +1706,8 @@
               const mm = model.internalModel && model.internalModel.motionManager;
               const d = mm && mm.definitions;
               if (!d) return [];
-              return Object.keys(d).filter((g) => Array.isArray((d as Any)[g]) && (d as Any)[g].length > 0);
+              // 空组名（VTS 导出偶尔会有 "Motions": {"": [...]}）不能进菜单/绑定下拉，否则是空白项
+              return Object.keys(d).filter((g) => g.trim() && Array.isArray((d as Any)[g]) && (d as Any)[g].length > 0);
             } catch {
               return [];
             }

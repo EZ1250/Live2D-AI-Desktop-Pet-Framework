@@ -603,7 +603,6 @@ async function sendChat(bridge: RendererBridge): Promise<void> {
   chatSending = true;
   if (sendBtn) {
     sendBtn.disabled = true;
-    sendBtn.textContent = '…';
   }
   // 先取走文字并清空输入框：AI 回复期间用户可继续组织下一句
   input.value = '';

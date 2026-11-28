@@ -16,7 +16,8 @@
  * 用法：
  *   node scripts/check-privacy.js --inputs          # 打包前扫 dist/ public/ local-assets/ package.json
  *   node scripts/check-privacy.js --packed <目录>   # 打包后扫 release/win-unpacked（含 app.asar 二进制）
- *   node scripts/check-privacy.js --all             # 两者都扫（本地自查用）
+ *   node scripts/check-privacy.js --repo            # 仓库源码/测试/文档自查（真实会话 id / 用户目录 / 密钥）
+ *   node scripts/check-privacy.js --all             # 三者都扫（本地自查用）
  *
  * 退出码：0 干净；1 发现违规（build-portable 会据此中止打包）。
  */
@@ -121,7 +122,7 @@ function checkText(rel, text, liveKey, userName) {
   }
 }
 
-function walk(dir, onFile) {
+function walk(dir, onFile, skipDirs) {
   let entries;
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -130,9 +131,79 @@ function walk(dir, onFile) {
   }
   for (const ent of entries) {
     const abs = path.join(dir, ent.name);
-    if (ent.isDirectory()) walk(abs, onFile);
-    else if (ent.isFile()) onFile(abs);
+    if (ent.isDirectory()) {
+      if (skipDirs && skipDirs.has(ent.name)) continue;
+      walk(abs, onFile, skipDirs);
+    } else if (ent.isFile()) onFile(abs);
   }
+}
+
+/** 本机真实 DSH 会话 id：只用于本地自查（`.dsh` 不存在时返回空数组，不影响打包） */
+function readLocalSessionIds() {
+  const out = [];
+  const base = path.join(os.homedir(), '.dsh', 'sessions');
+  try {
+    for (const scope of fs.readdirSync(base, { withFileTypes: true })) {
+      if (!scope.isDirectory()) continue;
+      let names = [];
+      try {
+        names = fs.readdirSync(path.join(base, scope.name));
+      } catch {
+        continue;
+      }
+      for (const name of names) {
+        if (/^session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(name)) out.push(name);
+      }
+    }
+  } catch {
+    /* 没装/没运行过 DSH：跳过这项比对 */
+  }
+  return out;
+}
+
+/**
+ * 仓库源码/测试/文档自查（`--repo`，`--all` 也会跑）。
+ * 打包输入扫描只看 dist/public，看不到源码里误提交的本机信息：
+ * 真实会话 id、本机用户目录、真实 API Key 都属于"提交进仓库就会永久泄露"的东西。
+ */
+function scanRepo(liveKey, userName) {
+  const home = os.homedir();
+  const sessionIds = readLocalSessionIds();
+  const skip = new Set(['node_modules', 'dist', 'release', '.git', 'build', '.cache', 'out', 'coverage']);
+  const targets = ['src', 'tests', 'scripts', 'docs', 'android-mcp-client'].map((d) => path.join(ROOT, d));
+  const roots = ['README.md', 'README_PORTABLE.md', 'CONTRACT.md', 'package.json', 'electron-builder.yml', '.gitignore'].map(
+    (f) => path.join(ROOT, f),
+  );
+  console.log(
+    `[privacy] 扫描仓库文本：src/ tests/ scripts/ docs/（含本机真实会话 id ${sessionIds.length} 个、用户目录比对）`,
+  );
+  const check = (abs) => {
+    const rel = path.relative(ROOT, abs).split(path.sep).join('/');
+    scanned++;
+    checkFileName(rel);
+    const ext = path.extname(abs).toLowerCase();
+    if (!TEXT_EXT.has(ext)) return;
+    try {
+      if (fs.statSync(abs).size > MAX_TEXT_BYTES) return;
+      const text = fs.readFileSync(abs, 'utf8');
+      // 测试夹具（例如专门测试"密钥被剔除"的假值）可整行豁免：行尾写 `privacy-scan:ignore`
+      const scannable = text
+        .split('\n')
+        .filter((line) => !line.includes('privacy-scan:ignore'))
+        .join('\n');
+      checkText(rel, scannable, liveKey, userName);
+      if (home && text.includes(home)) {
+        problems.push(`仓库文本含本机用户目录（会泄露用户名）：${rel}`);
+      }
+      for (const id of sessionIds) {
+        if (text.includes(id)) problems.push(`仓库文本含本机真实 DSH 会话 id（泄露使用记录标识）：${rel} → ${id.slice(0, 16)}…`);
+      }
+    } catch {
+      /* 读不了就跳过 */
+    }
+  };
+  for (const dir of targets) walk(dir, check, skip);
+  for (const file of roots) if (fs.existsSync(file)) check(file);
 }
 
 function readLiveKey() {
@@ -207,6 +278,7 @@ function main() {
   console.log(`[privacy] userData=${USER_DATA}（本机真实 Key ${liveKey ? '已读取，将用于比对' : '未读取到'}）`);
 
   const wantAll = argv.includes('--all') || argv.length === 0;
+  if (wantAll || argv.includes('--repo')) scanRepo(liveKey, userName);
   if (wantAll || argv.includes('--inputs')) scanInputs(liveKey, userName);
   const packedIdx = argv.indexOf('--packed');
   if (packedIdx >= 0 && argv[packedIdx + 1]) scanPacked(path.resolve(argv[packedIdx + 1]), liveKey, userName);
@@ -223,10 +295,11 @@ function main() {
   for (const w of [...new Set(warnings)]) console.warn(`[privacy] 警告：${w}`);
   const uniq = [...new Set(problems)];
   if (uniq.length) {
-    console.error(`\n[privacy] ✗ 发现 ${uniq.length} 项隐私风险（共扫描 ${scanned} 个文件）——已中止打包：`);
+    console.error(`\n[privacy] ✗ 发现 ${uniq.length} 项隐私风险（共扫描 ${scanned} 个文件）——打包会失败，提交前也请先清理：`);
     for (const p of uniq) console.error(`  - ${p}`);
     console.error('\n处理办法：把个人配置移出打包目录（正确位置是 %APPDATA%\\pet-desktop-app\\），');
-    console.error('          或在 electron-builder.yml 的 files/extraResources 里排除它。');
+    console.error('          或在 electron-builder.yml 的 files/extraResources 里排除它；');
+    console.error('          测试夹具里的假密钥可在该行行尾加 `privacy-scan:ignore` 豁免。');
     process.exit(1);
   }
   console.log(`[privacy] ✓ 未发现隐私文件/密钥进包（扫描 ${scanned} 个文件）`);

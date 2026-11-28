@@ -57,7 +57,7 @@ function rendererKernel(): RendererKernelHandle | null {
 /** live2d.ts 暴露的全局渲染库（见 ./live2d.ts 底部 window.PetLive2d） */
 interface RenderLib {
   isLive2DAvailable(): boolean;
-  mountLive2D(input: { container: HTMLElement; url: string }): Promise<RenderHandle | null>;
+  mountLive2D(input: { container: HTMLElement; url: string; auto?: ModelManifest['autoSources'] }): Promise<RenderHandle | null>;
   mountPortrait(input: { container: HTMLElement; url: string; fit?: 'contain' | 'framing' }): RenderHandle | null;
   mountPlaceholder(input: { container: HTMLElement; name: string; hint?: string }): RenderHandle | null;
 }
@@ -282,6 +282,11 @@ let typewriterActive = false;
 let streamBuffer = '';
 let revealPos = 0;
 let streamDone = false;
+/** 流式输出停滞看门狗：连续 20s 无新 delta 就按结束收尾，防止结束信号丢失导致气泡/打字机一直空转 */
+let streamStallTimer: number | null = null;
+/** 这一轮是被看门狗"提前收尾"的（不是真结束）：之后再来 delta 要续写同一段，不能清屏重开 */
+let streamStallFinalized = false;
+const STREAM_STALL_TIMEOUT_MS = 20_000;
 let streamTTL = DEFAULT_TTL_MS;
 /** 本轮气泡的 ttlMs 是否由调用方显式指定（显式值原样夹取，否则按内容长度自适应） */
 let ttlExplicit = false;
@@ -305,8 +310,10 @@ function setBubbleTone(tone: 'info' | 'error'): void {
 function clearBubbleTimers(): void {
   if (typeTimer) window.clearTimeout(typeTimer);
   if (hideTimer) window.clearTimeout(hideTimer);
+  if (streamStallTimer) window.clearTimeout(streamStallTimer);
   typeTimer = 0;
   hideTimer = 0;
+  streamStallTimer = null;
 }
 function hideBubble(): void {
   bubbleHeld = false;
@@ -367,6 +374,7 @@ function showBubble(text: string, opts?: { ttlMs?: number; tone?: 'info' | 'erro
   if (!bubbleEl || !bubbleTextEl) return;
   markInteraction(); // 正在说话 → 属于活跃状态，不该待在空闲降帧里
   clearBubbleTimers();
+  streamStallFinalized = false; // 新的一段显示：看门狗状态作废
   streamBuffer = text;
   revealPos = 0;
   streamDone = true;
@@ -401,12 +409,13 @@ function showBubble(text: string, opts?: { ttlMs?: number; tone?: 'info' | 'erro
  */
 function feedChatDelta(delta: string): void {
   if (!bubbleEl || !bubbleTextEl) return;
-  if (!streamBuffer || streamDone) {
+  if (!streamBuffer || (streamDone && !streamStallFinalized)) {
     // 新一段回复：清屏重开打字
     clearBubbleTimers();
     streamBuffer = '';
     revealPos = 0;
     streamDone = false;
+    streamStallFinalized = false;
     streamTTL = DEFAULT_TTL_MS;
     ttlExplicit = false;
     typewriterActive = true;
@@ -414,10 +423,24 @@ function feedChatDelta(delta: string): void {
     bubbleEl.classList.add('is-visible', 'is-typing');
     markUserRowSent(); // 已经收到回复 → 该行从"发送中"转为已送达
   } else {
-    streamDone = false; // 缓冲未结束，继续等更多 delta
+    // 缓冲未结束（或只是被看门狗提前收尾）：继续续写，别丢掉已经显示的文字
+    streamDone = false;
+    streamStallFinalized = false;
   }
   streamBuffer += delta;
   if (!typeTimer) typeTimer = window.setTimeout(pumpTypewriter, TYPE_SPEED_MS);
+  // 收到新内容就重置停滞看门狗：只有真的长时间没有新 delta 才按结束收尾
+  if (streamStallTimer) window.clearTimeout(streamStallTimer);
+  streamStallTimer = window.setTimeout(() => {
+    streamStallTimer = null;
+    if (!streamDone) {
+      console.warn('[bubble] 流式输出停滞 20s，按结束收尾');
+      streamDone = true;
+      streamStallFinalized = true;
+      setChatTyping(false);
+      if (!typeTimer) pumpTypewriter();
+    }
+  }, STREAM_STALL_TIMEOUT_MS);
   // 同步到对话记录：正在流式输出的那一行实时增长（不逐段持久化，整段结束才写）
   // 独立聊天窗口接管对话时，这一行由它维护；桌宠窗口只在气泡里打字，避免重复落盘
   if (!chatOwnedByChatWindow) {
@@ -573,7 +596,7 @@ async function mountManifest(manifest: ModelManifest): Promise<void> {
     const lib = getRenderLib();
     if (lib && lib.isLive2DAvailable() && url) {
       // —— 真 moc3：PIXI 路径 ——
-      const handle = await lib.mountLive2D({ container: stageEl, url });
+      const handle = await lib.mountLive2D({ container: stageEl, url, auto: manifest.autoSources });
       if (gen !== mountGeneration) {
         // 挂载期间用户/主进程已切换模型：丢弃本次结果
         try { handle?.destroy(); } catch { /* ignore */ }
@@ -2210,9 +2233,9 @@ function subscribeOptionalPushes(bridge: RendererBridge): void {
         setChatTyping(false);
         chatScrollToEnd();
       } else if (payload && typeof payload.message === 'string') {
-        // AI 调用错误：以错误气泡提示，不清空正在进行的流
+        // AI 调用错误：以错误气泡提示，不清空正在进行的流；DSH 回合可能要等很久，气泡留久一点免得错过
         aiStartEmitted = false;
-        showBubble(`⚠️ ${payload.message}`, { tone: 'error', immediate: true });
+        showBubble(`⚠️ ${payload.message}`, { tone: 'error', immediate: true, ttlMs: 15000 });
         emitBehavior('error');
         if (!chatOwnedByChatWindow) appendChatLog('error', payload.message);
         setChatTyping(false);
@@ -3648,6 +3671,8 @@ function subscribeChatPanelPushes(bridge: RendererBridge): void {
       if (streamText) streamText.textContent = payload.full;
       streamRowEl = null;
       streamDone = true;
+      if (streamStallTimer) window.clearTimeout(streamStallTimer);
+      streamStallTimer = null;
       void bridge.chatLogAppend?.({ role: 'pet', text: payload.full, at: Date.now() }).catch(() => undefined);
       setChatTyping(false);
       chatScrollToEnd();
@@ -3655,6 +3680,8 @@ function subscribeChatPanelPushes(bridge: RendererBridge): void {
       appendChatLog('error', payload.message);
       setChatTyping(false);
       streamDone = true;
+      if (streamStallTimer) window.clearTimeout(streamStallTimer);
+      streamStallTimer = null;
       if (typeTimer) {
         window.clearTimeout(typeTimer);
         typeTimer = null;
@@ -3745,11 +3772,23 @@ async function toggleHistoryList(bridge: RendererBridge): Promise<void> {
 async function applyPanelTitle(bridge: RendererBridge, kind: string): Promise<void> {
   document.title = kind;
   try {
+    // 标题优先用用户设置的桌宠名字（不是模型列表第一个，也不是当前模型名）。
+    const settings = await bridge.getSettings().catch(() => null);
+    const petName = (settings?.petName ?? '').trim();
+    if (petName) {
+      document.title = `${petName} · ${kind}`;
+      return;
+    }
+    const model = (settings?.modelName ?? '').trim();
+    if (model) {
+      document.title = `${model} · ${kind}`;
+      return;
+    }
     const names = await bridge.modelList();
     const first = names.find((n) => typeof n === 'string' && n.trim());
     if (first) document.title = `${first} · ${kind}`;
   } catch {
-    /* 拿不到模型列表就保留通用标题 */
+    /* 拿不到设置/模型列表就保留通用标题 */
   }
 }
 

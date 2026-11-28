@@ -2526,6 +2526,18 @@ async function bootstrap() {
         onSettingsSaved: (next) => {
             applyAutoTaskSettings(next);
             configureAutoTaskTools();
+            // 桌宠名字可能刚改：同步浮窗标题，不用重开窗口。
+            try {
+                // 没有名字可显示时别覆盖渲染层按模型列表起的标题
+                const titleName = String(next.petName || next.modelName || '').trim();
+                if (titleName) {
+                    if (chatWindow && !chatWindow.isDestroyed())
+                        chatWindow.setTitle(`${titleName} · 对话`);
+                    if (thinkWindow && !thinkWindow.isDestroyed())
+                        thinkWindow.setTitle(`${titleName} · 思考过程`);
+                }
+            }
+            catch { /* 标题更新失败不影响设置保存 */ }
             if (!autoTaskRunning) {
                 try {
                     autoTaskChat?.updateSettings(next);
@@ -3275,7 +3287,23 @@ async function bootstrap() {
             console.warn('[main] 投屏帧转发失败：', err.message);
         }
     });
+    // 反向接入开启时，DSH 桥接可通过本地 stdio 代理调用桌宠的 MCP 工具（mcp__pet__*）。
+    if (chat) {
+        chat.setDshMcpProvider(() => (petMcpServer ? petMcpServer.endpoint() : null));
+    }
     void petMcpServer.start();
+    // DSH 模式：启动后预热一次 DSH 子进程（冷启动很贵），避免用户第一条消息等几十秒。
+    // 等 2s 让 MCP 服务端先起来，预热的 patch 才和真实回合一致。
+    if (settings.aiMode === 'dsh' && chat) {
+        setTimeout(() => {
+            try {
+                chat.warmDsh();
+            }
+            catch (err) {
+                console.warn('[main] DSH 预热失败：', err.message);
+            }
+        }, 2000);
+    }
     initAutoTask(settings, resolver);
     // 7.3 技能库：userData/skills（用户自定义，优先）→ <assetsRoot>/skills（随包）
     skillBox = new skills_1.SkillBox([path.join(electron_1.app.getPath('userData'), 'skills'), path.join(resolver.assetsRoot(), 'skills')]);
@@ -4048,6 +4076,9 @@ function initAutoTask(settings, resolver) {
         },
     }, resolver.knowledgeDir());
     autoTaskChat.setUserDataDir(electron_1.app.getPath('userData'));
+    // 自主任务是后台静默任务，不该把聊天记录交接进它的 prompt；也用独立 DSH 会话，别和主对话抢会话写锁
+    autoTaskChat.setDshHistoryHandoff(false);
+    autoTaskChat.setDshSessionKey('autotask');
     if (promptLibrary)
         autoTaskChat.setPromptLibrary(promptLibrary);
     externalChat = new chatClient_1.ChatClient(settings, {
@@ -4077,6 +4108,8 @@ function initAutoTask(settings, resolver) {
         },
     }, resolver.knowledgeDir());
     externalChat.setUserDataDir(electron_1.app.getPath('userData'));
+    // 外部/手机桥接用独立 DSH 会话：多个桥接实例共用一份会话会互相抢 DSH 的独占写锁
+    externalChat.setDshSessionKey('external');
     if (promptLibrary)
         externalChat.setPromptLibrary(promptLibrary);
     configureExternalChatTools(settings);
@@ -4085,14 +4118,14 @@ function initAutoTask(settings, resolver) {
 }
 
 /** 用静默 ChatClient 问一次（无工具、不弹窗，结果只进气泡） */
-async function askAutoTask(promptText) {
+async function askAutoTask(promptText, attachments) {
     if (!autoTaskChat)
         throw new Error('自主任务未初始化');
     autoTaskChat.updateSettings((0, chatClient_1.loadAppSettings)());
     return await new Promise((resolve, reject) => {
         autoTaskResolve = resolve;
         autoTaskReject = reject;
-        autoTaskChat.startChat(promptText).catch((err) => {
+        autoTaskChat.startChat(promptText, attachments).catch((err) => {
             autoTaskResolve = null;
             autoTaskReject = null;
             reject(err instanceof Error ? err : new Error(String(err)));
@@ -4533,6 +4566,43 @@ function autoTaskContext() {
     };
 }
 
+/** DSH 自主任务：把当前桌面截屏作为附件，让 DSH 用 read_image 看画面。 */
+async function captureAutoTaskScreenshot() {
+    try {
+        const dir = path.join(electron_1.app.getPath('userData'), 'dsh-bridge', 'autotask');
+        fs.mkdirSync(dir, { recursive: true });
+        // 每次只保留一张最新截图：captureScreen 遇到同名文件会自动改名，旧图会越积越多。
+        try {
+            for (const name of fs.readdirSync(dir)) {
+                if (/^desktop.*\.png$/i.test(name)) {
+                    try { fs.unlinkSync(path.join(dir, name)); } catch { /* 被占用就下次再清 */ }
+                }
+            }
+        } catch { /* 清理失败不影响截图 */ }
+        const file = path.join(dir, 'desktop-latest.png');
+        const msg = await (0, screenTools_1.captureScreen)({ save_path: file });
+        if (!fs.existsSync(file)) {
+            console.warn('[autotask] 截屏失败：', msg);
+            return null;
+        }
+        // inbox 里上一轮复制进去的自动任务截图不会有人再读：只保留最新一轮，避免按分钟自动增长。
+        try {
+            const inbox = path.join(electron_1.app.getPath('userData'), 'dsh-bridge', 'inbox');
+            for (const name of fs.readdirSync(inbox)) {
+                if (/-desktop\.png$/i.test(name)) {
+                    try { fs.unlinkSync(path.join(inbox, name)); } catch { /* 被占用就下次再清 */ }
+                }
+            }
+        } catch { /* inbox 还不存在：忽略 */ }
+        const st = fs.statSync(file);
+        return { path: file, name: 'desktop.png', mime: 'image/png', size: st.size, kind: 'image' };
+    }
+    catch (err) {
+        console.warn('[autotask] 截屏异常：', err.message);
+        return null;
+    }
+}
+
 /** 返回给设置页/日志的结果文本；schedule 触发时静默跳过 */
 async function runAutoTask(trigger, eventMatched = false) {
     const settings = (0, chatClient_1.loadAppSettings)();
@@ -4597,7 +4667,18 @@ async function runAutoTask(trigger, eventMatched = false) {
                 autoTaskRoundPrompt = prompt;
                 if (autoTaskRoundDraft)
                     autoTaskRoundDraft = { ...autoTaskRoundDraft, prompt };
-                const reply = (await askAutoTask(prompt + autoTaskToolHint())).trim().replace(/^["「]|["」]$/g, '');
+                // DSH 模式：把当前桌面截屏随任务发过去（DSH 用 read_image 看）。
+                // API 模式仍走原逻辑（不额外加桌面截图附件）。
+                let autoAttachments;
+                if (settings.aiMode === 'dsh') {
+                    const shot = await captureAutoTaskScreenshot();
+                    if (shot)
+                        autoAttachments = [shot];
+                }
+                const screenshotHint = autoAttachments
+                    ? '\n这是一次带桌面截图的桌宠互动任务：请以桌宠身份，结合截图里正在做的事，说一句自然、简短的互动（不超过 60 字）；不要只复述窗口标题。'
+                    : '';
+                const reply = (await askAutoTask(prompt + screenshotHint + autoTaskToolHint(), autoAttachments)).trim().replace(/^["「]|["」]$/g, '');
                 autoTaskLastResult = reply;
                 if (reply && !reply.includes('无需提醒'))
                     sendToRenderer(contracts_1.IPC_UI_BUBBLE, { text: reply.slice(0, 120), ttlMs: 12000 });

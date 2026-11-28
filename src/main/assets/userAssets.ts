@@ -17,6 +17,7 @@ import * as path from 'path';
 import * as vm from 'vm';
 import { app, shell } from 'electron';
 import { inspectModelDir, type ModelCompat } from './modelCompat';
+import { scanModelSources } from './modelSources';
 
 export type AssetKind = 'model' | 'plugin';
 
@@ -307,11 +308,27 @@ export function validateModelDir(dir: string): UserModelEntry {
     }
   }
   if (!refs.Physics) issues.push('提示：没有物理文件（.physics3.json），头发/衣物不会摆动');
-  const expCount = Array.isArray(refs.Expressions) ? refs.Expressions.length : 0;
-  const motionGroups = refs.Motions && typeof refs.Motions === 'object' ? Object.keys(refs.Motions as object) : [];
+  const model3Exprs = Array.isArray(refs.Expressions) ? refs.Expressions : [];
+  const model3Groups = refs.Motions && typeof refs.Motions === 'object' ? Object.keys(refs.Motions as object).filter((g) => g.trim()) : [];
+  // 通用扫描：model3.json 之外的动作/表情（VTS 的 .vtube.json 热键、目录里的松散 .motion3/.exp3 文件）
+  // 也会被渲染层挂载时补进运行库，体检必须看同一份数据，否则会误报"没有表情/动作"。
+  const sources = scanModelSources(dir, model3Rel);
+  const expCount = model3Exprs.length + sources.expressions.length;
+  const motionGroups = [...model3Groups, ...sources.motions.map((m) => m.group)];
   if (expCount === 0) issues.push('提示：该模型没有表情（Expressions），表情切换会无效');
   if (motionGroups.length === 0) issues.push('提示：该模型没有动作（Motions），动作菜单会无效');
   else if (!motionGroups.some((g) => /^idle$/i.test(g))) issues.push('提示：没有 Idle 动作组，待机时会用内置呼吸动画');
+  const st = sources.stats;
+  if (st.vtsMotions || st.vtsExpressions || st.looseMotions || st.looseExpressions) {
+    const parts: string[] = [];
+    if (st.vtsMotions || st.vtsExpressions) {
+      parts.push(`.vtube.json 热键（动作 ${st.vtsMotions}、表情 ${st.vtsExpressions}）`);
+    }
+    if (st.looseMotions || st.looseExpressions) {
+      parts.push(`目录里的松散文件（动作 ${st.looseMotions}、表情 ${st.looseExpressions}）`);
+    }
+    issues.push(`已自动识别额外可用项：${parts.join('、')}${st.vtsParamMappings ? `、参数映射 ${st.vtsParamMappings} 条` : ''}`);
+  }
 
   return entry;
 }
@@ -569,7 +586,7 @@ function readJsonLoose(file: string): unknown {
   }
 }
 
-/** 从 model3.json 里取表情名列表（拿不到就是空数组，绝不报错） */
+/** 模型可用的表情名（model3.json + .vtube.json 热键 + 目录里的松散 .exp3 文件；拿不到就是空数组） */
 export function readModelExpressionNames(modelDir: string): string[] {
   const rel = findFile(modelDir, (n) => /\.model3\.json$/i.test(n), 2);
   if (!rel) return [];
@@ -580,21 +597,9 @@ export function readModelExpressionNames(modelDir: string): string[] {
   const fromModel3 = Array.isArray(list)
     ? list.map((e) => (e && typeof e.Name === 'string' ? e.Name : '')).filter((n): n is string => !!n)
     : [];
-  if (fromModel3.length) return fromModel3.slice(0, 40);
-  // VTube Studio 模型：表情登记在 *.vtube.json 的 Hotkeys（ToggleExpression）
-  const vtubeRel = findFile(modelDir, (n) => /\.vtube\.json$/i.test(n), 2);
-  if (vtubeRel) {
-    const vjson = readJsonLoose(path.join(modelDir, vtubeRel)) as
-      | { Hotkeys?: Array<{ Name?: unknown; Action?: unknown }> }
-      | null;
-    const hotkeys = Array.isArray(vjson?.Hotkeys) ? vjson.Hotkeys : [];
-    return hotkeys
-      .filter((h) => h && h.Action === 'ToggleExpression')
-      .map((h) => (typeof h.Name === 'string' ? h.Name : ''))
-      .filter((n): n is string => !!n)
-      .slice(0, 40);
-  }
-  return [];
+  // 通用扫描补齐 model3 之外的表情（VTS 热键 / 松散文件），和挂载时合并进运行库的是同一份清单
+  const extra = scanModelSources(modelDir, rel).expressions.map((e) => e.name);
+  return [...new Set([...fromModel3, ...extra])].slice(0, 40);
 }
 
 /** 预设模板内容（JSON 合法：提示键以 _ 开头，解析侧忽略） */
@@ -678,7 +683,21 @@ export interface ModelCapabilities {
 export interface ModelDetection {
   capabilities: ModelCapabilities;
   /** 识别依据（便于设置页向用户交代"凭什么这么归"） */
-  hints: { expressions: string[]; motionGroups: string[]; parameterNames: string[]; parts: string[] };
+  hints: {
+    expressions: string[];
+    motionGroups: string[];
+    parameterNames: string[];
+    parts: string[];
+    /** 通用扫描（.vtube.json 热键 / 目录松散文件）的统计，没有额外来源时缺省 */
+    auto?: {
+      vtsFiles: string[];
+      vtsMotions: number;
+      vtsExpressions: number;
+      looseMotions: number;
+      looseExpressions: number;
+      paramMappings: number;
+    };
+  };
   /** 识别过程中碰到的问题（例如 model3.json 读不出来） */
   issues: string[];
 }
@@ -713,10 +732,25 @@ export function detectModelCapabilities(modelDir: string): ModelDetection {
   const model3 = readJsonLoose(path.join(modelDir, model3Rel)) as
     | { FileReferences?: { Motions?: Record<string, unknown>; Expressions?: Array<{ Name?: unknown }>; DisplayInfo?: string } }
     | null;
-  hints.motionGroups = Object.keys(model3?.FileReferences?.Motions ?? {});
-  hints.expressions = (model3?.FileReferences?.Expressions ?? [])
+  const model3Groups = Object.keys(model3?.FileReferences?.Motions ?? {}).filter((g) => g.trim());
+  const model3Exprs = (model3?.FileReferences?.Expressions ?? [])
     .map((e) => (e && typeof e.Name === 'string' ? e.Name : ''))
     .filter((n): n is string => !!n);
+  // 通用扫描：除 model3.json 外，还从 .vtube.json 热键和目录里的松散 .motion3/.exp3 文件补全清单
+  // （渲染层挂载时会把同一份清单合并进运行库，识别与可播放项保持一致）。
+  const sources = scanModelSources(modelDir, model3Rel);
+  hints.motionGroups = uniqueList([...model3Groups, ...sources.motions.map((m) => m.group)]);
+  hints.expressions = uniqueList([...model3Exprs, ...sources.expressions.map((e) => e.name)]);
+  if (sources.stats.vtsFiles.length || sources.motions.length || sources.expressions.length) {
+    hints.auto = {
+      vtsFiles: sources.stats.vtsFiles,
+      vtsMotions: sources.stats.vtsMotions,
+      vtsExpressions: sources.stats.vtsExpressions,
+      looseMotions: sources.stats.looseMotions,
+      looseExpressions: sources.stats.looseExpressions,
+      paramMappings: sources.stats.vtsParamMappings,
+    };
+  }
 
   // cdi3（DisplayInfo）：参数/部件中文名，用来兜底识别"脸红/生气/围裙/点"这类意图
   const displayRel = model3?.FileReferences?.DisplayInfo;
@@ -810,6 +844,8 @@ export function applyDetectedCapabilities(
       参数中文名: det.hints.parameterNames.slice(0, 40),
     };
     if (det.issues.length) next['_识别问题'] = det.issues;
+    // 上一版识别留下的问题（例如旧版漏认 VTS 动作/表情）修好后要清掉，否则设置页一直挂着过期警告
+    else delete next['_识别问题'];
     next['_说明'] = `「${modelName}」的模型预设（含自动识别的能力归类）。值都可手改；改完切换模型后生效。`;
 
     const created = !fs.existsSync(file);

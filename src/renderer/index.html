@@ -299,7 +299,7 @@
         <legend>AI 接入方式（二选一）</legend>
         <div class="settings-inline ai-mode-radios">
           <label class="settings-checkbox"><input type="radio" name="aiMode" id="setting-ai-mode-api" value="api" checked /> 使用 API（OpenAI 兼容）</label>
-          <label class="settings-checkbox"><input type="radio" name="aiMode" id="setting-ai-mode-dsh" value="dsh" /> 桥接本机 DSH（只转对话）</label>
+          <label class="settings-checkbox"><input type="radio" name="aiMode" id="setting-ai-mode-dsh" value="dsh" /> 桥接本机 DSH</label>
         </div>
       </fieldset>
       <details id="ai-api-details" class="settings-links" open>
@@ -393,8 +393,8 @@
         </fieldset>
       </details>
       <details id="ai-dsh-details" class="settings-links">
-        <summary>DSH 桥接（本机会话；只转对话）</summary>
-        <p class="settings-hint">把对话交给本机 DeepSeek Harness 处理：只转发文字消息、不传工具/截图；同一个 DSH 会话会延续上下文。DSH 用哪个模型由 DSH 自己的配置决定。</p>
+        <summary>DSH 桥接</summary>
+        <p class="settings-hint">文字直接转给本机 DeepSeek Harness；图片复制到 bridge/inbox，音频先转写，文件给路径，回发文件走 outbox；从 API 切过来时会把当前聊天记录交接一次，自主任务会把桌面截图随任务发送。DSH 使用自己的工具/模型，桌宠内置的 computer_* 工具在 DSH 模式下不生效。开启「反向接入」后，DSH 还能通过 MCP 调用 pet_* 工具（mcp__pet__*；pet_chat / pet_ask 不对 DSH 开放）。</p>
         <div class="settings-inline">
           <button id="dsh-refresh-status" type="button">刷新 DSH 状态</button>
           <button id="dsh-reset-session" type="button">重置 DSH 会话</button>

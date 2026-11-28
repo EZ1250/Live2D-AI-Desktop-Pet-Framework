@@ -161,18 +161,62 @@ asar 内 `renderer/index.html` → asar 内 `public/renderer/index.html` → `di
 
 - `AppSettings.aiMode`（`'api' | 'dsh'`，默认 `api`）二选一，设置页单选切换；选中一种时另一种配置区自动收起。
   - `api`：直连 OpenAI 兼容 API（原有行为；支持工具/截图/思考等完整能力）。
-  - `dsh`：**桥接本机 DSH**（`dsh --profile headless --json [--session-id <id>] -`）。
-    按用户要求**只转对话**：只把用户文字经 stdin 发给 DSH、只取 `final`/`text` 事件的文本作为回复；
-    不向 DSH 传宠物工具、不传截图、不解析其工具事件。实现见 `src/main/ai/dshBridge.ts`。
+  - `dsh`：**桥接本机 DSH**（`dsh --profile headless [--patch <file>] --json [--session-id <id>] -`）。
+    文字经 stdin 发给 DSH，只取 `final`/`text` 事件的文本作为回复；附件按媒体规则处理：
+    图片复制到 `<userData>/dsh-bridge/inbox/`、音频先 ASR、文本内联、其它文件给路径；
+    回发文件走 `outbox`。不使用桌宠内置的 `computer_*` 工具（这些仅在 API 模式下可用）。
+    DSH 模式的自主任务另会把当前桌面截图作为附件随任务发送（图片仍会先做一次视觉转述）。
+    实现见 `src/main/ai/dshBridge.ts`。
+    - **聊天记录交接**：从 api 切到 dsh（或 DSH 会话被重置）后的第一条消息，把本机 `chat-log.json`
+      当前会话最近 12 条 user/pet 记录作为一次性上下文拼在消息前；之后不再重复。自主任务（后台静默）
+      不做交接。保存任意设置不会重新触发。
+    - **推理流**：每次都带一个临时 `--patch`，里面插入本地插件 `<userData>/dsh-bridge-tools/pet-reasoning-stream.js`
+      监听 `agent/assistant-stream`，把 `reasoning-delta` 按行写 stderr（`pet-reasoning:<JSON 字符串>`）；
+      桥接层按行解析后推进思考浮窗（DSH `--json` 的 `thinking` 事件要等 assistant/message 提交后才出，
+      只能兜底）。非这种行的 stderr 只作为错误详情，不混进思考内容。
+    - **反向接入联动**：设置页开启「反向接入」且 MCP 服务端运行时，同一个 `--patch` 还通过
+      `<userData>/dsh-bridge-tools/pet-mcp-stdio.cjs` 把桌宠 MCP 端点（`pet_*` 工具）接到
+      DSH 的 `dsh-mcp-client`；模型侧工具名为 `mcp__pet__*`。token 只从进程环境传给代理，
+      且只接受 `127.0.0.1/localhost` 端点。`pet_chat`（会反向再驱动一次桌宠 AI、与当前会话共用会话文件）
+      和 `pet_ask`（等手机确认最长 120s，超过 DSH 工具超时）由代理屏蔽：既不列给模型、也不执行。
+      桌宠服务端不认识的方法（如新版 MCP 客户端的 `server/discover` 探测）会回 202 空 body，
+      代理对**带 id 的空响应**必须立刻回 JSON-RPC 错误——否则 DSH 会干等它自己的 60s 发现超时
+      （实测这会让每条 DSH 启动慢 60s）。
+      patch/插件/代理都写在 `dsh-bridge-tools`（**DSH 工作目录之外**），避免被 DSH 的写工具改写。
+      反向接入只挂在**主对话**（气泡窗/聊天窗）的桥接实例上：自主任务与手机/外部桥接的 DSH 调用不带 `pet_*`。
+      **可移植性前置条件**：只有当前 DSH 安装里确实带 `@deepseek-ai/dsh-mcp-client` 插件时才写 MCP 段
+      （`hasDshMcpClientPlugin` 按 `node` 模块解析 + 全局 npm 布局探测）；旧版 DSH 没有该插件时只写推理流插件，
+      对话与实时思考照常、反向接入自动关闭并在启动日志提示一次——不让 patch 引用不存在的插件把 headless 启动搞挂。
 - DSH 桥接细节：
   - 工作目录固定为 `<userData>/dsh-bridge`（**不放 AGENTS.md**；避免 headless 把桌宠项目当工作区去读规则/动文件），
     并设 `DSH_PERMISSION_MODE=workspace-write`（只允许写 bridge 目录内，AI 才能生成文件回发给用户；
-    其它副作用仍受 DSH 自身审批策略限制）；每次对话一个子进程，串行排队，超时 120s，
+    其它副作用仍受 DSH 自身审批策略限制）；每次对话一个子进程，串行排队，超时 180s（DSH 是完整
+    agent，多步工具任务经常超过 2 分钟，120s 会把正常回合杀掉、表现成"没有回复"），
     取消/退出/新对话会杀进程树（Windows `taskkill /T /F`）。
-  - 会话续接：首次从 `session` 事件拿 `sessionId` 存到 `<userData>/dsh-bridge/session.json`，后续消息带
-    `--session-id`；「新对话/重置上下文」或设置页「重置 DSH 会话」会清空它。
-  - 失败可读：未安装（找不到 dsh）→「未检测到 dsh 命令」；超时 →「DSH 超时（Ns）」；非零退出 → 带 stderr 尾部；
-    cmd.exe 的 GBK 系统错误会按 GBK 解码显示；会话失效（unknown session 等）自动清会话并重试一次。
+  - 会话续接：首次从 `session` 事件拿 `sessionId` 存到 `<userData>/dsh-session.json`（放在 bridge 之外，
+    避免 DSH 可写目录篡改会话），后续消息带 `--session-id`；「新对话/重置上下文」或设置页
+    「重置 DSH 会话」会清空它。主对话用 `dsh-session.json`，自主任务/手机桥接分别用
+    `dsh-session-autotask.json` / `dsh-session-external.json`——DSH 会话是**单写者**（独占写锁），
+    多个桥接实例共用一份会话会互相抢锁。
+  - 会话不可用时自动恢复：DSH 报会话不存在、被其它进程持有写锁（典型是在 DSH Web GUI 里打开了
+    同一个会话）、不能由 one-shot runner 接管、cwd 不匹配时，清掉本地会话并用新会话重试一次，
+    本轮回覆不中断（上下文会重新开始）；不会每轮都失败。
+  - 后台 DSH web：桥接前若没有在跑就最小化拉起一次；之后只检查记录下来的 pid 是否存活
+    （`process.kill(pid, 0)`），失活才重新拉起——不再依赖 PowerShell 探测，探测失败也不会误判为已退出。
+    探测/拉起/轮询全部在**后台**进行（`void`），不再挡在每轮对话的关键路径上——headless 对话不依赖它。
+  - 每轮打印一行耗时拆解（`[dsh] 回合完成 总计 …ms（排队 …ms，启动到首事件 …ms）`），
+    回复变慢时能区分是排队、DSH 启动、还是模型本身慢；同一行落到 `<userData>/dsh-turns.log`
+    （打包版没有控制台）。**启动到首事件 >5s 或回合失败**时附带 DSH stderr 尾部，
+    能看出卡在插件/MCP/权限哪一步。日志**落盘前脱敏**（`redactLogText`）：去掉推理流原文
+    （`pet-reasoning:…` 属于用户/模型内容）、把 `Bearer <token>` 打码、家目录替换成 `~`
+    （用户名不落盘）——用户把日志贴出来排查时不会带隐私。
+  - 预热：DSH 模式下 App 启动 2s 后在后台跑一次「只启动、不带任务」的 headless（空 stdin
+    会在启动完成后以非 0 退出，不建会话、不调模型），把冷启动（node/DSH 模块、profile 解析、
+    插件挂载、MCP 客户端）的开销在后台付掉；真实对话开始时若预热还在跑会先杀掉它，避免两个
+    DSH 同时冷启动抢资源。
+  - 失败可读：未安装（找不到 dsh）→「未检测到 dsh 命令」；超时 →「DSH 超时（Ns）」；非零退出 → 优先用
+    `--json` 的 `error` 事件文本，没有才用 stderr 尾部；cmd.exe 的 GBK 系统错误会按 GBK 解码显示；
+    会话失效（unknown session 等）自动清会话并重试一次。
   - 状态探测：`dsh -V` 缓存版本；设置页「刷新 DSH 状态」重新探测。
   - 安全边界（评审后加固）：
     - 会话 id 白名单 `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`：`session.json` 里的非法 id 直接忽略，

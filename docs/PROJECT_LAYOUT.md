@@ -539,9 +539,19 @@ moc3 取景的居中基准不是画布包围盒，而是从**命中遮罩**量�
 2. **绑定按模型分桶**（`motionTriggersByModel[模型名]`，旧版全局 `motionTriggers` 只作回退）。
    不同模型的动作组/表情完全不同（模型 A 的某个表情在模型 B 上不存在），只存一份全局映射时
    换个模型绑定就全失效 —— 那也是"设置没被记住"的典型观感。保存时只更新当前模型这一桶。
-3. **可绑定目标只认模型真实声明的动作组/表情**（`model3.json` 的 `Motions` / `Expressions`
-   经引擎暴露，见 `live2d.ts` 的 `listMotions/listExpressions`）。模型的"能力归类"
-   （`pet-model.json` 的 `capabilities`）只是**建议清单**，不等于可播放。
+3. **可绑定目标只认模型真实声明的动作组/表情**（经引擎暴露，见 `live2d.ts` 的
+   `listMotions/listExpressions`）。模型的"能力归类"（`pet-model.json` 的 `capabilities`）
+   只是**建议清单**，不等于可播放。"声明"按**通用扫描**理解（`src/main/assets/modelSources.ts`）：
+   - `model3.json` 的 `FileReferences.Motions` / `Expressions`（标准导出）；
+   - `.vtube.json` 的 `Hotkeys`（VTS 导出，model3.json 常为空；同名文件渲染层挂载时自己合并，
+     **不同名/多个 vtube 文件也认**，由主进程扫出来随 manifest 下发）；
+   - 目录里没被任何 json 引用的松散 `*.motion3.json` / `*.exp3.json`（"半套导出"，按文件名成组，
+     `IDLE.motion3.json` 归 `Idle`）。
+   主进程 `buildModelManifest` 把 model3 之外的条目放进 `manifest.autoSources`，渲染层
+   `normalizeModelSettings` 合并进运行库 settings：**识别到的动作/表情必须真的能选、能播**，
+   否则设置页说"有"、右键菜单却是空的。同一个文件只注册一次（去重），组名/表情名撞车自动改名。
+   VTS 的 `ParameterSettings`（追踪/口型映射）同样归一化，渲染层自己没读到同名 vtube 时用
+   manifest 里那份兜底。
 4. **解析不到目标不能静默**：`emitBehavior` 对"明确配了但当前模型没有"的绑定只 `console.warn`
    一次（附上该模型可用的动作组/表情清单），避免"完全没反应又查不出原因"。
 5. **设置页的「模型」下拉必须显示当前模型**（`populateSettings` 里按 `settings.modelName` 设

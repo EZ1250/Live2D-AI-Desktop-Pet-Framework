@@ -245,7 +245,7 @@ function installThinkDrag(): void {
     if (!dragging) return;
     const rect = panel.getBoundingClientRect();
     const nextLeft = Math.min(Math.max(4, rect.left + (e.clientX - lastX)), Math.max(4, window.innerWidth - rect.width - 4));
-    const nextTop = Math.min(Math.max(4, rect.top + (e.clientY - lastY)), Math.max(4, window.innerHeight - 40));
+    const nextTop = Math.min(Math.max(4, rect.top + (e.clientY - lastY)), Math.max(4, window.innerHeight - rect.height - 4));
     lastX = e.clientX;
     lastY = e.clientY;
     panel.style.right = 'auto';

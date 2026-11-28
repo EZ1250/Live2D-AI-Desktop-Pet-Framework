@@ -99,6 +99,7 @@ import {
   writeModelPresetTemplate,
 } from './assets/userAssets';
 import { inspectModelDir, describeCompat } from './assets/modelCompat';
+import { scanModelSources } from './assets/modelSources';
 import type { ChatClient } from './ai/chatClient';
 import type { ToolBox } from './tools';
 
@@ -764,13 +765,18 @@ export function registerIpc(deps: IpcDeps): IpcBridge {
       .filter((n) => !listUserModels().some((m) => m.name === n));
     // 用户模型带上"预设摘要 + 预设问题"：设置页能一眼看到这个模型被怎么适配过、哪里写坏了
     const models = listUserModels().map((m) => {
-      const { preset, issues } = deps.pathResolver.modelPreset(m.name);
+      let presetResult = deps.pathResolver.modelPreset(m.name);
       const found = readModelPresetFile(m.name, m.dir);
-      // 手动把模型文件夹丢进 live2d-models 的情况：扫描时补做一次能力归类（幂等、只填空缺）
-      if (!found.exists) {
+      // 手动把模型文件夹丢进 live2d-models 的情况：扫描时补做一次能力归类（幂等、只填空缺）；
+      // 已有预设但完全没有能力归类时也补一次——旧版识别会漏掉 VTS 模型（.vtube.json）的动作/表情。
+      const needDetect =
+        !found.exists || !presetResult.preset.capabilities || Object.keys(presetResult.preset.capabilities).length === 0;
+      if (needDetect) {
         const applied = applyDetectedCapabilities(m.dir, m.name);
         if (!applied.ok) console.warn(`[ipc] 扫描时能力归类失败（${m.name}）：${applied.error}`);
+        else if (!found.exists) presetResult = deps.pathResolver.modelPreset(m.name);
       }
+      const { preset, issues } = presetResult;
       const caps = preset.capabilities;
       const emotionCount = preset.emotionMap ? Object.keys(preset.emotionMap).length : 0;
       const parameterCount = preset.parameterMap ? Object.keys(preset.parameterMap).length : 0;
@@ -1738,6 +1744,34 @@ function rememberModelName(name: string): void {
   } catch (err) {
     console.warn(`[ipc] 模型体检失败（${desc.name}）：${(err as Error).message}`);
   }
+  // 通用扫描：model3.json 之外的动作/表情/参数映射（VTS .vtube.json 热键、目录松散文件）。
+  // 随 manifest 下发，渲染层挂载时补进运行库 settings —— 外部模型各种导出方式都能用上。
+  let autoSources: ModelManifest['autoSources'];
+  if (desc.type === 'moc3') {
+    try {
+      const dirAbs = resolver.modelDirAbs(desc.name);
+      if (dirAbs) {
+        const src = scanModelSources(dirAbs, desc.file);
+        if (src.motions.length || src.expressions.length || src.paramRows.length) {
+          autoSources = {
+            motions: src.motions.slice(0, 200),
+            expressions: src.expressions.slice(0, 200),
+            paramRows: src.paramRows.slice(0, 64),
+            stats: {
+              vtsFiles: src.stats.vtsFiles,
+              vtsMotions: src.stats.vtsMotions,
+              vtsExpressions: src.stats.vtsExpressions,
+              looseMotions: src.stats.looseMotions,
+              looseExpressions: src.stats.looseExpressions,
+              paramMappings: src.stats.vtsParamMappings,
+            },
+          };
+        }
+      }
+    } catch (err) {
+      console.warn(`[ipc] 模型动作/表情通用扫描失败（${desc.name}）：${(err as Error).message.slice(0, 80)}`);
+    }
+  }
   return {
     name: desc.name,
     url: `${deps.staticBaseUrl()}/${encoded}`,
@@ -1749,5 +1783,6 @@ function rememberModelName(name: string): void {
     ...(compat ? { compat } : {}),
     ...(preset ? { preset } : {}),
     ...(presetIssues ? { presetIssues } : {}),
+    ...(autoSources ? { autoSources } : {}),
   };
 }

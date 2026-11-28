@@ -431,6 +431,12 @@ export class PetMcpServer {
     return { running: this.started && this.server !== null, port: this.actualPort, lan: this.cfg.lan };
   }
 
+  /** 内部用：给 DSH 桥接生成 MCP stdio 代理时提供实际回环端点（不暴露到 IPC）。 */
+  endpoint(): { url: string; token: string } | null {
+    if (!this.started || !this.server || !this.cfg.token) return null;
+    return { url: `http://127.0.0.1:${this.actualPort}/mcp`, token: this.cfg.token };
+  }
+
   /** 热重载 mcp-server.json：先关监听，再按当前配置重启（端口/开关变化都会生效） */
   async reload(): Promise<void> {
     this.dispose();

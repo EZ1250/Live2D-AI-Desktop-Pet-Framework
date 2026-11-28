@@ -786,6 +786,36 @@ export interface ModelManifest {
    * 任何来源的模型都能给出「能不能渲染 / 为什么 / 怎么办」，渲染层据此决定直接提示而不是硬加载。
    */
   compat?: ModelCompatInfo;
+  /**
+   * 通用扫描结果（主进程 modelSources.ts）：model3.json 之外的可用动作/表情/参数映射。
+   * 外部模型导出方式五花八门——VTS 把热键写在 .vtube.json、有些导出只留 Animation/ Exp3/ 目录而
+   * model3.json 不引用——渲染层挂载时把这份清单补进运行库 settings，这些动作/表情才真的能用。
+   * `file` 为相对 model3.json 所在目录的路径（正斜杠），渲染层按静态资源 URL 取。
+   */
+  autoSources?: {
+    motions: Array<{ group: string; file: string }>;
+    expressions: Array<{ name: string; file: string }>;
+    /** VTS 参数映射原始表（主进程已归一化）；本机同名 .vtube.json 没读到映射时用它兜底 */
+    paramRows?: Array<{
+      input: string;
+      inLow: number;
+      inHigh: number;
+      outId: string;
+      outLow: number;
+      outHigh: number;
+      clampInput: boolean;
+      clampOutput: boolean;
+      smoothing: number;
+    }>;
+    stats: {
+      vtsFiles: string[];
+      vtsMotions: number;
+      vtsExpressions: number;
+      looseMotions: number;
+      looseExpressions: number;
+      paramMappings: number;
+    };
+  };
 }
 
 /** 模型体检结果（主进程 modelCompat.ts 产出） */

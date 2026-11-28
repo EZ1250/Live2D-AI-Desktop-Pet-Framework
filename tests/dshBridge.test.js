@@ -1,4 +1,4 @@
-/**
+﻿/**
  * dshBridge.test.js —— DSH 桥接的纯逻辑单测（不 spawn 真实 dsh、不联网）。
  *
  * 覆盖：NDJSON 行解析容错、会话失效识别、dsh 命令解析（PATH/APPDATA/环境变量覆盖）、
@@ -11,6 +11,7 @@ const bridge = require('../dist/main/ai/dshBridge.js');
 const {
   parseDshLine,
   looksLikeInvalidSession,
+  dshSessionFileName,
   resolveDshCommand,
   buildDshSpawnPlan,
   formatDshError,
@@ -44,10 +45,36 @@ describe('looksLikeInvalidSession', () => {
     }
   });
 
+  it('detects the messages this DSH build actually prints', () => {
+    // 会话不存在 / 被别的进程（DSH Web GUI）持有独占写锁 / one-shot 不能接管
+    for (const text of [
+      'dsh: session "session-x" does not exist; omit --session-id to start a new Session',
+      'dsh: session "session-x" is already owned by an active write handle',
+      'session "session-x" does not compose with the one-shot runner',
+      'session "session-x" was recorded in "C:\\a", not "C:\\b"',
+      'session "session-x" cannot be driven directly',
+    ]) {
+      assert.equal(looksLikeInvalidSession(text), true, text);
+    }
+  });
+
   it('ignores unrelated stderr', () => {
     assert.equal(looksLikeInvalidSession('some other error'), false);
+    assert.equal(looksLikeInvalidSession('Error: connect ECONNREFUSED 127.0.0.1:1'), false);
     assert.equal(looksLikeInvalidSession(''), false);
     assert.equal(looksLikeInvalidSession(undefined), false);
+  });
+});
+
+describe('dshSessionFileName', () => {
+  it('keeps the main chat on dsh-session.json and isolates other instances', () => {
+    assert.equal(dshSessionFileName('chat'), 'dsh-session.json');
+    assert.equal(dshSessionFileName(''), 'dsh-session.json');
+    assert.equal(dshSessionFileName('autotask'), 'dsh-session-autotask.json');
+    assert.equal(dshSessionFileName('external'), 'dsh-session-external.json');
+    // 防止奇怪的 key 拼出目录穿越/非法文件名
+    assert.equal(dshSessionFileName('../evil'), 'dsh-session-evil.json');
+    assert.equal(dshSessionFileName('a b/c'), 'dsh-session-abc.json');
   });
 });
 
@@ -139,7 +166,7 @@ describe('formatDshError', () => {
 
 describe('session id / command path safety', () => {
   it('accepts normal DSH session ids and rejects cmd-metacharacter payloads', () => {
-    assert.equal(isValidSessionId('session-3d33102b-ec6e-4b2c-8de1-e2982af417ed'), true);
+    assert.equal(isValidSessionId('session-01234567-89ab-4cde-8f01-23456789abcd'), true);
     assert.equal(isValidSessionId('session_1.2-3'), true);
     for (const bad of [
       '',
@@ -217,5 +244,57 @@ describe('session id / command path safety', () => {
     ]) {
       delete process.env[key];
     }
+  });
+});
+
+describe('hasDshMcpClientPlugin', () => {
+  it('recognises the nested dependency layout of a global npm install', () => {
+    const ok = bridge.hasDshMcpClientPlugin('C:\\Users\\me\\AppData\\Roaming\\npm\\dsh.cmd', {
+      env: {},
+      pathExists: (p) =>
+        p.replace(/\\/g, '/').endsWith('/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-mcp-client/package.json'),
+      resolveSpec: () => null,
+    });
+    assert.equal(ok, true);
+  });
+
+  it('uses node module resolution when the package is resolvable', () => {
+    const asked = [];
+    const ok = bridge.hasDshMcpClientPlugin('/usr/local/bin/dsh', {
+      env: { PATH: '/usr/local/bin' },
+      pathExists: () => false,
+      resolveSpec: (spec, paths) => {
+        asked.push([spec, paths]);
+        return '/x/index.js';
+      },
+    });
+    assert.equal(ok, true);
+    assert.equal(asked.length > 0, true);
+    assert.equal(asked[0][0], '@deepseek-ai/dsh-mcp-client');
+  });
+
+  it('returns false for an older DSH without the plugin (reverse access disabled, chat unaffected)', () => {
+    const ok = bridge.hasDshMcpClientPlugin('C:\\Users\\me\\npm\\dsh.cmd', {
+      env: { APPDATA: 'C:\\Users\\me\\AppData\\Roaming' },
+      pathExists: () => false,
+      resolveSpec: () => null,
+    });
+    assert.equal(ok, false);
+  });
+});
+
+describe('redactLogText', () => {
+  it('strips reasoning text, bearer token and user home directory from logs', () => {
+    const home = require('node:os').homedir();
+    const raw =
+      'pet-reasoning:"用户不想让你看到这句话" warn: plugin ok Bearer abcdef123456 ' +
+      `path=${home}\\secret\\x.txt more pet-reasoning:"second"`;
+    const out = bridge.redactLogText(raw);
+    assert.equal(out.includes('用户不想让你看到这句话'), false);
+    assert.equal(out.includes('second'), false);
+    assert.equal(out.includes('abcdef123456'), false);
+    assert.equal(out.includes(home), false);
+    assert.equal(out.includes('Bearer ***'), true);
+    assert.equal(out.includes('plugin ok'), true);
   });
 });

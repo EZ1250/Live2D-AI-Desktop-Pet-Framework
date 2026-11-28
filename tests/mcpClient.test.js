@@ -77,7 +77,7 @@ test('结果格式化：文本/图片/结构化/错误/截断', () => {
 });
 
 test('stdio 环境清洗：剔除密钥类变量，再合并显式 env 并替换 ${env:NAME}', () => {
-  process.env.PET_MCP_TEST_SECRET = 'resolved-secret';
+  process.env.PET_MCP_TEST_SECRET = 'resolved-secret'; // privacy-scan:ignore 测试夹具，非真实密钥
   const env = mcp.scrubServerEnv(
     { PATH: 'C:/bin', GITHUB_TOKEN: 'should-drop', MY_PASSWORD: 'should-drop', NORMAL: 'keep' },
     { TOKEN: '${env:PET_MCP_TEST_SECRET}', PLAIN: 'v' },
